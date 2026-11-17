@@ -12,7 +12,7 @@ runs:
     # Only an exact hit is restored: fetch.sh skips a tree that already has a .git and only warns
     # when it sits at another revision, so a stale cache would reach check-vendor and fail there.
     - name: Cache vendor/
-      uses: actions/cache@v4
+      uses: actions/cache@v6
       with:
         path: vendor
         key: vendor-${{ hashFiles('tools/vendor/fetch.sh') }}
@@ -26,10 +26,10 @@ runs:
     # uses .dockerignore to exclude downloads, build output and Git metadata. The
     # vendor module files remain available to the build.
     - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v3
+      uses: docker/setup-buildx-action@v4
 
     - name: Build lc-build:local
-      uses: docker/build-push-action@v6
+      uses: docker/build-push-action@v7
       with:
         context: .
         file: docker/Dockerfile
@@ -47,7 +47,7 @@ runs:
       run: echo "key=openwrt-tc-$(grep -E '^(OPENWRT_RELEASE|TC_SHA256|TC_A64_SHA256) ' Makefile | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
 
     - name: Cache dl/tc and dl/tc-a64
-      uses: actions/cache@v4
+      uses: actions/cache@v6
       with:
         path: |
           dl/tc
