@@ -1,0 +1,5 @@
+# QEMU TCG provides a guest kernel without host kernel modules or KVM access.
+ARG BUILD_IMAGE=lc-build:local
+FROM ${BUILD_IMAGE}
+RUN apt-get update && apt-get install -y --no-install-recommends qemu-system-x86 cpio \
+    && rm -rf /var/lib/apt/lists/*

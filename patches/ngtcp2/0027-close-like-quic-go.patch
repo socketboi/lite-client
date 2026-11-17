@@ -1,0 +1,98 @@
+A client's CONNECTION_CLOSE during the handshake, as quic-go packs it.
+
+quic-go's packConnectionClose writes the frame at every encryption level it still has a sealer for
+— Initial, Handshake, 1-RTT, in that order — into one datagram, and pads the Initial so that the
+datagram is maxPacketSize (vendor/quic-go/packet_packer.go:217-310, initialPaddingLen at :347-356);
+the padding goes where appendPacketPayload puts it, after an ACK and before every other frame,
+which for a close is first. A client drops its Initial keys once it has sent a Handshake packet,
+so the Initial is there from the ServerHello until the client's own Finished — exactly when a
+failed certificate or a TLS alert closes the connection. ngtcp2's client wrote the Handshake packet
+alone, and an Initial close with its padding after the frame.
+
+Anyone on the path can open an Initial packet: its keys come from the Destination Connection ID.
+
+diff --git a/lib/ngtcp2_conn.c b/lib/ngtcp2_conn.c
+--- a/lib/ngtcp2_conn.c
++++ b/lib/ngtcp2_conn.c
+@@ -5927,6 +5927,19 @@
+     ngtcp2_qlog_write_frame(&conn->qlog, &lfr);
+   }
+ 
++  /* And an Initial CONNECTION_CLOSE the same way: it carries no ACK, so
++     its padding comes first, then the frame (appendPacketPayload, as
++     packConnectionClose reaches it through appendLongHeaderPacket,
++     vendor/quic-go/packet_packer.go:295-300). */
++  if (type == NGTCP2_PKT_INITIAL && lfr.padding.len &&
++      fr->hd.type == NGTCP2_FRAME_CONNECTION_CLOSE) {
++    uint8_t *pad = ppe.buf.begin + ppe.hdlen;
++    size_t rest = ngtcp2_buf_len(&ppe.buf) - ppe.hdlen - lfr.padding.len;
++
++    memmove(pad + lfr.padding.len, pad, rest);
++    memset(pad, 0, lfr.padding.len);
++  }
++
+   /* quic-go pads right after the ACK, and so before the PING of a
+      probe (vendor/quic-go/packet_packer.go:1064-1066). */
+   if (type == NGTCP2_PKT_1RTT && lfr.padding.len) {
+@@ -14253,6 +14266,61 @@
+     .reason = (uint8_t *)reason,
+   };
+ 
++  /* A client still holding its Initial keys closes in the Initial space
++     too, and first: quic-go's packConnectionClose writes the frame at
++     every level it has a sealer for — Initial, Handshake, 1-RTT, in that
++     order — into one datagram, and pads the Initial so that the whole
++     datagram is maxPacketSize (vendor/quic-go/packet_packer.go:217-310,
++     initialPaddingLen at :347-356).  The later packets are written first,
++     aside, so that the Initial can be sized to fill what they leave. */
++  if (!conn->server && pkt_type != NGTCP2_PKT_INITIAL && in_pktns &&
++      in_pktns->crypto.tx.ckm) {
++    uint8_t tail[NGTCP2_MAX_UDP_PAYLOAD_SIZE];
++    size_t taillen = 0;
++    size_t dgramlen = ngtcp2_min(conn->local.settings.max_tx_udp_payload_size,
++                                 conn->dcid.current.max_udp_payload_size);
++
++    if (pkt_type != NGTCP2_PKT_HANDSHAKE && hs_pktns &&
++        hs_pktns->crypto.tx.ckm) {
++      nwrite = ngtcp2_conn_write_single_frame_pkt(
++        conn, pi, tail, sizeof(tail), NGTCP2_PKT_HANDSHAKE,
++        NGTCP2_WRITE_PKT_FLAG_NONE, &conn->dcid.current.cid, &fr,
++        NGTCP2_RTB_ENTRY_FLAG_NONE, NULL, ts);
++      if (nwrite < 0) {
++        return nwrite;
++      }
++      taillen += (size_t)nwrite;
++    }
++
++    nwrite = ngtcp2_conn_write_single_frame_pkt(
++      conn, pi, tail + taillen, sizeof(tail) - taillen, pkt_type,
++      NGTCP2_WRITE_PKT_FLAG_NONE, &conn->dcid.current.cid, &fr,
++      NGTCP2_RTB_ENTRY_FLAG_NONE, NULL, ts);
++    if (nwrite < 0) {
++      return nwrite;
++    }
++    taillen += (size_t)nwrite;
++
++    if (dgramlen > destlen) {
++      dgramlen = destlen;
++    }
++    if (taillen >= dgramlen) {
++      return NGTCP2_ERR_NOBUF;
++    }
++
++    nwrite = ngtcp2_conn_write_single_frame_pkt(
++      conn, pi, dest, dgramlen - taillen, NGTCP2_PKT_INITIAL,
++      NGTCP2_WRITE_PKT_FLAG_REQUIRE_PADDING_FULL, &conn->dcid.current.cid,
++      &fr, NGTCP2_RTB_ENTRY_FLAG_NONE, NULL, ts);
++    if (nwrite <= 0) {
++      return nwrite < 0 ? nwrite : NGTCP2_ERR_NOBUF;
++    }
++
++    memcpy(dest + nwrite, tail, taillen);
++
++    return nwrite + (ngtcp2_ssize)taillen;
++  }
++
+   if (!(conn->flags & NGTCP2_CONN_FLAG_HANDSHAKE_CONFIRMED) &&
+       pkt_type != NGTCP2_PKT_INITIAL) {
+     if (in_pktns && conn->server) {

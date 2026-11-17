@@ -1,0 +1,125 @@
+Initiate key updates as quic-go does.
+
+quic-go asks shouldInitiateKeyUpdate for every packet it seals and rolls its keys first when it says
+so (vendor/quic-go/internal/handshake/updatable_aead.go:318-356): once the handshake is confirmed and
+100 packets have been sent or opened with the first keys (FirstKeyUpdateInterval, :31-32), and then
+whenever 100000 have been with the current ones (KeyUpdateInterval,
+vendor/quic-go/internal/protocol/params.go:151) — a later update only once a packet sent with the
+current keys has been acknowledged (updateAllowed, :306-316). Its counters restart at every roll,
+the peer's included, and a packet opened with the peer's new keys is not counted (:224-258).
+ngtcp2 initiates only when the application asks, or at the AEAD limit.
+
+The counts are ngtcp2's own use_count on the send key and a new lc_rcvd on the receive key, the
+phase a new lc_phase bumped by conn_rotate_keys; conn_lc_key_update runs where ngtcp2 prepares its
+next keys before each write. Keys not yet prepared, or the previous receive key not yet dropped, put
+the update off to a later packet — which at these counts is only ever the first one after them.
+
+The key phase bit sits under header protection, so this is visible to the node and to nobody on
+the path; it is the reference's behaviour all the same.
+
+diff --git a/lib/ngtcp2_crypto.h b/lib/ngtcp2_crypto.h
+--- a/lib/ngtcp2_crypto.h
++++ b/lib/ngtcp2_crypto.h
+@@ -58,6 +58,9 @@
+   int64_t pkt_num;
+   /* use_count is the number of encryption applied with this key. */
+   uint64_t use_count;
++  /* lc_rcvd is the number of packets this key has opened while it was
++     the current one: quic-go's numRcvdWithCurrentKey. */
++  uint64_t lc_rcvd;
+   /* flags is the bitwise OR of zero or more of
+      NGTCP2_CRYPTO_KM_FLAG_*. */
+   uint8_t flags;
+diff --git a/lib/ngtcp2_conn.h b/lib/ngtcp2_conn.h
+--- a/lib/ngtcp2_conn.h
++++ b/lib/ngtcp2_conn.h
+@@ -630,6 +630,9 @@
+          confirmed by the local endpoint last time.  UINT64_MAX means
+          undefined value. */
+       ngtcp2_tstamp confirmed_ts;
++      /* lc_phase counts the key updates so far, either side's: quic-go's
++         keyPhase. */
++      uint64_t lc_phase;
+     } key_update;
+ 
+     /* tls_native_handle is a native handle to TLS session object. */
+diff --git a/lib/ngtcp2_conn.c b/lib/ngtcp2_conn.c
+--- a/lib/ngtcp2_conn.c
++++ b/lib/ngtcp2_conn.c
+@@ -10200,6 +10200,8 @@
+   if (initiator) {
+     conn->flags |= NGTCP2_CONN_FLAG_KEY_UPDATE_INITIATOR;
+   }
++
++  ++conn->crypto.key_update.lc_phase;
+ }
+ 
+ /*
+@@ -10852,6 +10854,10 @@
+     return NGTCP2_ERR_DISCARD_PKT;
+   }
+ 
++  if (hd.type == NGTCP2_PKT_1RTT && ckm == pktns->crypto.rx.ckm) {
++    ++ckm->lc_rcvd;
++  }
++
+   rv = ngtcp2_pkt_verify_reserved_bits(conn->crypto.decrypt_hp_buf.base[0]);
+   if (rv != 0) {
+     ngtcp2_log_info(&conn->log, NGTCP2_LOG_EVENT_PKT,
+@@ -12691,6 +12697,47 @@
+   return 0;
+ }
+ 
++/*
++ * conn_lc_key_update initiates a key update when quic-go would: its
++ * shouldInitiateKeyUpdate, asked for every packet it seals
++ * (vendor/quic-go/internal/handshake/updatable_aead.go:318-356).  The
++ * first once the handshake is confirmed and 100 packets have been sent
++ * or opened with the first keys, then whenever 100000 have been with
++ * the current ones, and a later one only once a packet sent with the
++ * current keys has been acknowledged.  Keys still being prepared, or
++ * the previous receive key not yet dropped, put it off to the next
++ * packet.
++ */
++static void conn_lc_key_update(ngtcp2_conn *conn) {
++  ngtcp2_pktns *pktns = &conn->pktns;
++  ngtcp2_crypto_km *tx = pktns->crypto.tx.ckm, *rx = pktns->crypto.rx.ckm;
++  uint64_t phase = conn->crypto.key_update.lc_phase;
++
++  if (!(conn->flags & NGTCP2_CONN_FLAG_HANDSHAKE_CONFIRMED) || !tx || !rx) {
++    return;
++  }
++
++  if (phase > 0 &&
++      (tx->use_count == 0 || pktns->rtb.largest_acked_tx_pkt_num < tx->pkt_num)) {
++    return;
++  }
++
++  if (!((phase == 0 && (rx->lc_rcvd >= 100 || tx->use_count >= 100)) ||
++        rx->lc_rcvd >= 100000 || tx->use_count >= 100000)) {
++    return;
++  }
++
++  if (!conn->crypto.key_update.new_tx_ckm ||
++      !conn->crypto.key_update.new_rx_ckm ||
++      conn->crypto.key_update.old_rx_ckm) {
++    return;
++  }
++
++  ngtcp2_log_info(&conn->log, NGTCP2_LOG_EVENT_CRY,
++                  "initiating key update as quic-go does");
++  conn_rotate_keys(conn, NGTCP2_MAX_PKT_NUM, /* initiator = */ 1);
++}
++
+ static int conn_initiate_key_update(ngtcp2_conn *conn, ngtcp2_tstamp ts) {
+   ngtcp2_tstamp confirmed_ts = conn->crypto.key_update.confirmed_ts;
+   ngtcp2_duration pto = ngtcp2_conn_compute_pto(conn, &conn->pktns);
+@@ -14043,6 +14090,8 @@
+       if (rv != 0) {
+         return rv;
+       }
++
++      conn_lc_key_update(conn);
+     }
+ 
+     if (!conn->pktns.rtb.probe_pkt_left && conn_cwnd_is_zero(conn)) {

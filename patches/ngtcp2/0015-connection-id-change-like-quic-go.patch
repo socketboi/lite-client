@@ -1,0 +1,205 @@
+A client that leaves the server's first Connection ID as soon as it can, as quic-go's does.
+
+quic-go's client does not keep the Destination Connection ID it started with. Once its handshake is
+complete it takes the first Connection ID the server issued, retires the old one, and from then on
+changes again every 5000 to 15000 datagrams while at least two unused ones are in hand
+(connIDManager, vendor/quic-go/conn_id_manager.go:173-251); it picks the ID for every packet it
+writes, long header or short (vendor/quic-go/packet_packer.go:281, :438, :944), so the server's
+NEW_CONNECTION_ID, which rides in the 1-RTT packet of the server's first flight, usually lands
+before the client writes anything more — and its last Initial and its Handshake packets carry the
+new ID already. ngtcp2 kept seq 0 for the life of the connection and only moved when the server
+told it to; a path observer saw one ID where the reference shows two, and no RETIRE_CONNECTION_ID
+where the reference sends one right away. This is not the Chrome parrot; quic-go does it either way.
+
+diff --git a/lib/ngtcp2_conn.c b/lib/ngtcp2_conn.c
+index 0bb9b2e..f9d089f 100644
+--- a/lib/ngtcp2_conn.c
++++ b/lib/ngtcp2_conn.c
+@@ -9021,6 +9021,120 @@ static int conn_recv_new_connection_id(ngtcp2_conn *conn,
+   return 0;
+ }
+ 
++/* PacketsPerConnectionID and MaxActiveConnectionIDs
++   (vendor/quic-go/internal/protocol/params.go:127, :134). */
++#define NGTCP2_QGO_PKTS_PER_DCID 10000
++#define NGTCP2_QGO_MAX_ACTIVE_CONNECTION_IDS 4
++
++/*
++ * conn_qgo_lowest_unused_first brings the unused Connection ID with
++ * the lowest sequence number to the front, where the next pop takes
++ * it from.  quic-go keeps its queue sorted and takes the lowest
++ * (vendor/quic-go/conn_id_manager.go:137-171, :183); ngtcp2 keeps them
++ * in the order they came, and quic-go's own server lists the IDs of
++ * its first flight highest first.
++ */
++static void conn_qgo_lowest_unused_first(ngtcp2_conn *conn) {
++  ngtcp2_ringbuf *rb = &conn->dcid.dtr.unused.rb;
++  size_t len = ngtcp2_ringbuf_len(rb);
++  size_t i, lowest = 0;
++  ngtcp2_dcid *a, *b, t;
++
++  for (i = 1; i < len; ++i) {
++    a = ngtcp2_ringbuf_get(rb, i);
++    b = ngtcp2_ringbuf_get(rb, lowest);
++    if (a->seq < b->seq) {
++      lowest = i;
++    }
++  }
++
++  if (lowest == 0) {
++    return;
++  }
++
++  a = ngtcp2_ringbuf_get(rb, 0);
++  b = ngtcp2_ringbuf_get(rb, lowest);
++  t = *a;
++  *a = *b;
++  *b = t;
++}
++
++/*
++ * conn_qgo_dcid_changed is the end of quic-go's updateConnectionID
++ * (vendor/quic-go/conn_id_manager.go:188-189): the count starts over
++ * and the next change comes after PacketsPerConnectionID/2 plus a draw
++ * from [0, PacketsPerConnectionID) datagrams, PacketsPerConnectionID
++ * being 10000 (vendor/quic-go/internal/protocol/params.go:134).
++ */
++static void conn_qgo_dcid_changed(ngtcp2_conn *conn) {
++  conn->dcid.pkts_since_change = 0;
++  conn->dcid.pkts_per_change =
++    NGTCP2_QGO_PKTS_PER_DCID / 2 +
++    chrome_rand_n(conn, NGTCP2_QGO_PKTS_PER_DCID);
++}
++
++/*
++ * conn_qgo_update_dcid is quic-go's connIDManager.Get
++ * (vendor/quic-go/conn_id_manager.go:230-251), which its packer asks
++ * for the Destination Connection ID of every packet it writes, long
++ * header or short (vendor/quic-go/packet_packer.go:281, :438, :944).
++ * Once the handshake is complete a client leaves the Connection ID it
++ * started with for the first one the server issued, as early as it
++ * can; after that it moves on once it has sent pkts_per_change
++ * datagrams on one, provided at least half of MaxActiveConnectionIDs
++ * (4, vendor/quic-go/internal/protocol/params.go:127) wait unused.
++ * The one it leaves is retired, as updateConnectionID does (:173-191).
++ *
++ * The server's Connection IDs come in a 1-RTT packet that is part of
++ * its first flight, so the switch usually happens before the client
++ * has written anything after the handshake: its ACK of the server's
++ * Initial and its Finished already carry the new ID.
++ */
++static int conn_qgo_update_dcid(ngtcp2_conn *conn, ngtcp2_tstamp ts) {
++  ngtcp2_pv *pv = conn->pv;
++  ngtcp2_dcid dcid;
++  size_t unused;
++  int rv;
++
++  if (conn->server || !(conn->flags & NGTCP2_CONN_FLAG_HANDSHAKE_COMPLETED)) {
++    return 0;
++  }
++
++  unused = ngtcp2_dcidtr_unused_len(&conn->dcid.dtr);
++  if (unused == 0) {
++    return 0;
++  }
++
++  if (conn->dcid.current.seq != 0 &&
++      (2 * unused < NGTCP2_QGO_MAX_ACTIVE_CONNECTION_IDS ||
++       conn->dcid.pkts_since_change < conn->dcid.pkts_per_change)) {
++    return 0;
++  }
++
++  rv = conn_retire_active_dcid(conn, &conn->dcid.current, ts);
++  if (rv != 0) {
++    return rv;
++  }
++
++  conn_qgo_lowest_unused_first(conn);
++  ngtcp2_dcidtr_pop_unused_cid_token(&conn->dcid.dtr, &dcid);
++
++  if (pv) {
++    if (conn->dcid.current.seq == pv->dcid.seq) {
++      ngtcp2_dcid_copy_cid_token(&pv->dcid, &dcid);
++    }
++    if ((pv->flags & NGTCP2_PV_FLAG_FALLBACK_PRESENT) &&
++        conn->dcid.current.seq == pv->fallback_dcid.seq) {
++      ngtcp2_dcid_copy_cid_token(&pv->fallback_dcid, &dcid);
++    }
++  }
++
++  ngtcp2_dcid_copy_cid_token(&conn->dcid.current, &dcid);
++  conn_qgo_dcid_changed(conn);
++
++  return conn_call_activate_dcid(conn, &conn->dcid.current);
++}
++
+ /*
+  * conn_post_process_recv_new_connection_id handles retirement request
+  * of active DCIDs.
+@@ -9049,6 +9163,7 @@ static int conn_post_process_recv_new_connection_id(ngtcp2_conn *conn,
+       return rv;
+     }
+ 
++    conn_qgo_lowest_unused_first(conn);
+     ngtcp2_dcidtr_pop_unused_cid_token(&conn->dcid.dtr, &dcid);
+ 
+     if (pv) {
+@@ -9062,6 +9177,9 @@ static int conn_post_process_recv_new_connection_id(ngtcp2_conn *conn,
+     }
+ 
+     ngtcp2_dcid_copy_cid_token(&conn->dcid.current, &dcid);
++    /* A change the server forces is still a change
++       (vendor/quic-go/conn_id_manager.go:129-133). */
++    conn_qgo_dcid_changed(conn);
+ 
+     rv = conn_call_activate_dcid(conn, &conn->dcid.current);
+     if (rv != 0) {
+@@ -13074,6 +13192,12 @@ conn_write_vmsg_wrapper(ngtcp2_conn *conn, ngtcp2_path *path,
+     conn->tx.chrome_last_dgram_padding = conn->tx.chrome_dgram_padding;
+   }
+ 
++  /* connIDManager.SentPacket, once for every datagram sent
++     (vendor/quic-go/connection.go:2821, :2874). */
++  if (nwrite > 0) {
++    ++conn->dcid.pkts_since_change;
++  }
++
+   assert((size_t)nwrite <= destlen);
+ 
+   if (cstat->bytes_in_flight >= cstat->cwnd) {
+@@ -13251,6 +13375,16 @@ ngtcp2_ssize ngtcp2_conn_write_vmsg(ngtcp2_conn *conn, ngtcp2_path *path,
+ 
+   conn_update_timestamp(conn, ts);
+ 
++  /* The Connection ID is chosen once per datagram; a datagram that is
++     still being filled keeps the one it began with. */
++  if (!ppe_pending && (conn->state == NGTCP2_CS_CLIENT_WAIT_HANDSHAKE ||
++                       conn->state == NGTCP2_CS_POST_HANDSHAKE)) {
++    rv = conn_qgo_update_dcid(conn, ts);
++    if (rv != 0) {
++      return rv;
++    }
++  }
++
+   if (path) {
+     ngtcp2_path_copy(path, &conn->dcid.current.ps.path);
+   }
+diff --git a/lib/ngtcp2_conn.h b/lib/ngtcp2_conn.h
+index 7a3e639..c0a2fb1 100644
+--- a/lib/ngtcp2_conn.h
++++ b/lib/ngtcp2_conn.h
+@@ -423,6 +423,14 @@ struct ngtcp2_conn {
+     /* retire_prior_to is the largest retire_prior_to received so
+        far. */
+     uint64_t retire_prior_to;
++    /* pkts_since_change and pkts_per_change are quic-go's
++       packetsSinceLastChange and packetsPerConnectionID
++       (vendor/quic-go/conn_id_manager.go:33-38): the datagrams a
++       client has sent since it last changed its Destination
++       Connection ID, and how many it sends before the next change.
++       See conn_qgo_update_dcid. */
++    uint32_t pkts_since_change;
++    uint32_t pkts_per_change;
+   } dcid;
+ 
+   struct {

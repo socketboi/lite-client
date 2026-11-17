@@ -1,0 +1,941 @@
+#!/bin/sh /etc/rc.common
+# procd service for lite-client.
+#
+# Everything here was learned on a device rather than from documentation, and each rule below cost
+# a broken network before it was written down.
+
+START=95
+STOP=10
+USE_PROCD=1
+
+PROG=/usr/sbin/lc-tunnel
+CONF=/etc/config/lite-client
+
+# Where the tunnel's own state lives. The account, the account password and the obfuscation password
+# are secrets: they go in files with mode 0600, never on the command line, because a command line
+# is readable by every process on the machine through /proc — and procd keeps a copy of it in ubus
+# for the life of the instance besides.
+STATE=/etc/lite-client
+EVENTS=/var/run/lite-client-events
+
+# What a sysupgrade keeps. The same list is the package's conffiles, and there is no way to have it
+# in one place only: conffiles takes no wildcards. Point auth_file or uuid_file somewhere else and
+# the credential is simply gone after a firmware upgrade, so it is said out loud here — this is
+# the only place where both sides are visible at once.
+PRESERVED="$STATE/uuid $STATE/auth $STATE/obfs"
+
+# Marks and routing tables this service owns. Chosen high and stated here because the router has
+# other software with the same idea: mwan3, SQM and fw4 all use marks, and a collision does not
+# announce itself — it delivers somebody else's packets to the wrong place.
+FWMARK=0x1000000
+RT_TABLE=104
+
+# The kernel's own sizing of TCP memory, as it stood at the first start after boot. /var/run is
+# emptied by a reboot, which is exactly when the kernel sizes it again. See lc_tune_tcp.
+TCP_MEM_BOOT=/var/run/lite-client.tcp_mem
+# Where the free memory is read from; a variable so that the test can hand it a box of its own.
+LC_MEMINFO=/proc/meminfo
+
+# A whole number and nothing else. An empty value is not a number; whether the option was required
+# is the caller's business.
+lc_is_number() {
+	case "$1" in
+	'' | *[!0-9]*) return 1 ;;
+	esac
+	return 0
+}
+
+# A PORT, not merely a number — otherwise this check passes what the binary itself will refuse.
+#
+# `option port 99999` is digits, so the previous check let it through; `lc_u16` in args.c refuses it
+# and lc-tunnel exits with LC_EXIT_CONFIG. What matters is WHAT HAS ALREADY HAPPENED BY THEN: the
+# intercept rules go up a few lines below, and procd, once respawn is exhausted, does not call
+# `stop_service` — so there is nobody left to take them down. The LAN keeps 80 and 443 diverted into
+# a dead socket: no internet, and nothing in the log saying why. Exactly the failure this early
+# check exists for.
+lc_is_port() {
+	lc_is_number "$1" || return 1
+	[ "$1" -ge 1 ] && [ "$1" -le 65535 ]
+}
+
+# An IPv4 address, or one with a prefix length. Nothing else, and nothing extra.
+#
+# These values go into the TEXT of an nft script now rather than into its argument list, which is
+# what makes atomicity possible — and which means a value is no longer just data to nft, it is
+# script. The config file belongs to root, so this is not a way in; it is the difference between a
+# typo that is refused by name and a typo that ends the ruleset somewhere unintended. Whitelisting
+# the shape is the only check that stays correct as nft's syntax grows.
+lc_is_ip4() {
+	local a="${1%%/*}" p="${1#*/}" n
+	case "$a" in *.) return 1 ;; esac
+	[ "$1" != "${1#*/}" ] && { lc_is_number "$p" && [ "$p" -le 32 ] || return 1; }
+	# Four parts, each a number under 256. Written out because busybox has no case-insensitive
+	# ranges and `case` cannot count.
+	local i=0
+	while [ -n "$a" ]; do
+		n="${a%%.*}"
+		[ "$n" = "$a" ] && a='' || a="${a#*.}"
+		lc_is_number "$n" || return 1
+		[ "$n" -le 255 ] || return 1
+		i=$((i + 1))
+	done
+	[ "$i" = 4 ]
+}
+
+# An IPv6 address by its shape alone: hex digits and colons, at least two of them, and the dots of
+# an embedded IPv4 tail. Loose about what makes a VALID address — nft is strict about that, and
+# refuses the whole transaction — and strict about the one thing that matters here, that nothing
+# but an address can reach the script.
+lc_is_ip6() {
+	case "$1" in
+	*[!0-9a-fA-F:.]*) return 1 ;;
+	*:*:*) return 0 ;;
+	esac
+	return 1
+}
+
+# Validate client selection before tuning TCP or registering an instance. The rules builder
+# also calls this helper so direct callers cannot bypass the same validation.
+lc_clients_ok() {
+	local c
+	for c in $1; do
+		case "$c" in
+		*:*)
+			logger -t lite-client "client '$c' is IPv6, which this ruleset cannot intercept; not starting"
+			return 1
+			;;
+		esac
+		lc_is_ip4 "$c" || {
+			logger -t lite-client "client '$c' is not an IPv4 address or prefix; not starting"
+			return 1
+		}
+	done
+	return 0
+}
+
+# The addresses a node NAME has now, as the router's own resolver answers: every `Address:` line
+# after the first `Name:` in busybox nslookup's answer — the lines above it name the server asked,
+# with a tab and a port. Nothing when the name has no address, or the resolver is not up yet.
+lc_node_addrs() {
+	nslookup "$1" 2>/dev/null | awk '/^Name:/ { n = 1 } n && /^Address: / { print $2 }'
+}
+
+# Exactly 64 hex digits: the SHA-256 of the node's certificate. Checked here because the only other
+# place it is checked is the binary, which by then has already exited — and the rules would
+# already be holding the LAN.
+lc_is_sha256() {
+	case "$1" in
+	*[!0-9a-fA-F]*) return 1 ;;
+	esac
+	[ "${#1}" = 64 ]
+}
+
+# Said about a secret that a sysupgrade will not keep. A warning rather than a refusal: the path may
+# have been chosen on purpose — but saying nothing would cost a router that comes back from an
+# upgrade without its account.
+lc_warn_unpreserved() {
+	local path="$1" what="$2" p
+	for p in $PRESERVED; do
+		[ "$path" = "$p" ] && return 0
+	done
+	logger -t lite-client "$what is $path, which sysupgrade does not keep; see the conffiles"
+	return 0
+}
+
+# Whether `workers` is a value this plane can run with.
+#
+# REALITY takes 1..8 or `auto` (one per CPU, which is what the reference does: Go spreads its
+# goroutines over every core). `auto` is the value to use when one configuration goes to many
+# routers: it reaches boxes with two cores and with four, and a number chosen for one is wrong on the
+# other. Several workers do not change what the node counts: every connection still leaves from
+# the router's one address, and a client with several live connections is what the reference looks
+# like anyway (its pre-connect pool).
+#
+# HYSTERIA2 TAKES ONE, AND ANYTHING ELSE IS REFUSED RATHER THAN LOWERED. A server that sells a
+# subscription as one active connection enforces it on this plane by session: every worker dials its
+# own QUIC session with the same password, and such a server closes each earlier session of a
+# password the moment a newer one registers. The workers would evict one another in turn: a tunnel
+# made of 0x107 closes, which is easy to mistake for the path being blocked.
+# Quietly running one worker instead would be a router running with a setting it was not given, so
+# it is said and the start refuses, as every other impossible value in this file does. Parallelism
+# on this plane belongs INSIDE the one session (threads), never across sessions.
+lc_workers_ok() {
+	local plane="$1" workers="$2"
+	case "$workers" in
+	auto | [1-8]) ;;
+	*)
+		logger -t lite-client "workers must be 1..8 or auto, not '$workers'; not starting"
+		return 1
+		;;
+	esac
+	if [ "$plane" = hysteria ] && [ "$workers" != 1 ]; then
+		logger -t lite-client "workers is '$workers', but on the hysteria plane each worker opens its own session with the same password"
+		logger -t lite-client "the node keeps one session per subscription and closes the rest (0x107); set workers to 1 or leave it unset; not starting"
+		return 1
+	fi
+	return 0
+}
+
+# Chrome's QUIC stack is parroted unless this says no, as hysteria's client parrots unless its config
+# says quic.disableChromeParrot (since 2.11). Normalised to on or off, and anything else refused: a
+# typo that quietly left the parrot on would be the setting not taken, with no line to say so.
+# test/parrot holds this function, start_service's use of it and the binary's own default, read off
+# its first datagram, to one another.
+lc_chrome_parrot() {
+	case "$1" in
+		'' | 1 | on | yes | true) echo on ;;
+		0 | off | no | false) echo off ;;
+		*) logger -t lite-client "chrome_parrot is '$1', which is not a yes or a no; not starting"; return 1 ;;
+	esac
+}
+
+# TCP MEMORY, SIZED FOR A ROUTER THAT ENDS ITS DOWNLOADS ITSELF — measured 2026-09-24 on both boxes
+# this runs on, with this client and the reference Xray side by side.
+#
+# The kernel sizes two things separately, and on a router they disagree. tcp_mem is the room for ALL
+# of TCP, in pages, set at boot from the RAM (a sixteenth of it before "pressure": tcp_init_mem in
+# net/ipv4/tcp.c). tcp_rmem and tcp_wmem cap what ONE socket's buffers may grow to.
+#
+# AX3000T, 239 MB, with another REALITY package's sysctl drop-in: one socket may grow to 32 MB, the
+# whole box may hold 14 MB before pressure and 21.6 MB at all. One download at 200 Mbit/s over 110 ms
+# grew its window to 10.7 MB; the box went into memory pressure 3 to 16 times a download, and in
+# pressure the kernel throws away out-of-order segments it has ALREADY acknowledged by SACK
+# (PruneCalled and TCPOFODrop, hundreds to thousands a download). The node, told those bytes had
+# arrived, learns otherwise: a capture on the box's WAN shows 26-41 % of a download sent twice, and
+# the node refilling the holes one at a time for 20 to 150 seconds. Xray's downloads the same — it is
+# the kernel's doing, not a client's. tcp_mem times three with the same 32 MB: not one pressure,
+# 183-219 Mbit/s where it had been 130-150 between stalls, and never more than 24 MB in use.
+#
+# MT7621, 118 MB, nothing set: the kernel's own ceiling for a socket there is 0.9 MB, a
+# window under half a megabyte — 33 Mbit/s over 110 ms whatever the client does. HTTPS over REALITY
+# with Vision measured exactly that, 32-35, with the tunnel using a third of a core. A socket ceiling of 8 MB
+# and tcp_mem times three: 66-69. 32 MB and times six: the same 67-70, the processor being the limit
+# by then.
+#
+# So the pressure threshold becomes the kernel's own times three — the factor measured on both — BUT
+# NO MORE THAN HALF OF THE MEMORY FREE WHEN THE TUNNEL STARTS. The kernel sizes from the RAM; what a
+# router can spare is what AdGuard Home and the rest leave over, and below the pressure threshold
+# nothing restrains TCP at all. Measured with four downloads at once (2026-09-24): on the MT7621,
+# times three (21 MB) left 15-17 MB of its ~40 free and stalled nothing, while times two brought
+# hundreds of discarded segments and a download that stopped for 150 seconds. On the AX3000T, beside
+# AdGuard Home and sing-box with ~60 MB free, times three (43 MB) let TCP take 39 MB and leave 16 —
+# the measurement's own guard stopped it — while times two (29 MB) never went under 30 MB free and
+# discarded 302 segments. Half of what is free is times three on the first box and about times two on
+# the second. When half of what is free is no more than the kernel's own threshold, nothing is raised
+# at all — not the sockets either. The low and high marks keep the kernel's proportions to the
+# threshold, three quarters and one and a half.
+#
+# One socket may grow to half of that threshold, never past the 32 MB the planes use: one download
+# alone cannot push the box into pressure, two at full size can. The minimum and the default of
+# tcp_rmem and tcp_wmem are left as they are — they are where autotuning starts, not the room it has.
+# This spends memory, bounded by what is free, and touches no flash.
+#
+# The kernel's sizing is read at the first start after boot and kept in $TCP_MEM_BOOT: read back after
+# this has raised it, it would be raised again by every restart. The free memory is read at every
+# start, since that is what changes — a start early in boot sees more than later, and the restart the
+# WAN coming up triggers (service_triggers) reads it again. A kernel that refuses — a read-only /proc,
+# a container — is said, and is no reason to stay down: the tunnel works without this, slower.
+lc_tune_tcp() {
+	local low press high kpress free half cap a b rest rmem wmem why
+	[ -s "$TCP_MEM_BOOT" ] || sysctl -n net.ipv4.tcp_mem > "$TCP_MEM_BOOT" 2>/dev/null
+	read -r low press high < "$TCP_MEM_BOOT" 2>/dev/null
+	lc_is_number "$low" && lc_is_number "$press" && lc_is_number "$high" || {
+		rm -f "$TCP_MEM_BOOT"
+		logger -t lite-client "cannot read net.ipv4.tcp_mem; TCP memory left as the kernel sized it"
+		return 0
+	}
+	# Pages are 4 KiB on every target this package is built for (mipsel_24kc, aarch64_cortex-a53).
+	free=$(awk '$1 == "MemAvailable:" { print int($2 / 4) }' "$LC_MEMINFO" 2>/dev/null)
+	lc_is_number "$free" || {
+		logger -t lite-client "cannot read MemAvailable; TCP memory left as the kernel sized it"
+		return 0
+	}
+	kpress=$press
+	half=$((free / 2))
+	[ "$half" -gt "$kpress" ] || {
+		logger -t lite-client "$((free * 4)) kB free is too little to raise TCP memory; left as the kernel sized it"
+		return 0
+	}
+	press=$((kpress * 3)) why="the kernel's own sizing x3"
+	[ "$press" -le "$half" ] || press=$half why="half of the $((free * 4)) kB free"
+	low=$((press * 3 / 4)) high=$((press * 3 / 2))
+	cap=$((press * 4096 / 2))
+	[ "$cap" -le 33554432 ] || cap=33554432
+	read -r a b rest <<EOF
+$(sysctl -n net.ipv4.tcp_rmem 2>/dev/null)
+EOF
+	lc_is_number "$a" && lc_is_number "$b" || { a=4096 b=131072; }
+	rmem="$a $b $cap"
+	read -r a b rest <<EOF
+$(sysctl -n net.ipv4.tcp_wmem 2>/dev/null)
+EOF
+	lc_is_number "$a" && lc_is_number "$b" || { a=4096 b=16384; }
+	wmem="$a $b $cap"
+	if sysctl -w net.ipv4.tcp_mem="$low $press $high" net.ipv4.tcp_rmem="$rmem" \
+		net.ipv4.tcp_wmem="$wmem" > /dev/null 2>&1; then
+		logger -t lite-client "tcp memory: $low $press $high pages ($why), a socket up to $cap bytes"
+	else
+		logger -t lite-client "the kernel refused the TCP memory sizing; the tunnel runs, capped by its defaults"
+	fi
+	return 0
+}
+
+start_service() {
+	LC_START_RESULT=1
+	LC_WAIT_READY=0
+	# rc.common publishes an empty service even when validation refuses a repeated start.
+	# Remove our old interception before it can stop the previous instance and leave dead sockets.
+	lc_rules_down
+	config_load lite-client
+
+	local node port sni pbk sid uuid_file listen_port client_net enabled
+	local plane auth auth_file auth_arg obfs obfs_file obfs_arg rate pin
+	local flow udp_port workers enabled_raw lc_unused chrome_parrot lc_cp lc_check_error
+
+	# Said out loud, because this was the one refusal in the whole file that was silent. `enabled` is
+	# read as a boolean, and anything outside the words config_get_bool knows becomes 0 — so `option
+	# enabled 'y'` is a service that starts, exits zero and does nothing, with no line anywhere to say
+	# the word was not understood. The distinction below is the useful half: "off" is an answer, "not
+	# a yes or a no" is a typo.
+	config_get enabled_raw main enabled ''
+	config_get_bool enabled main enabled 0
+	if [ "$enabled" != 1 ]; then
+		case "$enabled_raw" in
+		0 | off | false | no | disabled | '')
+			LC_START_RESULT=0
+			logger -t lite-client "disabled in the configuration; not starting" ;;
+		*)
+			logger -t lite-client "enabled is '$enabled_raw', which is not a yes or a no; not starting" ;;
+		esac
+		return "$LC_START_RESULT"
+	fi
+
+	config_get plane       main plane reality
+	config_get node        main node
+	config_get port        main port 443
+	config_get sni         main sni
+	config_get pbk         main public_key
+	config_get sid         main short_id
+	config_get uuid_file   main uuid_file "$STATE/uuid"
+	config_get listen_port main listen_port 19099
+	config_get client_net  main clients
+	config_get auth        main auth
+	config_get auth_file   main auth_file "$STATE/auth"
+	config_get obfs        main obfs
+	config_get obfs_file   main obfs_file "$STATE/obfs"
+	config_get rate        main rate
+	config_get pin         main pin
+	config_get hop_seconds main hop_seconds
+	config_get gecko main gecko
+	config_get chrome_parrot main chrome_parrot
+	config_get flow        main flow xtls-rprx-vision
+	config_get udp_port    main udp_port
+	config_get workers     main workers
+
+	# EVERYTHING that can be checked is checked HERE, before lc_rules_up.
+	#
+	# The rules used to go up first, while the pin, the rate, the password file and "does this build
+	# have that plane" were read by the binary, which answered a mistake in any of them by exiting at
+	# once. `respawn 3600 5 0` then restarted it without limit, with the rules already sending port
+	# 80 and 443 from every address in `clients` into a process that is not there: what the household
+	# gets is not "the tunnel is down" but "there is no internet", and nothing in the log says why.
+	# Anything the binary learns from its arguments, this script can learn earlier and cheaper.
+	[ -n "$node" ] && [ -n "$sni" ] || {
+		logger -t lite-client "node and sni are required; not starting"
+		return 1
+	}
+	# A RANGE IS A LEGAL PORT HERE, and it was not: `option port '20000-50000'` — the form the
+	# binary accepts and upstream documents — was turned away by lc_is_port with "must be 1..65535",
+	# so the feature existed and no configuration could reach it. Exactly the complaint this file
+	# already carries about the Hysteria2 plane a few lines up: written, packaged, and reachable only
+	# by stopping the service and typing the command line by hand.
+	#
+	# The halves are checked as ports; the binary checks the pair again and refuses a reversed or
+	# empty range, so this is a gate against nonsense reaching the rules, not the last word.
+	case "$port" in
+	*-*)
+		lc_is_port "${port%%-*}" && lc_is_port "${port#*-}" || {
+			logger -t lite-client "port range '$port' is not two ports; not starting"
+			return 1
+		}
+		[ "$plane" = hysteria ] || {
+			logger -t lite-client "a port range is only meaningful on the hysteria plane; not starting"
+			return 1
+		}
+		;;
+	*)
+		lc_is_port "$port" || {
+			logger -t lite-client "port must be 1..65535, not '$port'; not starting"
+			return 1
+		}
+		;;
+	esac
+
+	# Gecko's sizes, checked here because the client refuses them and a refusal after the firewall
+	# rules are up is a router with interception and no tunnel. The shape is MIN-MAX, and both have
+	# to be what the NODE was configured with: frames of the wrong size still decode, which is the
+	# one thing this layer exists to prevent.
+	[ -z "$gecko" ] || case "$gecko" in
+		*[!0-9-]*|-*|*-|*-*-*|*[!0-9]) logger -t lite-client "gecko must be MIN-MAX, not '$gecko'; not starting"; return 1 ;;
+		*-*) : ;;
+		*) logger -t lite-client "gecko must be MIN-MAX, not '$gecko'; not starting"; return 1 ;;
+	esac
+	# Chrome's QUIC stack, on or off: see lc_chrome_parrot. The word as written is kept for the
+	# reality branch, which has to say when it was set there.
+	lc_cp=$chrome_parrot
+	chrome_parrot=$(lc_chrome_parrot "$chrome_parrot") || return 1
+	# Five is upstream's floor, not a preference: udphop returns "hop interval must be at least 5
+	# seconds" and the client does not start. This said one, and the binary then accepted the value
+	# and turned hopping off without stopping — a router that runs with a setting it was not given.
+	# No upper bound: upstream has none (the 3600 that stood here was ours).
+	[ -z "$hop_seconds" ] || { lc_is_number "$hop_seconds" && [ "$hop_seconds" -ge 5 ]; } || {
+		logger -t lite-client "hop_seconds must be at least 5, not '$hop_seconds'; not starting"
+		return 1
+	}
+
+	lc_is_port "$listen_port" || {
+		logger -t lite-client "listen_port must be 1..65535, not '$listen_port'; not starting"
+		return 1
+	}
+	[ -z "$udp_port" ] || lc_is_port "$udp_port" || {
+		logger -t lite-client "udp_port must be 1..65535, not '$udp_port'; not starting"
+		return 1
+	}
+	[ "$udp_port" != "$listen_port" ] || {
+		logger -t lite-client "udp_port and listen_port are both $listen_port; not starting"
+		return 1
+	}
+
+	# Which planes this build has at all. There are two packages and one config file, and
+	# `option plane hysteria` on a REALITY build is the likeliest way to end up respawning forever
+	# after an upgrade.
+	# `-F`, because the value comes from UCI — from a person — and without it grep reads that value as
+	# a REGULAR EXPRESSION: `option plane '.*'` would pass this gate. The `case` further down refuses
+	# it anyway, so this never became a hole; but a check that a dot and a star walk through is not a
+	# check.
+	#
+	# ASKED WHETHER IT ANSWERED AT ALL BEFORE ASKING WHAT IT SAID. A binary that cannot be run — not
+	# executable, built for another architecture, copied half-way — produces no output, and no output
+	# matched no plane, so this reported "this build has no 'hysteria' plane": a confident statement
+	# about the contents of a file it never managed to open. It cost six minutes of a router carrying
+	# nothing while the message on screen was about planes. The two cases are one question apart and
+	# their answers point in opposite directions.
+	lc_planes=$($PROG --planes 2>/dev/null)
+	if [ -z "$lc_planes" ]; then
+		logger -t lite-client "cannot run $PROG at all; not starting (is it executable, and built for this box?)"
+		return 1
+	fi
+	echo "$lc_planes" | grep -qxF "$plane" || {
+		logger -t lite-client "this build has no '$plane' plane; not starting"
+		logger -t lite-client "it carries: $(echo "$lc_planes" | tr '\n' ' ')"
+		return 1
+	}
+
+	# The command line is built here rather than in two copies of procd_open_instance, because the
+	# two planes differ in their arguments and in nothing else this script does: the same listener,
+	# the same rules, the same respawn. Built in "$@" so that the options at the end can be left out
+	# when they are not configured — an empty string passed positionally is an argument, and
+	# lc-tunnel would take it for one.
+	case "$plane" in
+	hysteria)
+		# A literal password beats the file when both are set, because someone who typed one into the
+		# config meant to use it — and it is logged as the exception it is, though not for the reason
+		# that used to be written here.
+		#
+		# In /proc the literal lives for milliseconds: lc-tunnel overwrites the argument as soon as it
+		# has read it. procd is what keeps it. The array goes over ubus in procd_set_param command and
+		# stays there for the life of the instance, so the password is visible in
+		# `ubus call service list` until the service stops, and overwriting argv in the child does not
+		# reach that copy at all. The file form creates no such copy: what travels over ubus is
+		# "@/etc/lite-client/auth", not the password.
+		if [ -n "$auth" ]; then
+			auth_arg="$auth"
+			logger -t lite-client "auth is set literally; use auth_file instead"
+			logger -t lite-client "a literal stays in 'ubus call service list' while the service runs"
+		else
+			[ -r "$auth_file" ] || {
+				logger -t lite-client "cannot read $auth_file; not starting"
+				return 1
+			}
+			lc_warn_unpreserved "$auth_file" "auth_file"
+			auth_arg="@$auth_file"
+		fi
+
+		# The obfuscation password takes the same shape as the account, for a reason of the same size:
+		# it is a shared secret that gates the node's whole UDP port — without it the node answers
+		# nothing at all — and it had no @FILE form here, only a literal, which is to say a string in
+		# ubus for as long as the service runs.
+		#
+		# A dash where there is no obfuscation, which is what lc-tunnel wants said out loud: an empty
+		# argument and a missing one are too easy to confuse when the symptom of getting it wrong is a
+		# node that never answers.
+		if [ -n "$obfs" ]; then
+			obfs_arg="$obfs"
+			logger -t lite-client "obfs is set literally; use obfs_file instead"
+			logger -t lite-client "a literal stays in 'ubus call service list' while the service runs"
+		elif [ "$obfs_file" != "$STATE/obfs" ] || [ -e "$obfs_file" ]; then
+			# A FILE THAT IS SET AND CANNOT BE READ IS A REFUSAL, not "then there is no obfuscation".
+			#
+			# The condition tells "somebody named a path" apart from "the default applied": obfs_file
+			# HAS a default ($STATE/obfs), so testing it for emptiness is wrong — a box that runs no
+			# obfuscation would stop starting at all. Refusing is right when the path was named
+			# EXPLICITLY, or when the default file is on disk and will not open.
+			#
+			# This was `elif [ -r ... ]`, and any path that did not open — lost to a sysupgrade, wrong
+			# mode — fell through to `-`: the tunnel came up with obfuscation OFF and said nothing.
+			# The operator asked for Salamander, got bare QUIC, and learned it from the censor rather
+			# than from us. Its neighbour auth_file refuses in the same situation; the two parted
+			# company only because this one has a default and that one does not.
+			[ -r "$obfs_file" ] || {
+				logger -t lite-client "obfs_file '$obfs_file' is set but not readable; not starting (fix the path or its mode, or clear the option to run without obfuscation)"
+				return 1
+			}
+			lc_warn_unpreserved "$obfs_file" "obfs_file"
+			obfs_arg="@$obfs_file"
+		else
+			obfs_arg="-"
+		fi
+
+		if [ -n "$rate" ] && ! lc_is_number "$rate"; then
+			logger -t lite-client "rate must be bytes per second as a number, not '$rate'; not starting"
+			return 1
+		fi
+		# A dash is the operator saying "unauthenticated, and I mean it" — the same spelling the
+		# tunnel takes for it, and the same one obfs already uses for "the node runs none". Anything
+		# else has to be a digest.
+		if [ "$pin" != "-" ] && [ -n "$pin" ] && ! lc_is_sha256 "$pin"; then
+			logger -t lite-client "pin must be the certificate's sha256, 64 hex characters"
+			logger -t lite-client "'$pin' is not one; not starting"
+			return 1
+		fi
+		# AND AN EMPTY PIN IS NO LONGER A WAY TO START.
+		#
+		# It used to be: leaving the option out gave a tunnel that accepted whatever certificate the
+		# far end presented, and said so on one line that scrolls past. The reference verifies the
+		# node's certificate unless told not to (see the refusal in lc-tunnel's main), so a client
+		# that skips it because a field is blank is not a smaller client, it is a different promise.
+		# Refused here as well as in the program so that the reason reaches syslog, where somebody
+		# looking at a service that will not start actually looks.
+		if [ -z "$pin" ]; then
+			logger -t lite-client "pin is not set: the node would not be authenticated at all"
+			logger -t lite-client "set 'pin' to the certificate's sha256, or to '-' to accept that"
+			logger -t lite-client "  openssl x509 -outform der | sha256sum   on the node"
+			return 1
+		fi
+
+		set -- "$PROG" -H "$node" "$port" "$sni" "$auth_arg" "$obfs_arg" "$listen_port"
+		[ -n "$rate" ] && set -- "$@" -r "$rate"
+		[ -n "$hop_seconds" ] && set -- "$@" -j "$hop_seconds"
+		[ -n "$gecko" ] && set -- "$@" -g "$gecko"
+		[ "$chrome_parrot" = off ] && set -- "$@" -c off
+		# Without this the tunnel carries the household's traffic to whatever answered on that
+		# address, and its own log says so on every reconnect. It is a line in a config file here
+		# because that is the only place a router can be told.
+		# Always passed now, digest or dash — the empty case was refused above. The dash reaches the
+		# program as the waiver, so an operator who chose to run unauthenticated gets the tunnel and
+		# the warning, and one who simply forgot gets neither.
+		set -- "$@" -p "$pin"
+		[ "$pin" = "-" ] &&
+			logger -t lite-client "pin is '-': the node is deliberately not authenticated"
+		;;
+	reality)
+		# THREE OPTIONS THAT DO NOTHING HERE, SAID SO RATHER THAN DROPPED.
+		#
+		# -p, -r and -j belong to the hysteria plane, and this branch has never passed them. The client
+		# itself REFUSES them on the wrong plane rather than ignoring them, and main.c says why: doing
+		# nothing quietly is how a node ends up unverified. This script was quietly doing the very
+		# thing that refusal exists to prevent — an operator with `option pin` in the file and a
+		# working tunnel had every reason to believe the node was being checked against it.
+		for lc_unused in pin:"$pin" rate:"$rate" hop_seconds:"$hop_seconds" gecko:"$gecko" \
+		    chrome_parrot:"$lc_cp"; do
+			[ -n "${lc_unused#*:}" ] || continue
+			logger -t lite-client "${lc_unused%%:*} is set but belongs to the hysteria plane; no effect here"
+		done
+		[ -z "$pin" ] || logger -t lite-client \
+			"on this plane the node proves itself with its reality key, not with a pin"
+
+		[ -n "$pbk" ] || {
+			logger -t lite-client "public_key is required on the reality plane; not starting"
+			return 1
+		}
+		[ -r "$uuid_file" ] || {
+			logger -t lite-client "cannot read $uuid_file; not starting"
+			return 1
+		}
+		lc_warn_unpreserved "$uuid_file" "uuid_file"
+		[ -r "$STATE/fingerprint.fpt" ] || {
+			logger -t lite-client "cannot read $STATE/fingerprint.fpt; not starting"
+			return 1
+		}
+		# THE CLIENT UNDERSTANDS THE TWO SPELLINGS THE REFERENCE ACCEPTS, and they are not two
+		# flows: 'xtls-rprx-vision-udp443' is Vision with the reference's `allowUDP443` set, and
+		# the value is truncated to sixteen bytes before it goes on the wire
+		# (vendor/Xray-core/proxy/vless/outbound/outbound.go:249-254). Both are passed through to
+		# lc-tunnel as written; deciding what they mean is the client's job, not this script's.
+		#
+		# This used to refuse '-udp443' outright, on the belief that accepting it would silently
+		# mean "no Vision". That was true of the client as it then was and is not true of the
+		# reference, which defines the value exactly — so the refusal turned a legal plane setting
+		# into a router that would not start, and every LC box on a server whose flow was switched
+		# to it went down at once.
+		case "$flow" in
+		xtls-rprx-vision | xtls-rprx-vision-udp443) set -- "$PROG" "$STATE/fingerprint.fpt" \
+			"$node" "$port" "$sni" "$pbk" "$sid" "@$uuid_file" "$listen_port" -f "$flow" ;;
+		'' | none) set -- "$PROG" "$STATE/fingerprint.fpt" \
+			"$node" "$port" "$sni" "$pbk" "$sid" "@$uuid_file" "$listen_port"
+			logger -t lite-client "running without XTLS-Vision: the inner TLS is not hidden" ;;
+		*)
+			logger -t lite-client "flow '$flow' is not one this client implements; not starting"
+			logger -t lite-client "it understands xtls-rprx-vision[-udp443], or none for plain VLESS"
+			return 1
+			;;
+		esac
+		;;
+	*)
+		logger -t lite-client "plane must be reality or hysteria, not '$plane'; not starting"
+		return 1
+		;;
+	esac
+
+	# UDP on both planes, because the option is common to both — and because without it QUIC travels
+	# beside the tunnel rather than through it. A browser denied UDP/443 falls back to TCP by itself;
+	# a browser HANDED UDP/443 directly uses it, and says nothing about it.
+	[ -n "$udp_port" ] && set -- "$@" -u "$udp_port"
+
+	# How many copies of the tunnel share the listeners.
+	#
+	# Left out of the command line when unset, so the client's own default applies (below); passed
+	# through whenever it is set.
+	#
+	# ⚠️ WHAT IT DOES AND DOES NOT DO, because the name invites the wrong expectation: it splits
+	# CONNECTIONS across cores, not one download. A single stream lives in one worker from beginning
+	# to end and is exactly as fast as it was. A household with many connections open at once is
+	# what gains.
+	#
+	# procd still supervises ONE pid, and that is deliberate: with more than one worker the parent
+	# stops carrying traffic and becomes their supervisor, so a worker that dies is replaced without
+	# procd ever needing to know. See `supervise` in lc-tunnel.
+	#
+	# Empty now means the client's own default, which since 2026-09-23 is one worker per CPU on the
+	# REALITY plane and one on Hysteria2 (see lc-tunnel, before `supervise`) — so a value that IS set,
+	# 1 included, is passed through: `1` has to keep meaning one, not "whatever the default is".
+	# Which values a plane can take at all is lc_workers_ok's business.
+	if [ -n "$workers" ]; then
+		lc_workers_ok "$plane" "$workers" || return 1
+		set -- "$@" -w "$workers"
+	fi
+
+	# File ownership, mode, contents and fingerprint format belong to the client parser.
+	# Refuse before tuning TCP, publishing a procd instance or intercepting any LAN traffic.
+	lc_clients_ok "$client_net" || return 1
+	if ! lc_check_error=$("$@" --check-config 2>&1); then
+		logger -t lite-client "configuration rejected by lc-tunnel: $lc_check_error"
+		return 1
+	fi
+
+	# Before the tunnel rather than after it, so that its first download already has the room. Past
+	# every refusal above: rejected configuration only cleans previous interception, without tuning TCP.
+	lc_tune_tcp
+
+	procd_open_instance
+	procd_set_param command "$@"
+	# Bounded RAM evidence can be drained by an external diagnostics collector.
+	# An ordinary service stop terminates the supervisor and records no crash.
+	mkdir -p "$EVENTS" || return 1
+	chmod 700 "$EVENTS" || return 1
+	local source_version diagnostic_client_id
+	source_version=$("$PROG" --version) || return 1
+	config_get diagnostic_client_id main diagnostic_client_id ''
+	case "$diagnostic_client_id" in *[!0-9]*) return 1 ;; esac
+	[ -z "$diagnostic_client_id" ] || { [ "${#diagnostic_client_id}" -le 10 ] && [ "$diagnostic_client_id" -le 2147483647 ]; } || return 1
+	procd_set_param env "LC_EVENT_DIR=$EVENTS" "LC_SOURCE_VERSION=$source_version" "LC_PLANE=$plane" "LC_CLIENT_ID=$diagnostic_client_id"
+	# retry 0 means "respawn forever", and on the Hysteria2 plane that is now the only answer that
+	# keeps a tunnel. lc-tunnel does what the reference client does when the node does not answer at
+	# start: it exits (`failed to initialize client`, status 1). After a restart the path can refuse
+	# handshakes for minutes, so a limit of five exits in the hour would stop the service for good
+	# a minute into that and leave the LAN intercepted into nothing. Every mistake a configuration can
+	# make is refused above, before the rules go up, so what exits from here is the node or the path:
+	# each restart, five seconds apart, is one more attempt, as each new start of the reference is.
+	procd_set_param respawn 3600 5 0
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	# OpenWrt's default_postinst calls start on upgrade. Without these managed inputs,
+	# unchanged UCI/argv let procd retain the old executable after APK replaced its file.
+	procd_set_param file "$CONF" "$PROG" "$STATE/fingerprint.fpt"
+	procd_close_instance
+
+	# The rules follow command validation and instance preparation. rc.common::rc_procd publishes
+	# the service after start_service returns; procd_close_instance alone does not start a process.
+	lc_rules_up "$listen_port" "$client_net" "$node" "$udp_port" || {
+		logger -t lite-client "the intercept rules did not come up; nothing is intercepted"
+		logger -t lite-client "the tunnel instance is prepared for procd; check service status after startup"
+		return 1
+	}
+	LC_READY_TCP=$listen_port
+	LC_READY_UDP=$udp_port
+	LC_WAIT_READY=1
+	LC_START_RESULT=0
+	return 0
+}
+
+# A supervisor retains the shared TCP socket while every worker is restarting.
+# Only an event-loop registration in the owning process proves a local consumer.
+lc_fd_polled() {
+	local pid="$1" watched="$2" info
+	for info in /proc/"$pid"/fdinfo/[0-9] /proc/"$pid"/fdinfo/*; do
+		[ "$(readlink "/proc/$pid/fd/${info##*/}" 2>/dev/null)" = 'anon_inode:[eventpoll]' ] || continue
+		awk -v fd="$watched" '$1 == "tfd:" && $2 == fd { found=1 } END { exit !found }' \
+			"$info" 2>/dev/null && return 0
+	done
+	return 1
+}
+
+# A port existing in /proc/net is not readiness: an unrelated process may own it.
+# The owner must run the current binary and poll the matching socket itself.
+lc_listener_owned() {
+	local pid="$1" port="$2" protocol="$3" state hex inodes children process fd target inode owner_state
+	case "$protocol" in tcp) state=0A ;; udp) state=07 ;; *) return 1 ;; esac
+	hex=$(awk -v p="$port" 'BEGIN {printf "%04X", p+0}')
+	inodes=$(awk -v p="$hex" -v s="$state" '$2 ~ (":" p "$") && $4 == s {print $10}' \
+		"/proc/net/$protocol" "/proc/net/${protocol}6" 2>/dev/null)
+	[ -n "$inodes" ] || return 1
+	# OpenWrt kernels need not enable CHECKPOINT_RESTORE, which supplies the
+	# task/children file. PPid in proc status is available on the device kernels.
+	children=$(awk -v parent="$pid" '$1 == "PPid:" && $2 == parent {
+		split(FILENAME, path, "/"); print path[3]
+	}' /proc/[0-9]*/status 2>/dev/null)
+	for process in $pid $children; do
+		lc_is_number "$process" || continue
+		[ "$(readlink "/proc/$process/exe" 2>/dev/null)" = "$PROG" ] || continue
+		owner_state=$(awk '$1 == "State:" {print $2}' "/proc/$process/status" 2>/dev/null)
+		case "$owner_state" in ''|T|t|Z|X) continue ;; esac
+		for fd in /proc/"$process"/fd/[0-9] /proc/"$process"/fd/*; do
+			target=$(readlink "$fd" 2>/dev/null) || continue
+			for inode in $inodes; do
+				[ "$target" = "socket:[$inode]" ] && lc_fd_polled "$process" "${fd##*/}" && return 0
+			done
+		done
+	done
+	return 1
+}
+
+lc_wait_ready() {
+	local attempt=0 pid
+	while [ "$attempt" -lt 10 ]; do
+		pid=$(ubus -t 1 call service list '{"name":"lite-client"}' 2>/dev/null | \
+			jsonfilter -e '@["lite-client"].instances.instance1.pid' 2>/dev/null)
+		if lc_is_number "$pid" && lc_listener_owned "$pid" "$1" tcp; then
+			[ -z "$2" ] || lc_listener_owned "$pid" "$2" udp || {
+				attempt=$((attempt + 1)); sleep 1; continue
+			}
+			return 0
+		fi
+		attempt=$((attempt + 1))
+		sleep 1
+	done
+	return 1
+}
+
+# rc.common calls this after publishing the prepared service to procd. It also
+# preserves configuration errors that rc_procd otherwise replaces with the ubus result.
+service_started() {
+	[ "${LC_START_RESULT:-1}" = 0 ] || return 1
+	[ "${LC_WAIT_READY:-0}" = 1 ] || return 0
+	lc_wait_ready "$LC_READY_TCP" "$LC_READY_UDP" && return 0
+	# Keep the existing fail-closed policy: readiness failure must not remove rules
+	# or stop procd's retries, including when Hysteria's upstream is temporarily down.
+	logger -t lite-client "listeners are not ready; procd keeps retrying and interception remains in place"
+	return 1
+}
+
+stop_service() {
+	lc_rules_down
+}
+
+# Reloading means the rules and the process both have to come back consistent with the new config,
+# and the only way to be sure of that is to take everything down first. See lc_rules_up.
+#
+# Written out because without it `reload` is not `restart`: rc.common falls back to start alone, and
+# stop_service — the only caller of lc_rules_down — never runs. Set `enabled 0` and commit, or commit
+# a config this build refuses, and procd drops the instance while the interception stays behind:
+# every listed client's 80 and 443 pointing at a socket that no longer exists. "No internet at home",
+# with nothing in the log to connect it to the change that caused it.
+reload_service() {
+	stop
+	start
+}
+
+service_triggers() {
+	procd_add_reload_trigger lite-client
+	procd_add_interface_trigger "interface.*.up" wan /etc/init.d/lite-client restart
+}
+
+lc_rules_down() {
+	local lc_family lc_table lc_tries
+	# Own one bit outside mwan3 and Tailscale masks. Remove only the reserved
+	# selector; explicitly retire both historical 0x40404 bindings on upgrade.
+	for lc_family in -4 -6; do
+		lc_tries=0
+		while [ "$lc_tries" -lt 32 ] && ip "$lc_family" rule del fwmark "$FWMARK/$FWMARK" lookup "$RT_TABLE" priority 102 2>/dev/null; do
+			lc_tries=$((lc_tries + 1))
+		done
+		for lc_table in 101 104; do
+			lc_tries=0
+			while [ "$lc_tries" -lt 32 ] && ip "$lc_family" rule del fwmark 0x40404 lookup "$lc_table" 2>/dev/null; do
+				lc_tries=$((lc_tries + 1))
+			done
+		done
+		ip "$lc_family" route flush table "$RT_TABLE" 2>/dev/null
+	done
+	nft delete table inet lite_client 2>/dev/null
+	return 0
+}
+
+lc_rules_up() {
+	local port="$1" clients="$2" node="$3" udp="$4"
+
+	# Down first, always. Starting is then the same whether or not a previous start left anything,
+	# which is the property the first version lacked.
+	lc_rules_down
+
+	# NOBODY LISTED MEANS NO CLIENT RULES — AND EVERYTHING ELSE STILL GOES UP.
+	#
+	# `clients` empty is not an unfinished configuration: it is how the tunnel is run when something
+	# else decides whose traffic goes into it: another firewall component marks by domain and prefix
+	# in its own fw4 chain and tproxies into our listener.
+	#
+	# THE COMMENT THAT STOOD HERE SAID THE REST WAS A SECOND COPY OF WHAT THAT COMPONENT ALREADY HAS,
+	# AND THAT IS NOT TRUE ON EVERY ROUTER. Measured on a live box running exactly this arrangement:
+	# the only `socket transparent` rules in the whole ruleset were ours, `vpn_exclude` was empty so
+	# nothing else excluded the node's own address, and the routing table the marked packets are sent
+	# to — `ip rule fwmark 0x40404 lookup 104` with `local default dev lo` — was ours as well. The
+	# fw4 plane marks and tproxies; it does not carry the pieces that make a tproxy socket work.
+	#
+	# So an empty `clients` used to take four things down with it: both `socket transparent` accepts,
+	# without which packets belonging to an established transparent socket are not delivered to it;
+	# the `return` on the node's address, without which our own tunnel traffic can be marked and fed
+	# back into itself; and the ip rule and route, without which a marked packet has nowhere to go.
+	# The tunnel then ran with nothing reaching it and nothing said why.
+	#
+	# What is genuinely per-client is the saddr tproxy pair at the end of this function, and only
+	# that is skipped now.
+	if [ -z "$clients" ]; then
+		logger -t lite-client "no clients listed: this router intercepts nobody by address"
+		logger -t lite-client "the listener and its routing stay up, for whatever else marks traffic into them"
+	fi
+
+	# WHAT IS NOT INTERCEPTED, ONCE, WHERE SOMEBODY WILL SEE IT.
+	#
+	# This service takes 80 and 443 over IPv4 from the listed addresses. Everything else — every other
+	# port, all of UDP unless udp_port is set, and the whole of IPv6 — leaves the way it always did.
+	# That is the design and not a fault, but it is invisible from the router: `service list` says
+	# running, a check-my-ip page over TCP shows the node, and QUIC and IPv6 are meanwhile taking
+	# their own road. A household is entitled to know which half of its traffic it has.
+	#
+	# IPv6 especially: lc_rules_down clears v6 rules that lc_rules_up has never added, which is the
+	# shape of a plan rather than of an oversight. Until it is written, a dual-stack LAN reaches every
+	# name with an AAAA record directly, and only the v4 fallbacks come through here.
+	[ -n "$udp" ] || logger -t lite-client \
+		"udp_port is unset: UDP is not intercepted, so QUIC leaves this router directly"
+	logger -t lite-client "IPv6 is not intercepted; only IPv4 ports 80 and 443 enter the tunnel"
+
+	ip rule add fwmark "$FWMARK/$FWMARK" lookup "$RT_TABLE" priority 102 || return 1
+	ip route add local default dev lo table "$RT_TABLE" || {
+		lc_rules_down
+		return 1
+	}
+
+	# THE WHOLE RULESET IN ONE TRANSACTION, not rule by rule — established on a router.
+	#
+	# Five early refusals (port, plane, public_key, uuid_file, a plane this build lacks) leave nothing
+	# behind. The sixth — a malformed entry in `clients` — did, and it was not cosmetic: the rules
+	# were added one at a time, `192.168.10.0/33` failed on ITS OWN line, and interception for the
+	# addresses listed BEFORE it was already up. No process existed by then, because the start had
+	# been judged a failure. That is exactly the hole the rules are raised last to avoid: a host on
+	# the LAN with 80 and 443 diverted into nothing. The log meanwhile said "nothing is intercepted",
+	# which was false, and "the tunnel itself is running", which was also false.
+	#
+	# `nft -f -` applies a ruleset atomically: one bad line cancels the whole of it, and a partial
+	# state does not exist for an instant. The refusal is closing again, as it was meant to be.
+	local script c
+
+	# Packets already belonging to a transparent socket: marked so the routing rule above delivers
+	# them to it, and accepted so nothing further reconsiders them.
+	script="add table inet lite_client
+add chain inet lite_client prerouting { type filter hook prerouting priority mangle; policy accept; }
+add rule inet lite_client prerouting meta l4proto tcp socket transparent 1 meta mark set meta mark | $FWMARK counter accept
+"
+	# UDP always enters through the selected TPROXY listener. The transparent sockets
+	# in lc_udp_reply_socket (src/net/tproxy.c) only send replies and are not polled.
+	# A generic UDP socket lookup would deliver new unselected clients to those sockets.
+	# Hysteria's UDPTProxy.newPair/forwarding instead reads connected per-client sockets
+	# (vendor/hysteria/app/internal/tproxy/udp_linux.go); its diversion model differs.
+
+	# The node itself is never intercepted. Not for the tunnel's own connections, which no rule here
+	# can match — they leave by the output hook, and what comes back has the node, not a client, as
+	# its source — but for a LAN host reaching the node directly, a phone with its own client for the
+	# same node, which the rules below would carry into the tunnel and out to the node again. ("One
+	# request became forty-two round trips before this line existed" stood here from the first
+	# commit, blaming the tunnel's own connection.)
+	#
+	# The family is chosen from each address itself rather than both lines being written: in an
+	# atomic ruleset an `ip6 daddr` line holding an IPv4 address is a syntax error that cancels
+	# EVERYTHING. It used to be swallowed by `2>/dev/null`, and that same silence hid the fact that on
+	# an IPv6 node not one of these rules was going up.
+	#
+	# A NAME IS TAKEN, and exempted by the addresses it has now. It used to be refused ("not an IPv4
+	# address; not starting"), because nft given a name resolves it once at insertion and refuses one
+	# with more than one address outright. The tunnel looks the name up for every dial, as the
+	# reference does (src/net/dial.h), so an address the name moves to later is not in these rules
+	# until the next start: until then a LAN host's own connection to it goes through the tunnel,
+	# and the tunnel's does not care. Every address is checked for shape before it goes into the
+	# script, as the configuration's own values are.
+	local a addrs="$node"
+	lc_is_ip4 "$node" || lc_is_ip6 "$node" || {
+		addrs=$(lc_node_addrs "$node")
+		[ -n "$addrs" ] || logger -t lite-client "node '$node' has no address yet; it is exempted from interception by none"
+	}
+	for a in $addrs; do
+		if lc_is_ip4 "$a"; then
+			script="${script}add rule inet lite_client prerouting ip daddr $a counter return
+"
+		elif lc_is_ip6 "$a"; then
+			script="${script}add rule inet lite_client prerouting ip6 daddr $a counter return
+"
+		else
+			logger -t lite-client "node '$node': '$a' is not an address; not starting"
+			lc_rules_down
+			return 1
+		fi
+	done
+
+	# And only what the configuration asked for. `clients` is a set of addresses or prefixes, not
+	# the whole subnet by default: intercepting everything on a router is how one experiment takes
+	# a household's internet with it.
+	# Empty expands to nothing, so an unlisted router simply adds no saddr rules here.
+	for c in $clients; do
+		# The interception is written for IPv4 only (`ip saddr`, `tproxy ip to`), so an IPv6 address
+		# here has always been a mistake — just, until now, a silent one. Saying so is our job: a host
+		# somebody listed and which is not intercepted goes straight out to the internet.
+		lc_clients_ok "$c" || {
+			lc_rules_down
+			return 1
+		}
+		script="${script}add rule inet lite_client prerouting ip saddr $c tcp dport { 80, 443 } meta mark set meta mark | $FWMARK counter
+add rule inet lite_client prerouting ip saddr $c tcp dport { 80, 443 } tproxy ip to :$port counter accept
+"
+		# UDP/443 is QUIC, and no other port is listed here on purpose: DNS (53) must not be diverted
+		# — the router's own resolver handles it — and everything indiscriminately would mean DHCP,
+		# NTP and whatever the router itself talks over.
+		[ -n "$udp" ] && script="${script}add rule inet lite_client prerouting ip saddr $c udp dport 443 meta mark set meta mark | $FWMARK counter
+add rule inet lite_client prerouting ip saddr $c udp dport 443 tproxy ip to :$udp counter accept
+"
+	done
+
+	echo "$script" | nft -f - || {
+		logger -t lite-client "the intercept ruleset was refused as a whole; check 'clients' in $CONF"
+		lc_rules_down
+		return 1
+	}
+	return 0
+}

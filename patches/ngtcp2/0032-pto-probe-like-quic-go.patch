@@ -1,0 +1,265 @@
+A client's PTO probe as quic-go packs one.
+
+When a probe is due, quic-go first takes the oldest packet still outstanding out of its history and
+out of flight and queues its frames to be sent again, and only then packs the probe; if that packs
+nothing — what the packet carried was delivered another way — it takes the next oldest, and when none
+is left the probe is a PING (QueueProbePacket and sendProbePacket,
+vendor/quic-go/internal/ackhandler/sent_packet_handler.go:1120-1133,
+vendor/quic-go/connection.go:2732-2769). Nothing is reported lost: no congestion event, no count, no
+ECN verdict. And a PTO in the application data space leaves a packet number out, "in order to elicit
+an immediate ACK" (sent_packet_handler.go:989-993).
+
+Upstream ngtcp2 packed new data into a probe when it had any, and went back to an old packet only
+when it had none; the old packet stayed in ngtcp2_rtb, in flight, marked reclaimed, so its later
+acknowledgement still counted; a client's Initial probe took two packets at once; and no packet
+number was left out.
+
+A client now runs ngtcp2_rtb_queue_probe before each probe it packs, in every packet number space,
+and leaves a number out on a 1-RTT PTO — the one quic-go's PopPacketNumber hands the timer, and the
+scheduled one before it when that is due (:1041-1052). The server keeps upstream's code.
+
+Checked against quic-go's own sentPacketHandler, run by tools/qgovec: test/ngpatch.
+
+diff -Naur a/lib/ngtcp2_conn.c b/lib/ngtcp2_conn.c
+--- a/lib/ngtcp2_conn.c
++++ b/lib/ngtcp2_conn.c
+@@ -1336,6 +1336,41 @@
+   return 0;
+ }
+ 
++/*
++ * conn_skip_pkt_now leaves the next packet number of |pktns| out now,
++ * whether or not one is due: the one a client's PTO skips.  It does not
++ * move the next scheduled skip, as quic-go's does not
++ * (vendor/quic-go/internal/ackhandler/sent_packet_handler.go:989-993).
++ */
++static int conn_skip_pkt_now(ngtcp2_conn *conn, ngtcp2_pktns *pktns,
++                             ngtcp2_tstamp ts) {
++  ngtcp2_rtb_entry *rtbent;
++  ngtcp2_pkt_hd hd;
++  int rv;
++
++  ngtcp2_pkt_hd_init(&hd, 0, NGTCP2_PKT_1RTT, NULL, NULL,
++                     pktns->tx.last_pkt_num + 1, 0, 0);
++
++  rv = ngtcp2_rtb_entry_objalloc_new(&rtbent, &hd, NULL, ts, 0,
++                                     NGTCP2_RTB_ENTRY_FLAG_SKIP,
++                                     &conn->rtb_entry_objalloc);
++  if (rv != 0) {
++    assert(ngtcp2_err_is_fatal(rv));
++    return rv;
++  }
++
++  rv = ngtcp2_rtb_add(&pktns->rtb, rtbent, &conn->cstat);
++  if (rv != 0) {
++    ngtcp2_rtb_entry_objalloc_del(rtbent, &conn->rtb_entry_objalloc,
++                                  &conn->frc_objalloc, conn->mem);
++    return rv;
++  }
++
++  ++pktns->tx.last_pkt_num;
++
++  return 0;
++}
++
+ static size_t buflen_align(size_t buflen) {
+   return (buflen + 0x7U) & ~(size_t)0x7U;
+ }
+@@ -3317,6 +3352,7 @@
+   ngtcp2_ssize num_reclaimed;
+   uint32_t version;
+   int split_ack = 0;
++  int probe_queued = 0;
+   int chrome_done = 0;
+   size_t chrome_padding = (size_t)-1;
+ 
+@@ -3389,6 +3425,16 @@
+     }
+   }
+ 
++  /* The probe takes the oldest packet still outstanding out of flight
++     before anything is packed, as for 1-RTT: see conn_write_pkt. */
++  if (!conn->server && pktns->rtb.probe_pkt_left) {
++    rv = ngtcp2_rtb_queue_probe(&pktns->rtb, conn, pktns, &conn->cstat);
++    if (rv < 0) {
++      return rv;
++    }
++    probe_queued = rv;
++  }
++
+   /* The ACK of the server's Handshake flight goes alone under the
+      parrot, and the CRYPTO it would have carried — our Finished — goes
+      in the next datagram, unless what is queued is a retransmission
+@@ -3526,7 +3572,21 @@
+       }
+     }
+ 
+-    if (!(rtb_entry_flags & NGTCP2_RTB_ENTRY_FLAG_ACK_ELICITING) &&
++    if (!conn->server) {
++      if (!(rtb_entry_flags & NGTCP2_RTB_ENTRY_FLAG_ACK_ELICITING) &&
++          probe_queued) {
++        rv = ngtcp2_rtb_queue_probe(&pktns->rtb, conn, pktns, &conn->cstat);
++        if (rv < 0) {
++          ngtcp2_frame_chain_list_objalloc_del(frq, &conn->frc_objalloc,
++                                               conn->mem);
++          return rv;
++        }
++        probe_queued = rv;
++        if (probe_queued) {
++          goto build_pkt;
++        }
++      }
++    } else if (!(rtb_entry_flags & NGTCP2_RTB_ENTRY_FLAG_ACK_ELICITING) &&
+         pktns->rtb.num_retransmittable && pktns->rtb.probe_pkt_left) {
+       num_reclaimed = ngtcp2_rtb_reclaim_on_pto(
+         &pktns->rtb, conn, pktns,
+@@ -4710,6 +4770,7 @@
+   uint64_t delta;
+   const ngtcp2_cid *scid = NULL;
+   int keep_alive_expired = 0;
++  int probe_queued = 0;
+   uint32_t version = 0;
+ 
+   /* Return 0 if destlen is less than minimum packet length which can
+@@ -4953,6 +5014,19 @@
+       }
+     }
+ 
++    /* A client's probe takes the oldest packet still outstanding out of
++       flight first, and its frames are what the probe carries: quic-go
++       runs QueueProbePacket before it packs each one
++       (vendor/quic-go/connection.go:2745-2757).  Upstream packed new data
++       and went back to old packets only when there was none. */
++    if (!conn->server && pktns->rtb.probe_pkt_left) {
++      rv = ngtcp2_rtb_queue_probe(&pktns->rtb, conn, pktns, cstat);
++      if (rv < 0) {
++        return rv;
++      }
++      probe_queued = rv;
++    }
++
+   build_pkt:
+     for (pfrc = &pktns->tx.frq; *pfrc;) {
+       if ((*pfrc)->binder &&
+@@ -5418,7 +5492,23 @@
+       }
+     }
+ 
+-    if (pktns->tx.frq == NULL && !send_stream && !send_datagram &&
++    /* Nothing packed after all — what the taken packet carried had been
++       delivered another way: the next oldest, and so on until one gives
++       the probe something, or none is left and it is a PING
++       (vendor/quic-go/connection.go:2747-2764). */
++    if (!conn->server) {
++      if (!(rtb_entry_flags & NGTCP2_RTB_ENTRY_FLAG_ACK_ELICITING) &&
++          probe_queued) {
++        rv = ngtcp2_rtb_queue_probe(&pktns->rtb, conn, pktns, cstat);
++        if (rv < 0) {
++          return rv;
++        }
++        probe_queued = rv;
++        if (probe_queued) {
++          goto build_pkt;
++        }
++      }
++    } else if (pktns->tx.frq == NULL && !send_stream && !send_datagram &&
+         !(rtb_entry_flags & NGTCP2_RTB_ENTRY_FLAG_ACK_ELICITING) &&
+         pktns->rtb.num_retransmittable && pktns->rtb.probe_pkt_left) {
+       num_reclaimed = ngtcp2_rtb_reclaim_on_pto(&pktns->rtb, conn, pktns, 1);
+@@ -15458,6 +15548,20 @@
+       hs_pktns->rtb.probe_pkt_left = 2;
+     } else {
+       conn->pktns.rtb.probe_pkt_left = 2;
++
++      /* And a packet number is left out, "in order to elicit an immediate
++         ACK": quic-go pops the next number and records it as skipped — two
++         in a row when the one it pops is itself due to be skipped
++         (vendor/quic-go/internal/ackhandler/sent_packet_handler.go:
++         989-993, :1041-1052). */
++      rv = conn_handle_skip_pkt(conn, &conn->pktns, ts);
++      if (rv != 0) {
++        return rv;
++      }
++      rv = conn_skip_pkt_now(conn, &conn->pktns, ts);
++      if (rv != 0) {
++        return rv;
++      }
+     }
+   } else {
+     if (in_pktns && in_pktns->rtb.num_pto_eliciting) {
+diff -Naur a/lib/ngtcp2_rtb.c b/lib/ngtcp2_rtb.c
+--- a/lib/ngtcp2_rtb.c
++++ b/lib/ngtcp2_rtb.c
+@@ -1905,3 +1905,47 @@
+ 
+   return (ngtcp2_ssize)(atmost - num_pkts);
+ }
++
++int ngtcp2_rtb_queue_probe(ngtcp2_rtb *rtb, ngtcp2_conn *conn,
++                           ngtcp2_pktns *pktns, ngtcp2_conn_stat *cstat) {
++  ngtcp2_ksl_it it;
++  ngtcp2_rtb_entry *ent;
++  ngtcp2_ssize reclaimed;
++  int rv;
++
++  /* Oldest first: FirstOutstanding walks the history from its start
++     (vendor/quic-go/internal/ackhandler/sent_packet_history.go:102-113),
++     and Outstanding is ack-eliciting, not a path MTU probe
++     (vendor/quic-go/internal/ackhandler/packet.go:30-32). */
++  it = ngtcp2_ksl_end(&rtb->ents);
++  while (!ngtcp2_ksl_it_begin(&it)) {
++    ngtcp2_ksl_it_prev(&it);
++    ent = ngtcp2_ksl_it_get(&it);
++
++    if ((ent->flags & (NGTCP2_RTB_ENTRY_FLAG_LOST_RETRANSMITTED |
++                       NGTCP2_RTB_ENTRY_FLAG_SKIP |
++                       NGTCP2_RTB_ENTRY_FLAG_PMTUD_PROBE)) ||
++        !(ent->flags & NGTCP2_RTB_ENTRY_FLAG_ACK_ELICITING)) {
++      continue;
++    }
++
++    if ((ent->flags & NGTCP2_RTB_ENTRY_FLAG_RETRANSMITTABLE) &&
++        !(ent->flags & NGTCP2_RTB_ENTRY_FLAG_PTO_RECLAIMED)) {
++      reclaimed =
++        rtb_reclaim_frame(rtb, NGTCP2_RECLAIM_FLAG_ON_LOSS, conn, pktns, ent);
++      if (reclaimed < 0) {
++        return (int)reclaimed;
++      }
++    }
++
++    rtb_on_remove(rtb, ent, cstat);
++    rv = ngtcp2_ksl_remove_hint(&rtb->ents, &it, &it, &ent->hd.pkt_num);
++    assert(0 == rv);
++    ngtcp2_rtb_entry_objalloc_del(ent, rtb->rtb_entry_objalloc,
++                                  rtb->frc_objalloc, rtb->mem);
++
++    return 1;
++  }
++
++  return 0;
++}
+diff -Naur a/lib/ngtcp2_rtb.h b/lib/ngtcp2_rtb.h
+--- a/lib/ngtcp2_rtb.h
++++ b/lib/ngtcp2_rtb.h
+@@ -318,4 +318,21 @@
+ ngtcp2_ssize ngtcp2_rtb_reclaim_on_pto(ngtcp2_rtb *rtb, ngtcp2_conn *conn,
+                                        ngtcp2_pktns *pktns, size_t num_pkts);
+ 
++/*
++ * ngtcp2_rtb_queue_probe is quic-go's QueueProbePacket
++ * (vendor/quic-go/internal/ackhandler/sent_packet_handler.go:1120-1133),
++ * which a client runs before each probe it packs: the oldest packet still
++ * outstanding — ack-eliciting, not a path MTU probe, not declared lost —
++ * is taken out of flight and out of ngtcp2_rtb, and its frames are
++ * queued to be sent again.  Nobody is told of a loss: not the
++ * controller, not the ECN tracker, not the count of lost packets.  A
++ * later ACK of it acknowledges nothing, as the packet has left quic-go's
++ * history.
++ *
++ * It returns 1 if a packet was taken, 0 if none was outstanding, or
++ * NGTCP2_ERR_NOMEM.
++ */
++int ngtcp2_rtb_queue_probe(ngtcp2_rtb *rtb, ngtcp2_conn *conn,
++                           ngtcp2_pktns *pktns, ngtcp2_conn_stat *cstat);
++
+ #endif /* !defined(NGTCP2_RTB_H) */

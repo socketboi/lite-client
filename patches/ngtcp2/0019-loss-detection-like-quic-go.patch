@@ -1,0 +1,269 @@
+Loss detection as quic-go does it for a client.
+
+quic-go declares a packet lost once packetThreshold = 3 packets after it are acknowledged, not
+counting packet numbers it skipped, or once it is older than 9/8 of the larger of the latest and the
+smoothed RTT (detectLostPackets and Difference:
+vendor/quic-go/internal/ackhandler/sent_packet_handler.go:827-911,
+vendor/quic-go/internal/ackhandler/sent_packet_history.go:248-267). Upstream ngtcp2 differed in
+three ways a client shows:
+
+  - its packet threshold grows with the flight, to half the packets in flight and up to 256: with
+    a hundred packets out and the fiftieth acknowledged, quic-go declares 47 lost and ngtcp2
+    declared none;
+  - it declared the lost newest first, and their frames went back to the streams, and the streams
+    into the retransmission queue, in that order; quic-go walks its history oldest first;
+  - it had RFC 9002's persistent congestion, which quic-go does not: after a loss window of three
+    PTOs it started the RTT estimate over and reset the controller.
+
+A client now runs rtb_detect_lost_pkt_qgo; the server keeps upstream's code. With it, hysteria's
+controller gets no congestion_event from loss detection: quic-go runs OnCongestionEvent per lost
+packet in the same pass, which hybbr does with the ACK or the loss timer from on_pkt_lost, so the
+only congestion_event left is ECN-CE — a no-op for hysteria's BBR
+(vendor/hysteria/core/internal/congestion/bbr/bbr_sender.go:534-536) and a cutback at the largest
+acknowledged packet for NewReno. Before, NewReno took every loss event as one, and cut back again
+when a loss from an earlier window came with an ACK beyond it.
+
+Checked against quic-go's own sentPacketHandler, run by tools/qgovec: test/ngpatch.
+
+diff --git a/lib/ngtcp2_hybbr.c b/lib/ngtcp2_hybbr.c
+index d235888..fd6d161 100644
+--- a/lib/ngtcp2_hybbr.c
++++ b/lib/ngtcp2_hybbr.c
+@@ -2249,39 +2249,39 @@ void ngtcp2_hybbr_on_loss_timer(ngtcp2_hybbr *hybbr, ngtcp2_conn_stat *cstat,
+   hybbr_on_congestion_event(hybbr, ts);
+ }
+ 
+-/* Loss detected away from an ack — a timer, or ECN. ngtcp2 calls this after reporting the lost
+- * packets, and no on_ack_recv follows, so the event is run here instead. */
++/* ECN-CE, and nothing else: a client's losses reach the controller through on_pkt_lost and run
++ * with the ACK (on_ack_recv) or the loss timer (ngtcp2_hybbr_on_loss_timer), and its loss detection
++ * makes no congestion_event of them (rtb_detect_lost_pkt_qgo in ngtcp2_rtb.c). quic-go reports
++ * ECN-CE as OnCongestionEvent at the largest packet acknowledged, before that ACK's losses are
++ * looked for (vendor/quic-go/internal/ackhandler/sent_packet_handler.go:450-458): hysteria's BBR
++ * does nothing with it (core/internal/congestion/bbr/bbr_sender.go:534-536), and NewReno cuts back
++ * as for a loss. ngtcp2 calls this after it has detected the losses, which NewReno has not run yet
++ * — they wait in the batch for on_ack_recv — so the order is quic-go's. */
+ void ngtcp2_cc_hybbr_congestion_event(ngtcp2_cc *cc, ngtcp2_conn_stat *cstat,
+                                       ngtcp2_tstamp sent_ts,
+                                       const ngtcp2_cc_ack *ack,
+                                       ngtcp2_tstamp ts) {
+   ngtcp2_hybbr *hybbr = ngtcp2_struct_of(cc, ngtcp2_hybbr, cc);
++  int64_t largest;
++  size_t i;
+   (void)sent_ts;
+   (void)ack;
++  (void)ts;
+ 
+-  /* ECN-CE, which is all ngtcp2 calls this for: quic-go's NewReno cuts back as for a loss, at the
+-     largest packet acknowledged (vendor/quic-go/internal/ackhandler/sent_packet_handler.go:450-458). */
+-  if (hybbr->reno.on) {
+-    int64_t largest = hybbr->reno.largest_acked;
+-    size_t i;
+-
+-    for (i = 0; i < hybbr->acked_len; ++i) {
+-      if (hybbr->acked[i].pkt_num > largest) {
+-        largest = hybbr->acked[i].pkt_num;
+-      }
+-    }
+-    if (largest != -1) {
+-      reno_on_congestion_event(&hybbr->reno, largest);
+-      reno_publish(hybbr, cstat);
+-    }
++  if (!hybbr->reno.on) {
+     return;
+   }
+ 
+-  if (hybbr->lost_len == 0 && hybbr->acked_len == 0) {
+-    return;
++  largest = hybbr->reno.largest_acked;
++  for (i = 0; i < hybbr->acked_len; ++i) {
++    if (hybbr->acked[i].pkt_num > largest) {
++      largest = hybbr->acked[i].pkt_num;
++    }
++  }
++  if (largest != -1) {
++    reno_on_congestion_event(&hybbr->reno, largest);
++    reno_publish(hybbr, cstat);
+   }
+-
+-  ngtcp2_cc_hybbr_on_ack_recv(cc, cstat, ack, ts);
+ }
+ 
+ /* A path change: ngtcp2 asks the controller to start again. The reference has no such event — a
+diff --git a/lib/ngtcp2_rtb.c b/lib/ngtcp2_rtb.c
+index 45d4ebc..3614c12 100644
+--- a/lib/ngtcp2_rtb.c
++++ b/lib/ngtcp2_rtb.c
+@@ -1041,6 +1041,159 @@ static int conn_all_ecn_pkt_lost(ngtcp2_conn *conn) {
+          pktns->tx.ecn.validation_pkt_sent == pktns->tx.ecn.validation_pkt_lost;
+ }
+ 
++/*
++ * rtb_detect_lost_pkt_qgo is loss detection as quic-go does it for a
++ * client (detectLostPackets, vendor/quic-go/internal/ackhandler/
++ * sent_packet_handler.go:827-911).  Upstream's differs in four ways,
++ * each of which the client would show:
++ *
++ *   - the packet threshold is packetThreshold, 3 (:25), counted as
++ *     quic-go counts it — the packet numbers skipped in between do not
++ *     count (Difference, vendor/quic-go/internal/ackhandler/
++ *     sent_packet_history.go:248-267).  Upstream raised it with the
++ *     flight, to half the packets in flight and up to 256, so with a
++ *     hundred out it waited for fifty where quic-go waits for three;
++ *   - the lost are declared oldest first, as quic-go walks its history
++ *     (:844), and that is the order their frames go back to the streams
++ *     and the streams into the retransmission queue.  Upstream walked
++ *     newest first;
++ *   - there is no persistent congestion: quic-go has none, and upstream
++ *     reset the RTT estimate and the controller after a loss window of
++ *     three PTOs;
++ *   - hysteria's controller (hybbr) is told of the losses by
++ *     on_pkt_lost and runs them with the ACK or the loss timer, as
++ *     quic-go runs OnCongestionEvent per packet in the same pass
++ *     (:899-901) — so no congestion_event on top, which for hybbr means
++ *     an ECN-CE and nothing else (see ngtcp2_cc_hybbr_congestion_event).
++ *
++ * The loss time is quic-go's too: the oldest packet not yet lost, plus
++ * the loss delay (:882-889).
++ */
++static int rtb_detect_lost_pkt_qgo(ngtcp2_rtb *rtb, ngtcp2_cc_ack *cc_ack,
++                                   ngtcp2_conn *conn, ngtcp2_pktns *pktns,
++                                   ngtcp2_conn_stat *cstat, ngtcp2_tstamp ts) {
++  ngtcp2_rtb_entry *ent, *first = NULL;
++  ngtcp2_duration loss_delay = compute_pkt_loss_delay(cstat);
++  ngtcp2_ksl_it it, last;
++  ngtcp2_cc *cc = rtb->cc;
++  int64_t skipped = 0;
++  size_t ecn_pkt_lost = 0;
++  uint64_t bytes_lost = 0;
++  ngtcp2_tstamp loss_time;
++  ngtcp2_duration pto = ngtcp2_conn_compute_pto(conn, pktns);
++  int rv;
++
++  cstat->loss_time[pktns->id] = UINT64_MAX;
++
++  /* Newest first, to the newest packet that is lost: every packet older
++     than a lost one is lost too, by either threshold. */
++  it = ngtcp2_ksl_lower_bound(&rtb->ents, &rtb->largest_acked_tx_pkt_num);
++  for (; !ngtcp2_ksl_it_end(&it); ngtcp2_ksl_it_next(&it)) {
++    ent = ngtcp2_ksl_it_get(&it);
++
++    if (ent->flags & NGTCP2_RTB_ENTRY_FLAG_LOST_RETRANSMITTED) {
++      break;
++    }
++
++    if (ent->flags & NGTCP2_RTB_ENTRY_FLAG_SKIP) {
++      ++skipped;
++      continue;
++    }
++
++    if (ngtcp2_tstamp_elapsed(ent->ts, loss_delay, ts) ||
++        rtb->largest_acked_tx_pkt_num - ent->hd.pkt_num - skipped >=
++          NGTCP2_PKT_THRESHOLD) {
++      first = ent;
++      break;
++    }
++
++    loss_time = ent->ts + loss_delay;
++    if (loss_time < cstat->loss_time[pktns->id]) {
++      cstat->loss_time[pktns->id] = loss_time;
++    }
++  }
++
++  if (first == NULL) {
++    return 0;
++  }
++
++  /* To the oldest packet of the run, and back up from it. */
++  last = it;
++  for (ngtcp2_ksl_it_next(&it); !ngtcp2_ksl_it_end(&it);
++       ngtcp2_ksl_it_next(&it)) {
++    ent = ngtcp2_ksl_it_get(&it);
++
++    if (ent->flags & NGTCP2_RTB_ENTRY_FLAG_LOST_RETRANSMITTED) {
++      break;
++    }
++
++    last = it;
++  }
++
++  for (it = last;; ngtcp2_ksl_it_prev(&it)) {
++    ent = ngtcp2_ksl_it_get(&it);
++
++    if (ent->hd.pkt_num >= pktns->tx.ecn.start_pkt_num &&
++        (ent->flags & NGTCP2_RTB_ENTRY_FLAG_ECN)) {
++      ++ecn_pkt_lost;
++    }
++
++    bytes_lost += rtb_on_remove(rtb, ent, cstat);
++    rv = rtb_on_pkt_lost(rtb, ent, cstat, conn, pktns, ts);
++    if (rv != 0) {
++      return rv;
++    }
++
++    if (ent == first) {
++      break;
++    }
++  }
++
++  if (bytes_lost) {
++    switch (conn->tx.ecn.state) {
++    case NGTCP2_ECN_STATE_TESTING:
++      if (conn->tx.ecn.validation_start_ts == UINT64_MAX) {
++        break;
++      }
++
++      if (ts - conn->tx.ecn.validation_start_ts < 3 * pto) {
++        pktns->tx.ecn.validation_pkt_lost += ecn_pkt_lost;
++        assert(pktns->tx.ecn.validation_pkt_sent >=
++               pktns->tx.ecn.validation_pkt_lost);
++        break;
++      }
++
++      conn->tx.ecn.state = NGTCP2_ECN_STATE_UNKNOWN;
++
++      /* fall through */
++    case NGTCP2_ECN_STATE_UNKNOWN:
++      pktns->tx.ecn.validation_pkt_lost += ecn_pkt_lost;
++      assert(pktns->tx.ecn.validation_pkt_sent >=
++             pktns->tx.ecn.validation_pkt_lost);
++      if (conn_all_ecn_pkt_lost(conn)) {
++        conn->tx.ecn.state = NGTCP2_ECN_STATE_FAILED;
++      }
++      break;
++    default:
++      break;
++    }
++
++    cc_ack->bytes_lost = bytes_lost;
++
++    if (cc->congestion_event && conn->cc_algo != NGTCP2_CC_ALGO_HYBBR) {
++      cc->congestion_event(cc, cstat, first->ts, cc_ack, ts);
++    }
++  }
++
++  ngtcp2_rtb_remove_excessive_lost_pkt(
++    rtb, (size_t)ngtcp2_min(ngtcp2_max(rtb->cc_bytes_in_flight /
++                                         cstat->max_tx_udp_payload_size / 2,
++                                       NGTCP2_PKT_THRESHOLD),
++                            256));
++
++  return 0;
++}
++
+ /*
+  * This function assigns the number of bytes lost to
+  * |cc_ack|->bytes_lost if any.
+@@ -1064,6 +1217,12 @@ static int rtb_detect_lost_pkt(ngtcp2_rtb *rtb, ngtcp2_cc_ack *cc_ack,
+   uint64_t bytes_lost = 0;
+   ngtcp2_duration max_ack_delay;
+ 
++  /* A client detects its losses as quic-go does: see
++     rtb_detect_lost_pkt_qgo. */
++  if (!conn->server) {
++    return rtb_detect_lost_pkt_qgo(rtb, cc_ack, conn, pktns, cstat, ts);
++  }
++
+   pkt_thres = ngtcp2_max(pkt_thres, NGTCP2_PKT_THRESHOLD);
+   pkt_thres = ngtcp2_min(pkt_thres, 256);
+   cstat->loss_time[pktns->id] = UINT64_MAX;

@@ -1,0 +1,19 @@
+// Copied into GOROOT's x/text/unicode/norm by the Makefile (tools/.goroot-x) for tools/unitables,
+// which writes these tables out for C. Exports only: it changes nothing the package does.
+
+package norm
+
+func LCTables() (values []uint16, index []uint8, sparseOffset []uint16, sparse [][3]uint16, dec []byte, cc []uint8, recomp string, consts [8]int) {
+	for _, v := range nfcSparseValues {
+		sparse = append(sparse, [3]uint16{v.value, uint16(v.lo), uint16(v.hi)})
+	}
+	consts = [8]int{firstMulti, firstCCC, endMulti, firstLeadingCCC, firstCCCZeroExcept, firstStarterWithNLead, lastDecomp, maxDecomp}
+	return nfcValues[:], nfcIndex[:], nfcSparseOffset, sparse, decomps[:], ccc[:], recompMapPacked, consts
+}
+
+func LCLookupString(s string) (uint16, int) { return nfcData.lookupString(s) }
+
+func LCProps(s string) [7]int {
+	p := lookupInfoNFC(inputString(s), 0)
+	return [7]int{int(p.pos), int(p.size), int(p.ccc), int(p.tccc), int(p.nLead), int(p.flags), int(p.index)}
+}

@@ -1,0 +1,628 @@
+An ACK taken over what quic-go's history holds, not over what ngtcp2_rtb holds.
+
+quic-go keeps every packet it sent in its history until the packet is acknowledged or declared lost —
+the ones that elicit no acknowledgement too — and a packet declared lost leaves it
+(vendor/quic-go/internal/ackhandler/sent_packet_handler.go:331,
+vendor/quic-go/internal/ackhandler/sent_packet_history.go:61-67, :230-246).
+ReceivedAck works from that (vendor/quic-go/internal/ackhandler/sent_packet_handler.go:403-521). Upstream ngtcp2 worked from
+ngtcp2_rtb, which keeps no ACK-only packet and keeps a lost one, and a client showed it:
+
+  - an ACK acknowledging only ACK-only packets looked for no losses, so data packets three behind it
+    waited for the timer or the next ACK; quic-go declares them lost with it;
+  - an ACK of a packet already declared lost was processed as an acknowledgement: an RTT sample, an
+    acknowledgement for the controller, and its frames taken as delivered, which cancelled the
+    retransmission queued when it was lost. To quic-go the packet is gone and the ACK changes
+    nothing; the retransmission goes out;
+  - the largest acknowledged rose with every ACK, even one that acknowledged nothing; quic-go leaves
+    it and does nothing at all (:424-427);
+  - an ACK whose largest was an ACK-only packet gave no RTT sample; quic-go samples it when anything
+    ack-eliciting was acknowledged with it, unless it was sent before the last sampled one
+    (:430-449, largestAckedTime);
+  - the loss timer was set from ngtcp2_rtb alone; quic-go sets it from the oldest packet up to the
+    largest acknowledged, whichever kind (:881-888). And with nothing outstanding a client has no
+    timer, whatever the loss time says: quic-go cancels the alarm before it looks (:761-766).
+
+The ACK-only packets patch 0030 kept beside ngtcp2_rtb for the ECN tracker are kept per packet
+number space now (pktns->tx.nae), in every space, and loss detection gives them up by quic-go's two
+thresholds. The count ngtcp2_rtb_recv_ack returns is quic-go's: every packet newly acknowledged, so
+the probe count, the PTO backoff and the handshake confirmation of patch 0028 follow it as quic-go's
+do. The server keeps upstream's code.
+
+Checked against quic-go's own sentPacketHandler, run by tools/qgovec: test/ngpatch.
+
+diff -Naur a/lib/ngtcp2_conn.c b/lib/ngtcp2_conn.c
+--- a/lib/ngtcp2_conn.c
++++ b/lib/ngtcp2_conn.c
+@@ -874,6 +874,7 @@
+   ngtcp2_crypto_km_del(pktns->crypto.rx.ckm, mem);
+   ngtcp2_crypto_km_del(pktns->crypto.tx.ckm, mem);
+ 
++  ngtcp2_mem_free(mem, pktns->tx.nae);
+   ngtcp2_rtb_free(&pktns->rtb);
+   ngtcp2_strm_free(&pktns->crypto.strm);
+   ngtcp2_acktr_free(&pktns->acktr);
+@@ -1115,28 +1116,28 @@
+ }
+ 
+ /*
+- * conn_ecn_nae_push remembers a 1-RTT packet that ngtcp2_rtb does not
++ * pktns_nae_push remembers a packet of |pktns| that ngtcp2_rtb does not
+  * keep, for as long as quic-go's history would: see nae in
+  * ngtcp2_conn.h.
+  */
+-static int conn_ecn_nae_push(ngtcp2_conn *conn, int64_t pkt_num,
+-                             ngtcp2_tstamp ts) {
+-  if (conn->tx.ecn.nae_len == conn->tx.ecn.nae_cap) {
+-    size_t cap = conn->tx.ecn.nae_cap ? conn->tx.ecn.nae_cap * 2 : 16;
+-    void *p = ngtcp2_mem_realloc(conn->mem, conn->tx.ecn.nae,
+-                                 cap * sizeof(conn->tx.ecn.nae[0]));
++static int pktns_nae_push(ngtcp2_conn *conn, ngtcp2_pktns *pktns,
++                          int64_t pkt_num, ngtcp2_tstamp ts) {
++  if (pktns->tx.nae_len == pktns->tx.nae_cap) {
++    size_t cap = pktns->tx.nae_cap ? pktns->tx.nae_cap * 2 : 16;
++    void *p = ngtcp2_mem_realloc(conn->mem, pktns->tx.nae,
++                                 cap * sizeof(pktns->tx.nae[0]));
+ 
+     if (p == NULL) {
+       return NGTCP2_ERR_NOMEM;
+     }
+ 
+-    conn->tx.ecn.nae = p;
+-    conn->tx.ecn.nae_cap = cap;
++    pktns->tx.nae = p;
++    pktns->tx.nae_cap = cap;
+   }
+ 
+-  conn->tx.ecn.nae[conn->tx.ecn.nae_len].pkt_num = pkt_num;
+-  conn->tx.ecn.nae[conn->tx.ecn.nae_len].ts = ts;
+-  ++conn->tx.ecn.nae_len;
++  pktns->tx.nae[pktns->tx.nae_len].pkt_num = pkt_num;
++  pktns->tx.nae[pktns->tx.nae_len].ts = ts;
++  ++pktns->tx.nae_len;
+ 
+   return 0;
+ }
+@@ -1733,6 +1734,7 @@
+   (*pconn)->tx.last_blocked_offset = UINT64_MAX;
+   (*pconn)->rx.preferred_addr.pkt_num = -1;
+   (*pconn)->early.discard_started_ts = UINT64_MAX;
++  (*pconn)->tx.largest_acked_sent_ts = UINT64_MAX;
+ 
+   conn_ecn_init(*pconn);
+   conn_reset_ecn_validation_state(*pconn);
+@@ -1905,8 +1907,6 @@
+     ngtcp2_hybbr_free(&conn->hybbr);
+   }
+ 
+-  ngtcp2_mem_free(conn->mem, conn->tx.ecn.nae);
+-
+   ngtcp2_qlog_end(&conn->qlog);
+ 
+   if (conn->early.ckm) {
+@@ -3649,6 +3649,12 @@
+         (conn->flags & NGTCP2_CONN_FLAG_RESTART_IDLE_TIMER_ON_WRITE)) {
+       conn_restart_timer_on_write(conn, ts);
+     }
++  } else {
++    rv = pktns_nae_push(conn, pktns, hd.pkt_num, ts);
++    if (rv != 0) {
++      ngtcp2_frame_chain_list_objalloc_del(frq, &conn->frc_objalloc, conn->mem);
++      return rv;
++    }
+   }
+ 
+   if (pktns->rtb.probe_pkt_left &&
+@@ -5845,8 +5851,8 @@
+         (conn->flags & NGTCP2_CONN_FLAG_RESTART_IDLE_TIMER_ON_WRITE)) {
+       conn_restart_timer_on_write(conn, ts);
+     }
+-  } else if (type == NGTCP2_PKT_1RTT) {
+-    rv = conn_ecn_nae_push(conn, hd->pkt_num, ts);
++  } else {
++    rv = pktns_nae_push(conn, pktns, hd->pkt_num, ts);
+     if (rv != 0) {
+       return rv;
+     }
+@@ -6116,11 +6122,10 @@
+                          "probe pkt size=", nwrite);
+       }
+     }
+-  } else if (type == NGTCP2_PKT_1RTT &&
+-             fr->hd.type != NGTCP2_FRAME_CONNECTION_CLOSE &&
++  } else if (fr->hd.type != NGTCP2_FRAME_CONNECTION_CLOSE &&
+              fr->hd.type != NGTCP2_FRAME_CONNECTION_CLOSE_APP &&
+              (!path || ngtcp2_path_eq(&conn->dcid.current.ps.path, path))) {
+-    rv = conn_ecn_nae_push(conn, hd.pkt_num, ts);
++    rv = pktns_nae_push(conn, pktns, hd.pkt_num, ts);
+     if (rv != 0) {
+       return rv;
+     }
+@@ -15331,6 +15336,23 @@
+ 
+   conn_get_loss_time_and_pktns(conn, &earliest_loss_time, NULL);
+ 
++  /* A client with nothing outstanding has no timer, loss time or not:
++     quic-go cancels the alarm before it looks at the loss time
++     (vendor/quic-go/internal/ackhandler/sent_packet_handler.go:
++     761-766), and a loss time can be set by a packet that elicits no
++     acknowledgement (see nae in ngtcp2_conn.h). */
++  if (!conn->server &&
++      (conn->flags & (NGTCP2_CONN_FLAG_SERVER_ADDR_VERIFIED |
++                      NGTCP2_CONN_FLAG_HANDSHAKE_CONFIRMED)) &&
++      (!in_pktns || in_pktns->rtb.num_pto_eliciting == 0) &&
++      (!hs_pktns || hs_pktns->rtb.num_pto_eliciting == 0) &&
++      pktns->rtb.num_pto_eliciting == 0) {
++    if (cstat->loss_detection_timer != UINT64_MAX) {
++      ngtcp2_conn_cancel_loss_detection_timer(conn);
++    }
++    return;
++  }
++
+   if (earliest_loss_time != UINT64_MAX) {
+     cstat->loss_detection_timer = earliest_loss_time;
+ 
+diff -Naur a/lib/ngtcp2_conn.h b/lib/ngtcp2_conn.h
+--- a/lib/ngtcp2_conn.h
++++ b/lib/ngtcp2_conn.h
+@@ -276,6 +276,20 @@
+        numNonAckElicitingAcks does (vendor/quic-go/packet_packer.go:
+        616-634, protocol.MaxNonAckElicitingAcks = 19). */
+     size_t num_non_ack_eliciting_acks;
++    /* nae holds this space's packets that ngtcp2_rtb does not: those
++       that elicit no acknowledgement and carry no padding.  quic-go
++       keeps every packet in its history until it is acknowledged or
++       declared lost (vendor/quic-go/internal/ackhandler/
++       sent_packet_handler.go:331, sent_packet_history.go:61-67): an
++       ACK that acknowledges one of them has acknowledged something,
++       and loss detection and its timer see them as well.  See
++       ngtcp2_rtb_recv_ack and patches/ngtcp2/0031. */
++    struct {
++      int64_t pkt_num;
++      ngtcp2_tstamp ts;
++    } *nae;
++    size_t nae_len;
++    size_t nae_cap;
+ 
+     struct {
+       /* ect0 is the number of QUIC packets, not UDP datagram, which
+@@ -480,6 +494,13 @@
+        being written. */
+     size_t chrome_last_dgram_padding;
+     size_t chrome_dgram_padding;
++    /* largest_acked_sent_ts is quic-go's largestAckedTime: the send
++       time of the packet whose acknowledgement last gave an RTT
++       sample, UINT64_MAX before the first.  A sample from a packet
++       sent earlier is not taken
++       (vendor/quic-go/internal/ackhandler/sent_packet_handler.go:
++       440-446). */
++    ngtcp2_tstamp largest_acked_sent_ts;
+ 
+     /* ecn is quic-go's ecnTracker for the 1-RTT packet number space
+        (vendor/quic-go/internal/ackhandler/ecn.go), which replaces
+@@ -524,19 +545,6 @@
+          quic-go writes with ECNMode(false)
+          (vendor/quic-go/connection.go:2706-2707). */
+       int dgram_non;
+-      /* nae holds the 1-RTT packets that ngtcp2_rtb does not: those
+-         that elicit no acknowledgement and carry no padding.  quic-go
+-         keeps them in its history until acknowledged or declared lost
+-         (vendor/quic-go/internal/ackhandler/sent_packet_handler.go:
+-         331, sent_packet_history.go:61-67), and an ACK that
+-         acknowledges them hands them to HandleNewlyAcked with the
+-         rest. */
+-      struct {
+-        int64_t pkt_num;
+-        ngtcp2_tstamp ts;
+-      } *nae;
+-      size_t nae_len;
+-      size_t nae_cap;
+     } ecn;
+ 
+     struct {
+diff -Naur a/lib/ngtcp2_rtb.c b/lib/ngtcp2_rtb.c
+--- a/lib/ngtcp2_rtb.c
++++ b/lib/ngtcp2_rtb.c
+@@ -915,48 +915,58 @@
+   return 0;
+ }
+ 
+-/* ecn_nae_acked removes from the packets ngtcp2_rtb does not keep those
+-   |fr| acknowledges, as quic-go's history gives them up
+-   (sent_packet_handler.go:590-626), counting them as it counts the
+-   rest.  Returns how many there were. */
+-static size_t ecn_nae_acked(ngtcp2_conn *conn, const ngtcp2_ack *fr,
+-                            uint64_t *acked_ect0, int *acked_testing) {
++/* nae_take_acked removes from |pktns|'s packets kept beside ngtcp2_rtb
++   those |fr| acknowledges — quic-go's history hands them over with the
++   rest (sent_packet_handler.go:590-626) — and returns how many there
++   were.  *|plargest_ts| gets the send time of the one numbered as the
++   ACK's largest, when it is among them.  In the application data space
++   they are counted for ECN as the others are. */
++static size_t nae_take_acked(ngtcp2_conn *conn, ngtcp2_pktns *pktns,
++                             const ngtcp2_ack *fr, ngtcp2_tstamp *plargest_ts,
++                             uint64_t *acked_ect0, int *acked_testing) {
+   size_t i, j, n = 0;
++  int ecn = pktns == &conn->pktns;
+ 
+-  for (i = 0, j = 0; i < conn->tx.ecn.nae_len; ++i) {
+-    int64_t pkt_num = conn->tx.ecn.nae[i].pkt_num;
++  for (i = 0, j = 0; i < pktns->tx.nae_len; ++i) {
++    int64_t pkt_num = pktns->tx.nae[i].pkt_num;
+ 
+     if (ack_covers(fr, pkt_num)) {
+-      if (ecn_marked(conn, pkt_num)) {
++      if (pkt_num == fr->largest_ack) {
++        *plargest_ts = pktns->tx.nae[i].ts;
++      }
++      if (ecn && ecn_marked(conn, pkt_num)) {
+         ++*acked_ect0;
+       }
+-      if (ecn_testing_pkt(conn, pkt_num)) {
++      if (ecn && ecn_testing_pkt(conn, pkt_num)) {
+         *acked_testing = 1;
+       }
+       ++n;
+       continue;
+     }
+ 
+-    conn->tx.ecn.nae[j++] = conn->tx.ecn.nae[i];
++    pktns->tx.nae[j++] = pktns->tx.nae[i];
+   }
+ 
+-  conn->tx.ecn.nae_len = j;
++  pktns->tx.nae_len = j;
+ 
+   return n;
+ }
+ 
+-/* ecn_nae_lost gives up the packets ngtcp2_rtb does not keep that
+-   quic-go's detectLostPackets would declare lost — by either threshold,
+-   up to the largest acknowledged, the packet numbers skipped in between
+-   not counting (sent_packet_handler.go:843-888, sent_packet_history.go:
+-   260-274) — and tells the tracker nothing: they elicit no
+-   acknowledgement. */
+-static void ecn_nae_lost(ngtcp2_rtb *rtb, ngtcp2_conn *conn,
+-                         ngtcp2_duration loss_delay, ngtcp2_tstamp ts) {
++/* nae_detect_lost gives up the packets kept beside ngtcp2_rtb that
++   quic-go's detectLostPackets declares lost — by either threshold, up
++   to the largest acknowledged, the packet numbers skipped in between not
++   counting — and tells nobody: they elicit no acknowledgement, so
++   nothing is resent and the controller and the ECN tracker hear nothing
++   (sent_packet_handler.go:843-910, sent_packet_history.go:253-267).
++   The rest up to the largest acknowledged set the loss time as any
++   packet does: the oldest of them, plus the loss delay (:881-888). */
++static void nae_detect_lost(ngtcp2_rtb *rtb, ngtcp2_pktns *pktns,
++                            ngtcp2_conn_stat *cstat,
++                            ngtcp2_duration loss_delay, ngtcp2_tstamp ts) {
+   size_t i, j;
+ 
+-  for (i = 0, j = 0; i < conn->tx.ecn.nae_len; ++i) {
+-    int64_t pkt_num = conn->tx.ecn.nae[i].pkt_num;
++  for (i = 0, j = 0; i < pktns->tx.nae_len; ++i) {
++    int64_t pkt_num = pktns->tx.nae[i].pkt_num;
+ 
+     if (pkt_num <= rtb->largest_acked_tx_pkt_num) {
+       int64_t skipped = 0;
+@@ -974,32 +984,31 @@
+         }
+       }
+ 
+-      if (ngtcp2_tstamp_elapsed(conn->tx.ecn.nae[i].ts, loss_delay, ts) ||
++      if (ngtcp2_tstamp_elapsed(pktns->tx.nae[i].ts, loss_delay, ts) ||
+           rtb->largest_acked_tx_pkt_num - pkt_num - skipped >=
+             NGTCP2_PKT_THRESHOLD) {
+         continue;
+       }
++
++      if (pktns->tx.nae[i].ts + loss_delay < cstat->loss_time[pktns->id]) {
++        cstat->loss_time[pktns->id] = pktns->tx.nae[i].ts + loss_delay;
++      }
+     }
+ 
+-    conn->tx.ecn.nae[j++] = conn->tx.ecn.nae[i];
++    pktns->tx.nae[j++] = pktns->tx.nae[i];
+   }
+ 
+-  conn->tx.ecn.nae_len = j;
++  pktns->tx.nae_len = j;
+ }
+ 
+ /* rtb_ecn_on_ack hands a 1-RTT ACK to the tracker as quic-go's
+-   ReceivedAck does.  The packets it newly acknowledges are those the
+-   caller counted out of ngtcp2_rtb (|newly|, |acked_ect0|,
+-   |acked_testing|) and those ngtcp2_rtb does not keep.  None at all,
+-   and quic-go returns before the tracker and before it raises its
+-   largest acknowledged (vendor/quic-go/internal/ackhandler/
+-   sent_packet_handler.go:424-427); an ACK that does not raise it is not
+-   the tracker's (:452-453).  An ECN-CE the tracker believes in is a
+-   congestion event at the largest acknowledged (:454-457).
+-
+-   Only the tracker sees the packets kept beside ngtcp2_rtb: its loss
+-   detection runs, and its loss timer is set, from ngtcp2_rtb alone.
+-   Patch 0031 gives them the rest of quic-go's history. */
++   ReceivedAck does: the packets it newly acknowledges, |newly| of them,
++   |acked_ect0| sent ECT(0), a testing packet among them if
++   |acked_testing|.  None at all, and quic-go returns before the tracker
++   (vendor/quic-go/internal/ackhandler/sent_packet_handler.go:424-427);
++   an ACK that does not raise the largest acknowledged is not the
++   tracker's (:452-453).  An ECN-CE the tracker believes in is a
++   congestion event at the largest acknowledged (:454-457). */
+ static void rtb_ecn_on_ack(ngtcp2_rtb *rtb, ngtcp2_conn *conn,
+                            ngtcp2_conn_stat *cstat, const ngtcp2_ack *fr,
+                            const ngtcp2_cc_ack *cc_ack, size_t newly,
+@@ -1007,7 +1016,6 @@
+                            ngtcp2_tstamp ts) {
+   ngtcp2_cc *cc = rtb->cc;
+ 
+-  newly += ecn_nae_acked(conn, fr, &acked_ect0, &acked_testing);
+   if (newly == 0) {
+     return;
+   }
+@@ -1025,6 +1033,35 @@
+                                ngtcp2_conn *conn, ngtcp2_pktns *pktns,
+                                ngtcp2_conn_stat *cstat, ngtcp2_tstamp ts);
+ 
++/*
++ * A client takes an ACK as quic-go's ReceivedAck does
++ * (vendor/quic-go/internal/ackhandler/sent_packet_handler.go:403-521),
++ * over what its history holds rather than what ngtcp2_rtb holds:
++ *
++ *   - a packet declared lost is gone from the history
++ *     (sent_packet_history.go:230-246), so an ACK that covers it later
++ *     acknowledges nothing: no RTT sample from it, no acknowledgement for
++ *     the controller, and its frames are not taken as delivered — their
++ *     retransmission, queued when it was lost, goes out regardless.
++ *     Upstream kept it in ngtcp2_rtb and processed it as acknowledged;
++ *   - a packet that elicits no acknowledgement is in the history, and
++ *     ngtcp2_rtb does not keep it (see nae in ngtcp2_conn.h): an ACK
++ *     that acknowledges only such packets has acknowledged something;
++ *   - an ACK that acknowledges nothing is dropped whole (:424-427): the
++ *     largest acknowledged stays where it was, and nothing is looked for
++ *     as lost.  Otherwise the largest acknowledged is raised, and loss
++ *     detection runs, whatever the packets were.  Upstream raised the
++ *     largest on every ACK and looked for losses only when a packet of
++ *     ngtcp2_rtb was acknowledged;
++ *   - the RTT is sampled when the ACK's largest is among what it newly
++ *     acknowledged and so is an ack-eliciting packet, and the sample is
++ *     taken unless that packet was sent before the last one sampled
++ *     (:430-449).  Upstream sampled only an ACK that raised the largest.
++ *
++ * The count returned is what quic-go's is: every packet newly
++ * acknowledged, the ones kept beside ngtcp2_rtb included.  The server
++ * keeps upstream's code.
++ */
+ ngtcp2_ssize ngtcp2_rtb_recv_ack(ngtcp2_rtb *rtb, const ngtcp2_ack *fr,
+                                  ngtcp2_conn_stat *cstat, ngtcp2_conn *conn,
+                                  ngtcp2_pktns *pktns, ngtcp2_tstamp pkt_ts,
+@@ -1037,12 +1074,14 @@
+   size_t num_acked = 0;
+   int64_t pkt_num;
+   ngtcp2_cc *cc = rtb->cc;
+-  ngtcp2_rtb_entry *acked_ent = NULL;
++  ngtcp2_rtb_entry *acked_ent = NULL, *gone_ent = NULL;
+   int ack_eliciting_pkt_acked = 0;
++  int qgo = conn && !conn->server;
+   int qgo_ecn = conn && pktns == &conn->pktns;
+   uint64_t ecn_acked_ect0 = 0;
+   int ecn_acked_testing = 0;
+-  size_t ecn_newly_acked = 0;
++  size_t newly = 0;
++  ngtcp2_tstamp largest_ts = UINT64_MAX;
+   ngtcp2_cc_ack cc_ack = {
+     .largest_pkt_sent_ts = UINT64_MAX,
+     .rtt = UINT64_MAX,
+@@ -1059,7 +1098,7 @@
+     ngtcp2_log_info(rtb->log, NGTCP2_LOG_EVENT_CRY, "key update confirmed");
+   }
+ 
+-  if (rtb->largest_acked_tx_pkt_num < largest_ack) {
++  if (!qgo && rtb->largest_acked_tx_pkt_num < largest_ack) {
+     rtb->largest_acked_tx_pkt_num = largest_ack;
+   }
+ 
+@@ -1067,27 +1106,23 @@
+ 
+   /* Assume that ngtcp2_pkt_validate_ack(fr) returns 0 */
+   it = ngtcp2_ksl_lower_bound(&rtb->ents, &largest_ack);
+-  if (ngtcp2_ksl_it_end(&it)) {
+-    if (qgo_ecn) {
+-      rtb_ecn_on_ack(rtb, conn, cstat, fr, &cc_ack, 0, 0, 0, ts);
+-    }
+-
+-    if (cc->on_ack_recv) {
+-      cc->on_ack_recv(cc, cstat, &cc_ack, pkt_ts);
+-    }
+-
+-    return 0;
+-  }
+-
+   min_ack = largest_ack - (int64_t)fr->first_ack_range;
+ 
+-  for (; !ngtcp2_ksl_it_end(&it);) {
++  for (i = 0; !ngtcp2_ksl_it_end(&it);) {
+     pkt_num = *(int64_t *)ngtcp2_ksl_it_key(&it);
+ 
+     assert(pkt_num <= largest_ack);
+ 
+     if (pkt_num < min_ack) {
+-      break;
++      /* The next range, if there is one. */
++      if (i == fr->rangecnt) {
++        break;
++      }
++      largest_ack = min_ack - (int64_t)fr->ranges[i].gap - 2;
++      min_ack = largest_ack - (int64_t)fr->ranges[i].len;
++      ++i;
++      it = ngtcp2_ksl_lower_bound(&rtb->ents, &largest_ack);
++      continue;
+     }
+ 
+     ent = ngtcp2_ksl_it_get(&it);
+@@ -1097,68 +1132,76 @@
+       goto fail;
+     }
+ 
+-    if (rtb->largest_acked_tx_pkt_num == pkt_num) {
+-      cc_ack.largest_pkt_sent_ts = ent->ts;
++    if (qgo && (ent->flags & NGTCP2_RTB_ENTRY_FLAG_LOST_RETRANSMITTED)) {
++      /* Gone from quic-go's history when it was declared lost. */
++      rtb_remove(rtb, &it, &gone_ent, ent, cstat);
++      continue;
++    }
++
++    if (qgo ? pkt_num == fr->largest_ack
++            : rtb->largest_acked_tx_pkt_num == pkt_num) {
++      largest_ts = ent->ts;
+     }
+ 
+     if (ent->flags & NGTCP2_RTB_ENTRY_FLAG_ACK_ELICITING) {
+       ack_eliciting_pkt_acked = 1;
+     }
+ 
+-    rtb_remove(rtb, &it, &acked_ent, ent, cstat);
+-  }
++    if (qgo_ecn && !(ent->flags & NGTCP2_RTB_ENTRY_FLAG_LOST_RETRANSMITTED)) {
++      if (ecn_marked(conn, pkt_num)) {
++        ++ecn_acked_ect0;
++      }
++      if (ecn_testing_pkt(conn, pkt_num)) {
++        ecn_acked_testing = 1;
++      }
++    }
+ 
+-  for (i = 0; i < fr->rangecnt; ++i) {
+-    largest_ack = min_ack - (int64_t)fr->ranges[i].gap - 2;
+-    min_ack = largest_ack - (int64_t)fr->ranges[i].len;
+-
+-    it = ngtcp2_ksl_lower_bound(&rtb->ents, &largest_ack);
+-    if (ngtcp2_ksl_it_end(&it)) {
+-      break;
++    if (!(ent->flags & NGTCP2_RTB_ENTRY_FLAG_LOST_RETRANSMITTED)) {
++      ++newly;
+     }
+ 
+-    for (; !ngtcp2_ksl_it_end(&it);) {
+-      pkt_num = *(int64_t *)ngtcp2_ksl_it_key(&it);
+-      if (pkt_num < min_ack) {
+-        break;
+-      }
++    rtb_remove(rtb, &it, &acked_ent, ent, cstat);
++  }
+ 
+-      ent = ngtcp2_ksl_it_get(&it);
++  for (ent = gone_ent; ent; ent = gone_ent) {
++    gone_ent = ent->next;
++    ngtcp2_rtb_entry_objalloc_del(ent, rtb->rtb_entry_objalloc,
++                                  rtb->frc_objalloc, rtb->mem);
++  }
+ 
+-      if (ent->flags & NGTCP2_RTB_ENTRY_FLAG_SKIP) {
+-        rv = NGTCP2_ERR_PROTO;
+-        goto fail;
+-      }
++  if (conn) {
++    newly += nae_take_acked(conn, pktns, fr, &largest_ts, &ecn_acked_ect0,
++                            &ecn_acked_testing);
++  }
+ 
+-      if (ent->flags & NGTCP2_RTB_ENTRY_FLAG_ACK_ELICITING) {
+-        ack_eliciting_pkt_acked = 1;
+-      }
++  if (qgo) {
++    if (newly == 0) {
++      assert(acked_ent == NULL);
++      return 0;
++    }
+ 
+-      rtb_remove(rtb, &it, &acked_ent, ent, cstat);
++    if (rtb->largest_acked_tx_pkt_num < fr->largest_ack) {
++      rtb->largest_acked_tx_pkt_num = fr->largest_ack;
+     }
+   }
+ 
++  cc_ack.largest_pkt_sent_ts = largest_ts;
++
+   if (cc_ack.largest_pkt_sent_ts != UINT64_MAX && ack_eliciting_pkt_acked) {
+     cc_ack.rtt =
+       ngtcp2_max(pkt_ts - cc_ack.largest_pkt_sent_ts, NGTCP2_NANOSECONDS);
+ 
+-    ngtcp2_conn_update_rtt(conn, cc_ack.rtt, fr->ack_delay_unscaled, ts);
++    if (!qgo) {
++      ngtcp2_conn_update_rtt(conn, cc_ack.rtt, fr->ack_delay_unscaled, ts);
++    } else if (conn->tx.largest_acked_sent_ts == UINT64_MAX ||
++               cc_ack.largest_pkt_sent_ts >= conn->tx.largest_acked_sent_ts) {
++      ngtcp2_conn_update_rtt(conn, cc_ack.rtt, fr->ack_delay_unscaled, ts);
++      conn->tx.largest_acked_sent_ts = cc_ack.largest_pkt_sent_ts;
++    }
+   }
+ 
+   if (conn) {
+     for (ent = acked_ent; ent; ent = acked_ent) {
+-      /* What quic-go's history still holds: a packet it declared lost
+-         is gone from it (sent_packet_history.go:230-246). */
+-      if (qgo_ecn && !(ent->flags & NGTCP2_RTB_ENTRY_FLAG_LOST_RETRANSMITTED)) {
+-        ++ecn_newly_acked;
+-        if (ecn_marked(conn, ent->hd.pkt_num)) {
+-          ++ecn_acked_ect0;
+-        }
+-        if (ecn_testing_pkt(conn, ent->hd.pkt_num)) {
+-          ecn_acked_testing = 1;
+-        }
+-      }
+-
+       rv = process_acked_pkt(ent, conn, pktns);
+       if (rv != 0) {
+         goto fail;
+@@ -1198,18 +1241,18 @@
+   /* Before the losses, as quic-go hands an ACK to its tracker before it
+      looks for them (sent_packet_handler.go:452-460). */
+   if (qgo_ecn) {
+-    rtb_ecn_on_ack(rtb, conn, cstat, fr, &cc_ack, ecn_newly_acked,
+-                   ecn_acked_ect0, ecn_acked_testing, ts);
++    rtb_ecn_on_ack(rtb, conn, cstat, fr, &cc_ack, newly, ecn_acked_ect0,
++                   ecn_acked_testing, ts);
+   }
+ 
+   if (num_acked) {
+     ngtcp2_rst_on_ack_recv(rtb->rst, cstat);
++  }
+ 
+-    if (conn) {
+-      rv = rtb_detect_lost_pkt(rtb, &cc_ack, conn, pktns, cstat, pkt_ts);
+-      if (rv != 0) {
+-        return rv;
+-      }
++  if (conn && (qgo ? newly > 0 : num_acked > 0)) {
++    rv = rtb_detect_lost_pkt(rtb, &cc_ack, conn, pktns, cstat, pkt_ts);
++    if (rv != 0) {
++      return rv;
+     }
+   }
+ 
+@@ -1217,9 +1260,14 @@
+     cc->on_ack_recv(cc, cstat, &cc_ack, pkt_ts);
+   }
+ 
+-  return (ngtcp2_ssize)num_acked;
++  return (ngtcp2_ssize)(qgo ? newly : num_acked);
+ 
+ fail:
++  for (ent = gone_ent; ent; ent = gone_ent) {
++    gone_ent = ent->next;
++    ngtcp2_rtb_entry_objalloc_del(ent, rtb->rtb_entry_objalloc,
++                                  rtb->frc_objalloc, rtb->mem);
++  }
+   for (ent = acked_ent; ent; ent = acked_ent) {
+     acked_ent = ent->next;
+     ngtcp2_rtb_entry_objalloc_del(ent, rtb->rtb_entry_objalloc,
+@@ -1305,9 +1353,7 @@
+ 
+   cstat->loss_time[pktns->id] = UINT64_MAX;
+ 
+-  if (pktns == &conn->pktns) {
+-    ecn_nae_lost(rtb, conn, loss_delay, ts);
+-  }
++  nae_detect_lost(rtb, pktns, cstat, loss_delay, ts);
+ 
+   /* Newest first, to the newest packet that is lost: every packet older
+      than a lost one is lost too, by either threshold. */

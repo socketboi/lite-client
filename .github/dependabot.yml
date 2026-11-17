@@ -1,0 +1,18 @@
+version: 2
+updates:
+  # GitHub Actions only. Everything else this project depends on is pinned on purpose to the
+  # revision the reference builds with (vendor/, the Go toolchains in docker/Dockerfile, the
+  # OpenWrt release in the Makefile), and moving any of those is a deliberate change with its
+  # citations carried across, not a version bump.
+  - package-ecosystem: github-actions
+    # "/" covers .github/workflows; the local composite action is listed separately.
+    directories:
+      - "/"
+      - "/.github/actions/prepare"
+    schedule:
+      interval: monthly
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "ci"

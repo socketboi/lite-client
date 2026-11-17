@@ -1,0 +1,2510 @@
+The congestion control a hysteria client actually sends with, which is not the one ngtcp2 ships.
+
+`UseBBR` does not configure quic-go's congestion control — it REPLACES it. Every hysteria client
+that is given no bandwidth in its configuration calls
+`conn.SetCongestionControl(bbr.NewBbrSender(...))`
+(vendor/hysteria/core/internal/congestion/utils.go:37-43, reached from core/client/client.go:153),
+and what that installs is the package hysteria carries in core/internal/congestion/bbr: a port of
+Chromium's BBRv1, about 2600 lines of Go. ngtcp2's `NGTCP2_CC_ALGO_BBR` is BBRv2 — a different
+state machine, different gains, a different bandwidth estimator, a different response to loss. So
+this client, which matched the reference byte for byte in its packets, was sending them to a rhythm
+no reference client has: the one thing on this plane a path sees without decrypting anything.
+
+This patch adds that algorithm as `NGTCP2_CC_ALGO_HYBBR` in lib/ngtcp2_hybbr.{c,h}, ported from:
+
+  core/internal/congestion/bbr/bbr_sender.go               the state machine, the gains, the cycle, recovery, the windows
+  core/internal/congestion/bbr/bandwidth_sampler.go        per-packet sampling, the ack-aggregation tracker, A_0 selection
+  core/internal/congestion/bbr/windowed_filter.go          Kathleen Nichols' three-estimate filter, for bandwidth and ack height
+  core/internal/congestion/bbr/packet_number_indexed_queue.go, core/internal/congestion/bbr/ringbuffer.go   what the sampler keeps sent packets in
+  core/internal/congestion/bbr/bandwidth.go                the arithmetic, in its order of operations
+  core/internal/congestion/common/pacer.go          the token bucket, for the two numbers ngtcp2 needs from it
+
+Every constant is the reference's and every function carries the line it came from. The reference has
+three profiles (standard, conservative, aggressive) and their switches are all implemented and
+honoured here — drain-to-target, overshoot detection, ack aggregation during startup, overestimate
+avoidance, the reduced extra-acked on a bandwidth increase. What is NOT here is a way to select
+anything but standard, because nothing in this client's configuration selects one: hysteria's own
+default is the empty profile, which `configForProfile` answers with standard.
+
+HOW THE PACE IS APPLIED — and this is no longer a difference. The reference hands its rate to a
+token bucket that quic-go's send loop consults before every packet: send while there is budget, stop
+when there is not, wait no less than MinPacingDelay (core/internal/congestion/common/pacer.go:32-76). That bucket is ported
+here too, and since 19 September this client's send loop asks it the same way — see the note above
+the write loop in src/quic/conn.c. ngtcp2's own pacing is left unused: `ngtcp2_conn_update_pkt_tx_time`
+is never called, so the library never holds anything back itself and the only thing pacing this
+connection is the reference's bucket, filled at the reference's rate.
+
+The first version of this patch paced ngtcp2's way instead — write a batch, then wait that batch's
+worth of time — with the rate and the burst ceiling taken from the bucket. The relay in
+test/hystand/loss.sh, which reports the shape each client arrives in, said that was not enough: the
+reference's datagrams arrived back-to-back nine times in ten against eight in ten here. Asking the
+bucket per packet did not close that either, and the batch size turned out to be the reason (see
+LC_GSO_BATCH). What remains of it is measured and named there.
+
+
+Two smaller seams, both stated where they are crossed:
+
+  - ngtcp2 reports a packet to a controller BEFORE adding it to the in-flight count, and the
+    reference is told the count WITH the packet already in it (internal/ackhandler/sent_packet_handler.go:317-325), so
+    the packet is added at the call;
+  - ngtcp2 reports only ack-eliciting packets. The reference also sees ACK-only ones, where it
+    moves nothing but `lastSentPacket` and, when the connection was idle, `exitingQuiescence`.
+
+The batching is exact rather than approximate: ngtcp2 removes every acknowledged packet from the
+in-flight count before the first `on_pkt_acked`, detects loss next, and calls `on_ack_recv` last
+(ngtcp2_rtb.c, rtb_recv_ack), so an ack's acknowledged and lost packets are collected as they are
+reported and the reference's OnCongestionEventEx runs once, at the end, with the in-flight this ack
+started with recovered exactly.
+
+diff -Naur a/lib/includes/ngtcp2/ngtcp2.h b/lib/includes/ngtcp2/ngtcp2.h
+--- a/lib/includes/ngtcp2/ngtcp2.h
++++ b/lib/includes/ngtcp2/ngtcp2.h
+@@ -1766,7 +1766,13 @@
+   /**
+    * :enum:`NGTCP2_CC_ALGO_BBR` represents BBR v2.
+    */
+-  NGTCP2_CC_ALGO_BBR = 0x02
++  NGTCP2_CC_ALGO_BBR = 0x02,
++  /**
++   * :enum:`NGTCP2_CC_ALGO_HYBBR` represents the BBR that hysteria carries and installs on
++   * every connection its client makes: a port of Chromium's BBRv1, not the BBRv2 above.
++   * See lib/ngtcp2_hybbr.h.
++   */
++  NGTCP2_CC_ALGO_HYBBR = 0x03
+ } ngtcp2_cc_algo;
+ 
+ /**
+diff -Naur a/lib/ngtcp2_conn.c b/lib/ngtcp2_conn.c
+--- a/lib/ngtcp2_conn.c
++++ b/lib/ngtcp2_conn.c
+@@ -1437,6 +1437,14 @@
+                          &(*pconn)->rst);
+ 
+     break;
++  case NGTCP2_CC_ALGO_HYBBR:
++    /* The congestion control every hysteria client installs on its connection, which is not
++     * the BBR below: see lib/ngtcp2_hybbr.h. It is the only one here that allocates, so it is
++     * also the only one ngtcp2_conn_del has to free. */
++    ngtcp2_hybbr_init(&(*pconn)->hybbr, &(*pconn)->log, &(*pconn)->cstat,
++                      settings->initial_ts, &(*pconn)->pcg, mem);
++
++    break;
+   case NGTCP2_CC_ALGO_BBR:
+     ngtcp2_cc_bbr_init(&(*pconn)->bbr, &(*pconn)->log, &(*pconn)->cstat,
+                        &(*pconn)->rst, settings->initial_ts, &(*pconn)->pcg);
+@@ -1731,6 +1739,18 @@
+   ngtcp2_crypto_km_del(conn->vneg.tx.ckm, conn->mem);
+ }
+ 
++
++/* The controller of this connection when it is hysteria's BBR, so that a send loop can consult its
++ * pacer the way quic-go's loop consults the reference's — see ngtcp2_hybbr.h. NULL for every other
++ * algorithm, which is a caller built for one it does not have. */
++ngtcp2_hybbr *ngtcp2_conn_hybbr(ngtcp2_conn *conn) {
++  if (conn->cc_algo != NGTCP2_CC_ALGO_HYBBR) {
++    return NULL;
++  }
++
++  return &conn->hybbr;
++}
++
+ void ngtcp2_conn_del(ngtcp2_conn *conn) {
+   if (conn == NULL) {
+     return;
+@@ -1741,6 +1761,12 @@
+                                     &conn->frc_objalloc, conn->mem);
+   }
+ 
++  /* The one congestion controller here that owns memory: hysteria's BBR keeps the sampler's
++   * queue of sent packets and the batch an ack builds. The others are all inline. */
++  if (conn->cc_algo == NGTCP2_CC_ALGO_HYBBR) {
++    ngtcp2_hybbr_free(&conn->hybbr);
++  }
++
+   ngtcp2_qlog_end(&conn->qlog);
+ 
+   if (conn->early.ckm) {
+diff -Naur a/lib/ngtcp2_conn.h b/lib/ngtcp2_conn.h
+--- a/lib/ngtcp2_conn.h
++++ b/lib/ngtcp2_conn.h
+@@ -43,6 +43,7 @@
+ #include "ngtcp2_pq.h"
+ #include "ngtcp2_cc.h"
+ #include "ngtcp2_bbr.h"
++#include "ngtcp2_hybbr.h"
+ #include "ngtcp2_pv.h"
+ #include "ngtcp2_pmtud.h"
+ #include "ngtcp2_cid.h"
+@@ -705,6 +706,7 @@
+     ngtcp2_cc_reno reno;
+     ngtcp2_cc_cubic cubic;
+     ngtcp2_cc_bbr bbr;
++    ngtcp2_hybbr hybbr;
+   };
+   /* path_history remembers the paths that have been validated
+      successfully.  The path is added to this history when a local
+diff -Naur a/lib/ngtcp2_hybbr.c b/lib/ngtcp2_hybbr.c
+--- a/lib/ngtcp2_hybbr.c
++++ b/lib/ngtcp2_hybbr.c
+@@ -0,0 +1,2049 @@
++/*
++ * ngtcp2
++ *
++ * Copyright (c) 2026 the lite-client authors
++ * Translated from Hysteria (github.com/apernet/hysteria, core/internal/congestion/bbr),
++ * Copyright 2023 Toby, under the same MIT terms.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining
++ * a copy of this software and associated documentation files (the
++ * "Software"), to deal in the Software without restriction, including
++ * without limitation the rights to use, copy, modify, merge, publish,
++ * distribute, sublicense, and/or sell copies of the Software, and to
++ * permit persons to whom the Software is furnished to do so, subject to
++ * the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be
++ * included in all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++ * NONINFRINGEMENT.  IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
++ * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
++ * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
++ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++#include "ngtcp2_hybbr.h"
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "ngtcp2_conn_stat.h"
++#include "ngtcp2_macro.h"
++#include "ngtcp2_mem.h"
++
++/* Two helpers, because ngtcp2's ngtcp2_min/ngtcp2_max are _Generic over the C type and every
++ * quantity here is a uint64_t. */
++static uint64_t hybbr_min_u64(uint64_t a, uint64_t b) { return a < b ? a : b; }
++static uint64_t hybbr_max_u64(uint64_t a, uint64_t b) { return a > b ? a : b; }
++
++/* The reference's constants, each with the line that sets it. Nothing here is a round number chosen
++ * for this port: every one of them decides the shape of the sending rate, and a different value is
++ * a different client on the wire. */
++#define HYBBR_MIN_BPS 65536                    /* core/internal/congestion/bbr/bbr_sender.go:28 */
++#define HYBBR_INVALID_PACKET_NUMBER (-1)       /* core/internal/congestion/bbr/bbr_sender.go:30 */
++#define HYBBR_INITIAL_CWND_PACKETS 32          /* core/internal/congestion/bbr/bbr_sender.go:31 */
++#define HYBBR_MIN_CWND_PACKETS 4               /* core/internal/congestion/bbr/bbr_sender.go:32 */
++#define HYBBR_DEFAULT_HIGH_GAIN 2.885          /* core/internal/congestion/bbr/bbr_sender.go:38 */
++#define HYBBR_DERIVED_HIGH_CWND_GAIN 2.0       /* core/internal/congestion/bbr/bbr_sender.go:40 */
++#define HYBBR_GAIN_CYCLE_LENGTH 8              /* len(pacingGain), core/internal/congestion/bbr/bbr_sender.go:46, :50 */
++#define HYBBR_BANDWIDTH_WINDOW_SIZE 10         /* gainCycleLength + 2, core/internal/congestion/bbr/bbr_sender.go:52 */
++#define HYBBR_MIN_RTT_EXPIRY (10 * NGTCP2_SECONDS)     /* core/internal/congestion/bbr/bbr_sender.go:55 */
++#define HYBBR_PROBE_RTT_TIME (200 * NGTCP2_MILLISECONDS) /* core/internal/congestion/bbr/bbr_sender.go:57 */
++#define HYBBR_STARTUP_GROWTH_TARGET 1.25       /* core/internal/congestion/bbr/bbr_sender.go:61 */
++#define HYBBR_ROUND_TRIPS_WITHOUT_GROWTH 3     /* core/internal/congestion/bbr/bbr_sender.go:62 */
++#define HYBBR_DEFAULT_STARTUP_FULL_LOSS_COUNT 8 /* core/internal/congestion/bbr/bbr_sender.go:65 */
++#define HYBBR_BBR2_DEFAULT_LOSS_THRESHOLD 0.02 /* core/internal/congestion/bbr/bbr_sender.go:66 */
++
++/* quic-go's, not hysteria's, but they are the numbers hysteria's BBR is handed:
++ * vendor/quic-go/internal/protocol/params.go and protocol.go. */
++#define HYBBR_INITIAL_PACKET_SIZE 1280
++#define HYBBR_MAX_CWND_PACKETS 20000
++#define HYBBR_MIN_PACING_DELAY NGTCP2_MILLISECONDS
++#define HYBBR_PACKETS_PER_CONNECTION_ID 10000
++#define HYBBR_MAX_PACKET_BUFFER_SIZE 1452
++#define HYBBR_MAX_BURST_PACKETS 10             /* core/internal/congestion/common/pacer.go:11 */
++#define HYBBR_MAX_BURST_PACING_DELAY_MULT 4    /* core/internal/congestion/common/pacer.go:12 */
++
++#define HYBBR_INF_BANDWIDTH UINT64_MAX
++
++/* The reference prints its phase changes when HYSTERIA_BBR_DEBUG is set (core/internal/congestion/bbr/bbr_sender.go:42,
++ * :342, :1059-1063). The same lines are printed here under the same name, so a run of
++ * each can be read side by side — which is the only way to tell a port that behaves like the
++ * reference from one that merely compiles and goes fast. */
++static int hybbr_debug_on(void) {
++  static int decided, on;
++  const char *v;
++
++  if (!decided) {
++    decided = 1;
++    v = getenv("HYSTERIA_BBR_DEBUG");
++    on = v && *v && *v != '0' && *v != 'f' && *v != 'F';
++  }
++
++  return on;
++}
++
++#define hybbr_debug(...)                                                       \
++  do {                                                                         \
++    if (hybbr_debug_on()) {                                                     \
++      fprintf(stderr, "[BBRSender] ");                                         \
++      fprintf(stderr, __VA_ARGS__);                                            \
++      fprintf(stderr, "\n");                                                 \
++    }                                                                          \
++  } while (0)
++#define HYBBR_INF_RTT ((ngtcp2_duration)INT64_MAX)
++
++/* The four states, in the reference's order (core/internal/congestion/bbr/bbr_sender.go:69-82). */
++enum {
++  HYBBR_MODE_STARTUP,
++  HYBBR_MODE_DRAIN,
++  HYBBR_MODE_PROBE_BW,
++  HYBBR_MODE_PROBE_RTT,
++};
++
++enum {
++  HYBBR_RECOVERY_NOT_IN_RECOVERY,
++  HYBBR_RECOVERY_CONSERVATION,
++  HYBBR_RECOVERY_GROWTH,
++};
++
++/* The gain cycle of PROBE_BW (core/internal/congestion/bbr/bbr_sender.go:45-46). */
++static const double hybbr_pacing_gain[HYBBR_GAIN_CYCLE_LENGTH] = {
++  1.25, 0.75, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
++};
++
++/* ---- the arithmetic, in the reference's order of operations -------------------
++ *
++ * The order matters and is not an accident of writing: Go evaluates
++ * `Bandwidth(bytes) * Bandwidth(time.Second) / Bandwidth(delta) * BytesPerSecond` left to right, so
++ * the division happens BEFORE the multiplication by eight and truncates first (core/internal/congestion/bbr/bandwidth.go:24-27).
++ * Doing it in any other order gives a different number for the same input, and this number decides
++ * the pacing rate. */
++static uint64_t hybbr_bw_from_delta(uint64_t bytes, ngtcp2_duration delta) {
++  if (delta == 0) {
++    return 0;
++  }
++
++  return bytes * NGTCP2_SECONDS / delta * 8;
++}
++
++/* core/internal/congestion/bbr/bandwidth_sampler.go:868-873 */
++static uint64_t hybbr_bytes_from_bw_and_delta(uint64_t bw,
++                                              ngtcp2_duration delta) {
++  return (bw * delta) / (NGTCP2_SECONDS * 8);
++}
++
++/* core/internal/congestion/bbr/bbr_sender.go:1065-1067 */
++static uint64_t hybbr_bdp_from_rtt_and_bw(ngtcp2_duration rtt, uint64_t bw) {
++  return rtt * bw / 8 / NGTCP2_SECONDS;
++}
++
++/* ---- the ring buffer (ringbuffer.go) --------------------------------------------
++ *
++ * One implementation with an element size, where the reference has one per type through generics.
++ * It grows by doubling and never shrinks, and PopFront does not clear the slot — the reference
++ * zeroes it to help Go's collector, which is not a thing here. */
++static void hybbr_ring_init(ngtcp2_hybbr_ring *r, size_t elem_size,
++                            const ngtcp2_mem *mem) {
++  r->buf = NULL;
++  r->elem_size = elem_size;
++  r->cap = 0;
++  r->head = 0;
++  r->tail = 0;
++  r->full = 0;
++  r->mem = mem;
++}
++
++static void hybbr_ring_free(ngtcp2_hybbr_ring *r) {
++  ngtcp2_mem_free(r->mem, r->buf);
++  r->buf = NULL;
++  r->cap = 0;
++  r->head = r->tail = 0;
++  r->full = 0;
++}
++
++static size_t hybbr_ring_len(const ngtcp2_hybbr_ring *r) {
++  if (r->full) {
++    return r->cap;
++  }
++
++  if (r->tail >= r->head) {
++    return r->tail - r->head;
++  }
++
++  return r->tail - r->head + r->cap;
++}
++
++static int hybbr_ring_empty(const ngtcp2_hybbr_ring *r) {
++  return !r->full && r->head == r->tail;
++}
++
++static void *hybbr_ring_at(const ngtcp2_hybbr_ring *r, size_t index) {
++  size_t off;
++
++  if (hybbr_ring_empty(r) || index >= hybbr_ring_len(r)) {
++    return NULL;
++  }
++
++  off = (r->head + index) % r->cap;
++
++  return r->buf + off * r->elem_size;
++}
++
++static void *hybbr_ring_front(const ngtcp2_hybbr_ring *r) {
++  return hybbr_ring_at(r, 0);
++}
++
++static void *hybbr_ring_back(const ngtcp2_hybbr_ring *r) {
++  size_t n = hybbr_ring_len(r);
++
++  if (n == 0) {
++    return NULL;
++  }
++
++  return hybbr_ring_at(r, n - 1);
++}
++
++static int hybbr_ring_grow(ngtcp2_hybbr_ring *r) {
++  size_t new_cap = r->cap * 2;
++  uint8_t *buf;
++  size_t head_len;
++
++  if (new_cap == 0) {
++    new_cap = 1;
++  }
++
++  buf = ngtcp2_mem_malloc(r->mem, new_cap * r->elem_size);
++  if (buf == NULL) {
++    return NGTCP2_ERR_NOMEM;
++  }
++
++  if (r->cap) {
++    head_len = r->cap - r->head;
++    memcpy(buf, r->buf + r->head * r->elem_size, head_len * r->elem_size);
++    memcpy(buf + head_len * r->elem_size, r->buf, r->head * r->elem_size);
++  }
++
++  ngtcp2_mem_free(r->mem, r->buf);
++
++  r->buf = buf;
++  r->head = 0;
++  r->tail = r->cap;
++  r->cap = new_cap;
++  r->full = 0;
++
++  return 0;
++}
++
++static int hybbr_ring_push_back(ngtcp2_hybbr_ring *r, const void *elem) {
++  int rv;
++
++  if (r->full || r->cap == 0) {
++    rv = hybbr_ring_grow(r);
++    if (rv != 0) {
++      return rv;
++    }
++  }
++
++  if (elem) {
++    memcpy(r->buf + r->tail * r->elem_size, elem, r->elem_size);
++  } else {
++    memset(r->buf + r->tail * r->elem_size, 0, r->elem_size);
++  }
++
++  ++r->tail;
++
++  if (r->tail == r->cap) {
++    r->tail = 0;
++  }
++
++  if (r->tail == r->head) {
++    r->full = 1;
++  }
++
++  return 0;
++}
++
++static void hybbr_ring_pop_front(ngtcp2_hybbr_ring *r) {
++  if (hybbr_ring_empty(r)) {
++    return;
++  }
++
++  r->full = 0;
++  ++r->head;
++
++  if (r->head == r->cap) {
++    r->head = 0;
++  }
++}
++
++static void hybbr_ring_clear(ngtcp2_hybbr_ring *r) {
++  if (r->cap) {
++    memset(r->buf, 0, r->cap * r->elem_size);
++  }
++
++  r->head = r->tail = 0;
++  r->full = 0;
++}
++
++/* ---- the windowed filters (windowed_filter.go) ----------------------------------
++ *
++ * Kathleen Nichols' algorithm, kept twice over: once for the bandwidth (a plain number) and once
++ * for the ack-height event (a struct compared by its extra_acked). The reference has one generic
++ * implementation with a comparator; two here, because a comparator through a function pointer on
++ * every ack is the kind of thing this program does not do, and the two bodies are the same
++ * fourteen lines.
++ *
++ * One subtlety carried across exactly: the first test is `comparator(estimates[0].sample, zero) ==
++ * 0`, which is Go for "the filter has never been given anything", and it is what makes the first
++ * sample reset all three (core/internal/congestion/bbr/windowed_filter.go:105-110). */
++static void hybbr_bw_filter_reset(ngtcp2_hybbr_bw_entry est[3], uint64_t sample,
++                                  uint64_t time) {
++  est[2].sample = sample;
++  est[2].time = time;
++  est[1] = est[2];
++  est[0] = est[1];
++}
++
++static void hybbr_bw_filter_update(ngtcp2_hybbr_bw_entry est[3],
++                                   uint64_t window, uint64_t sample,
++                                   uint64_t time) {
++  if (est[0].sample == 0 || sample >= est[0].sample ||
++      time - est[2].time > window) {
++    hybbr_bw_filter_reset(est, sample, time);
++    return;
++  }
++
++  if (sample >= est[1].sample) {
++    est[1].sample = sample;
++    est[1].time = time;
++    est[2] = est[1];
++  } else if (sample >= est[2].sample) {
++    est[2].sample = sample;
++    est[2].time = time;
++  }
++
++  if (time - est[0].time > window) {
++    est[0] = est[1];
++    est[1] = est[2];
++    est[2].sample = sample;
++    est[2].time = time;
++
++    if (time - est[0].time > window) {
++      est[0] = est[1];
++      est[1] = est[2];
++    }
++
++    return;
++  }
++
++  if (est[1].sample == est[0].sample && time - est[1].time > window / 4) {
++    est[1].sample = sample;
++    est[1].time = time;
++    est[2] = est[1];
++    return;
++  }
++
++  if (est[2].sample == est[1].sample && time - est[2].time > window / 2) {
++    est[2].sample = sample;
++    est[2].time = time;
++  }
++}
++
++static void hybbr_ack_filter_reset(ngtcp2_hybbr_extra_acked_entry est[3],
++                                   const ngtcp2_hybbr_extra_acked *sample,
++                                   uint64_t time) {
++  est[2].sample = *sample;
++  est[2].time = time;
++  est[1] = est[2];
++  est[0] = est[1];
++}
++
++static void hybbr_ack_filter_update(ngtcp2_hybbr_extra_acked_entry est[3],
++                                    uint64_t window,
++                                    const ngtcp2_hybbr_extra_acked *sample,
++                                    uint64_t time) {
++  if (est[0].sample.extra_acked == 0 ||
++      sample->extra_acked >= est[0].sample.extra_acked ||
++      time - est[2].time > window) {
++    hybbr_ack_filter_reset(est, sample, time);
++    return;
++  }
++
++  if (sample->extra_acked >= est[1].sample.extra_acked) {
++    est[1].sample = *sample;
++    est[1].time = time;
++    est[2] = est[1];
++  } else if (sample->extra_acked >= est[2].sample.extra_acked) {
++    est[2].sample = *sample;
++    est[2].time = time;
++  }
++
++  if (time - est[0].time > window) {
++    est[0] = est[1];
++    est[1] = est[2];
++    est[2].sample = *sample;
++    est[2].time = time;
++
++    if (time - est[0].time > window) {
++      est[0] = est[1];
++      est[1] = est[2];
++    }
++
++    return;
++  }
++
++  if (est[1].sample.extra_acked == est[0].sample.extra_acked &&
++      time - est[1].time > window / 4) {
++    est[1].sample = *sample;
++    est[1].time = time;
++    est[2] = est[1];
++    return;
++  }
++
++  if (est[2].sample.extra_acked == est[1].sample.extra_acked &&
++      time - est[2].time > window / 2) {
++    est[2].sample = *sample;
++    est[2].time = time;
++  }
++}
++
++/* ---- the packet-number-indexed queue (packet_number_indexed_queue.go) -----------
++ *
++ * A deque whose entries are marked present or not, starting at the lowest present index. Its own
++ * comment calls it inherently hazardous — two entries far apart consume all the memory between
++ * them — and that is carried across with it, because what bounds it is the caller: packet numbers
++ * arrive in order and the queue is trimmed on every ack. */
++typedef struct hybbr_pnq_entry {
++  int present;
++  ngtcp2_hybbr_sent_packet entry;
++} hybbr_pnq_entry;
++
++static void hybbr_pnq_init(ngtcp2_hybbr_pnq *q, const ngtcp2_mem *mem) {
++  hybbr_ring_init(&q->entries, sizeof(hybbr_pnq_entry), mem);
++  q->number_of_present_entries = 0;
++  q->first_packet = HYBBR_INVALID_PACKET_NUMBER;
++}
++
++static void hybbr_pnq_free(ngtcp2_hybbr_pnq *q) {
++  hybbr_ring_free(&q->entries);
++}
++
++static int hybbr_pnq_is_empty(const ngtcp2_hybbr_pnq *q) {
++  return q->number_of_present_entries == 0;
++}
++
++static int64_t hybbr_pnq_last_packet(const ngtcp2_hybbr_pnq *q) {
++  if (hybbr_pnq_is_empty(q)) {
++    return HYBBR_INVALID_PACKET_NUMBER;
++  }
++
++  return q->first_packet + (int64_t)hybbr_ring_len(&q->entries) - 1;
++}
++
++static void hybbr_pnq_clearup(ngtcp2_hybbr_pnq *q) {
++  hybbr_pnq_entry *front;
++
++  for (;;) {
++    front = hybbr_ring_front(&q->entries);
++    if (front == NULL || front->present) {
++      break;
++    }
++
++    hybbr_ring_pop_front(&q->entries);
++    ++q->first_packet;
++  }
++
++  if (hybbr_ring_empty(&q->entries)) {
++    q->first_packet = HYBBR_INVALID_PACKET_NUMBER;
++  }
++}
++
++static hybbr_pnq_entry *hybbr_pnq_wrapper(const ngtcp2_hybbr_pnq *q,
++                                          int64_t pkt_num) {
++  int64_t offset;
++  hybbr_pnq_entry *ew;
++
++  if (pkt_num == HYBBR_INVALID_PACKET_NUMBER || hybbr_pnq_is_empty(q) ||
++      pkt_num < q->first_packet) {
++    return NULL;
++  }
++
++  offset = pkt_num - q->first_packet;
++  if (offset >= (int64_t)hybbr_ring_len(&q->entries)) {
++    return NULL;
++  }
++
++  ew = hybbr_ring_at(&q->entries, (size_t)offset);
++  if (ew == NULL || !ew->present) {
++    return NULL;
++  }
++
++  return ew;
++}
++
++static ngtcp2_hybbr_sent_packet *hybbr_pnq_get(const ngtcp2_hybbr_pnq *q,
++                                               int64_t pkt_num) {
++  hybbr_pnq_entry *ew = hybbr_pnq_wrapper(q, pkt_num);
++
++  if (ew == NULL) {
++    return NULL;
++  }
++
++  return &ew->entry;
++}
++
++static int hybbr_pnq_emplace(ngtcp2_hybbr_pnq *q, int64_t pkt_num,
++                             const ngtcp2_hybbr_sent_packet *entry) {
++  hybbr_pnq_entry ew;
++  int64_t offset, gap, i;
++  int rv;
++
++  if (pkt_num == HYBBR_INVALID_PACKET_NUMBER || entry == NULL) {
++    return 0;
++  }
++
++  ew.present = 1;
++  ew.entry = *entry;
++
++  if (hybbr_pnq_is_empty(q)) {
++    rv = hybbr_ring_push_back(&q->entries, &ew);
++    if (rv != 0) {
++      return 0;
++    }
++
++    q->number_of_present_entries = 1;
++    q->first_packet = pkt_num;
++
++    return 1;
++  }
++
++  /* Out of order is refused rather than sorted: the caller sends in order. */
++  if (pkt_num <= hybbr_pnq_last_packet(q)) {
++    return 0;
++  }
++
++  offset = pkt_num - q->first_packet;
++  gap = offset - (int64_t)hybbr_ring_len(&q->entries);
++
++  for (i = 0; i < gap; ++i) {
++    rv = hybbr_ring_push_back(&q->entries, NULL);
++    if (rv != 0) {
++      return 0;
++    }
++  }
++
++  rv = hybbr_ring_push_back(&q->entries, &ew);
++  if (rv != 0) {
++    return 0;
++  }
++
++  ++q->number_of_present_entries;
++
++  return 1;
++}
++
++static int hybbr_pnq_remove(ngtcp2_hybbr_pnq *q, int64_t pkt_num,
++                            uint64_t *psize) {
++  hybbr_pnq_entry *ew = hybbr_pnq_wrapper(q, pkt_num);
++
++  if (ew == NULL) {
++    return 0;
++  }
++
++  if (psize) {
++    *psize = ew->entry.size;
++  }
++
++  ew->present = 0;
++  --q->number_of_present_entries;
++
++  if (pkt_num == q->first_packet) {
++    hybbr_pnq_clearup(q);
++  }
++
++  return 1;
++}
++
++static void hybbr_pnq_remove_up_to(ngtcp2_hybbr_pnq *q, int64_t pkt_num) {
++  hybbr_pnq_entry *front;
++
++  while (!hybbr_ring_empty(&q->entries) &&
++         q->first_packet != HYBBR_INVALID_PACKET_NUMBER &&
++         q->first_packet < pkt_num) {
++    front = hybbr_ring_front(&q->entries);
++    if (front && front->present) {
++      --q->number_of_present_entries;
++    }
++
++    hybbr_ring_pop_front(&q->entries);
++    ++q->first_packet;
++  }
++
++  hybbr_pnq_clearup(q);
++}
++/* ---- the max ack height tracker (core/internal/congestion/bbr/bandwidth_sampler.go:100-241) -------------------
++ *
++ * How much more was acknowledged in an epoch than the bandwidth estimate says should have been.
++ * BBR adds it to the congestion window once it has left startup, which is how it tolerates a
++ * receiver that acknowledges in clumps. */
++static uint64_t hybbr_ack_height_get(const ngtcp2_hybbr_sampler *s) {
++  return s->max_ack_height_filter[0].sample.extra_acked;
++}
++
++static void hybbr_ack_height_reset(ngtcp2_hybbr_sampler *s, uint64_t new_height,
++                                   uint64_t new_time) {
++  ngtcp2_hybbr_extra_acked ev;
++
++  memset(&ev, 0, sizeof(ev));
++  ev.extra_acked = new_height;
++  ev.round = new_time;
++
++  hybbr_ack_filter_reset(s->max_ack_height_filter, &ev, new_time);
++}
++
++static uint64_t hybbr_ack_height_update(ngtcp2_hybbr_sampler *s,
++                                        uint64_t bandwidth_estimate,
++                                        int is_new_max_bandwidth,
++                                        uint64_t round_trip_count,
++                                        int64_t last_sent_packet_number,
++                                        int64_t last_acked_packet_number,
++                                        ngtcp2_tstamp ack_time,
++                                        uint64_t bytes_acked) {
++  int force_new_epoch = 0;
++  ngtcp2_duration aggregation_delta;
++  uint64_t expected_bytes_acked, extra_bytes_acked;
++  ngtcp2_hybbr_extra_acked new_event;
++
++  if (s->reduce_extra_acked_on_bandwidth_increase && is_new_max_bandwidth) {
++    /* Recompute what the three kept events would have been at the new bandwidth, and keep only
++     * those that still show an excess (core/internal/congestion/bbr/bandwidth_sampler.go:142-165). */
++    ngtcp2_hybbr_extra_acked best = s->max_ack_height_filter[0].sample;
++    ngtcp2_hybbr_extra_acked second = s->max_ack_height_filter[1].sample;
++    ngtcp2_hybbr_extra_acked third = s->max_ack_height_filter[2].sample;
++
++    memset(s->max_ack_height_filter, 0, sizeof(s->max_ack_height_filter));
++
++    expected_bytes_acked =
++      hybbr_bytes_from_bw_and_delta(bandwidth_estimate, best.time_delta);
++    if (expected_bytes_acked < best.bytes_acked) {
++      best.extra_acked = best.bytes_acked - expected_bytes_acked;
++      hybbr_ack_filter_update(s->max_ack_height_filter,
++                              s->max_ack_height_window, &best, best.round);
++    }
++
++    expected_bytes_acked =
++      hybbr_bytes_from_bw_and_delta(bandwidth_estimate, second.time_delta);
++    if (expected_bytes_acked < second.bytes_acked) {
++      second.extra_acked = second.bytes_acked - expected_bytes_acked;
++      hybbr_ack_filter_update(s->max_ack_height_filter,
++                              s->max_ack_height_window, &second, second.round);
++    }
++
++    expected_bytes_acked =
++      hybbr_bytes_from_bw_and_delta(bandwidth_estimate, third.time_delta);
++    if (expected_bytes_acked < third.bytes_acked) {
++      third.extra_acked = third.bytes_acked - expected_bytes_acked;
++      hybbr_ack_filter_update(s->max_ack_height_filter,
++                              s->max_ack_height_window, &third, third.round);
++    }
++  }
++
++  if (s->start_new_aggregation_epoch_after_full_round &&
++      s->last_sent_packet_number_before_epoch != HYBBR_INVALID_PACKET_NUMBER &&
++      last_acked_packet_number != HYBBR_INVALID_PACKET_NUMBER &&
++      last_acked_packet_number > s->last_sent_packet_number_before_epoch) {
++    force_new_epoch = 1;
++  }
++
++  if (s->aggregation_epoch_start_time == 0 || force_new_epoch) {
++    s->aggregation_epoch_bytes = bytes_acked;
++    s->aggregation_epoch_start_time = ack_time;
++    s->last_sent_packet_number_before_epoch = last_sent_packet_number;
++    ++s->num_ack_aggregation_epochs;
++
++    return 0;
++  }
++
++  aggregation_delta = ack_time - s->aggregation_epoch_start_time;
++  expected_bytes_acked =
++    hybbr_bytes_from_bw_and_delta(bandwidth_estimate, aggregation_delta);
++
++  /* The epoch restarts as soon as the ack arrival rate is no faster than the bandwidth. The
++   * threshold is 1.0 by default and 2.0 under overestimate avoidance. */
++  if ((double)s->aggregation_epoch_bytes <=
++      s->ack_aggregation_bandwidth_threshold * (double)expected_bytes_acked) {
++    s->aggregation_epoch_bytes = bytes_acked;
++    s->aggregation_epoch_start_time = ack_time;
++    s->last_sent_packet_number_before_epoch = last_sent_packet_number;
++    ++s->num_ack_aggregation_epochs;
++
++    return 0;
++  }
++
++  s->aggregation_epoch_bytes += bytes_acked;
++
++  extra_bytes_acked = s->aggregation_epoch_bytes - expected_bytes_acked;
++
++  memset(&new_event, 0, sizeof(new_event));
++  new_event.extra_acked = extra_bytes_acked;
++  new_event.bytes_acked = s->aggregation_epoch_bytes;
++  new_event.time_delta = aggregation_delta;
++
++  hybbr_ack_filter_update(s->max_ack_height_filter, s->max_ack_height_window,
++                          &new_event, round_trip_count);
++
++  return extra_bytes_acked;
++}
++
++/* ---- the two most recent ack points (core/internal/congestion/bbr/bandwidth_sampler.go:243-280) -------------- */
++static void hybbr_recent_ack_points_update(ngtcp2_hybbr_sampler *s,
++                                           ngtcp2_tstamp ack_time,
++                                           uint64_t total_bytes_acked) {
++  if (ack_time < s->ack_points[1].ack_time) {
++    s->ack_points[1].ack_time = ack_time;
++  } else if (ack_time > s->ack_points[1].ack_time) {
++    s->ack_points[0] = s->ack_points[1];
++    s->ack_points[1].ack_time = ack_time;
++  }
++
++  s->ack_points[1].total_bytes_acked = total_bytes_acked;
++}
++
++static ngtcp2_hybbr_ack_point *
++hybbr_recent_ack_points_less_recent(ngtcp2_hybbr_sampler *s) {
++  if (s->ack_points[0].total_bytes_acked != 0) {
++    return &s->ack_points[0];
++  }
++
++  return &s->ack_points[1];
++}
++
++/* ---- the sampler itself --------------------------------------------------------- */
++static void hybbr_sampler_init(ngtcp2_hybbr_sampler *s, uint64_t window,
++                               const ngtcp2_mem *mem) {
++  memset(s, 0, sizeof(*s));
++
++  s->max_ack_height_window = window;
++  s->last_sent_packet = HYBBR_INVALID_PACKET_NUMBER;
++  s->last_acked_packet = HYBBR_INVALID_PACKET_NUMBER;
++  s->end_of_app_limited_phase = HYBBR_INVALID_PACKET_NUMBER;
++  s->last_sent_packet_number_before_epoch = HYBBR_INVALID_PACKET_NUMBER;
++  s->ack_aggregation_bandwidth_threshold = 1.0;
++
++  hybbr_pnq_init(&s->connection_state_map, mem);
++  hybbr_ring_init(&s->a0_candidates, sizeof(ngtcp2_hybbr_ack_point), mem);
++}
++
++static void hybbr_sampler_free(ngtcp2_hybbr_sampler *s) {
++  hybbr_pnq_free(&s->connection_state_map);
++  hybbr_ring_free(&s->a0_candidates);
++}
++
++static void hybbr_sampler_on_app_limited(ngtcp2_hybbr_sampler *s) {
++  s->is_app_limited = 1;
++  s->end_of_app_limited_phase = s->last_sent_packet;
++}
++
++/* core/internal/congestion/bbr/bandwidth_sampler.go:554-596 */
++static void hybbr_sampler_on_packet_sent(ngtcp2_hybbr_sampler *s,
++                                         ngtcp2_tstamp sent_time,
++                                         int64_t pkt_num, uint64_t bytes,
++                                         uint64_t bytes_in_flight,
++                                         int is_retransmittable) {
++  ngtcp2_hybbr_sent_packet sp;
++
++  s->last_sent_packet = pkt_num;
++
++  if (!is_retransmittable) {
++    return;
++  }
++
++  s->total_bytes_sent += bytes;
++
++  /* With nothing in flight, the moment this packet opens the window can serve as the A_0 point.
++   * It understates the bandwidth a little and gives samples where there would otherwise be none —
++   * most importantly at the very start of the connection. */
++  if (bytes_in_flight == 0) {
++    s->last_acked_packet_ack_time = sent_time;
++
++    if (s->overestimate_avoidance) {
++      memset(s->ack_points, 0, sizeof(s->ack_points));
++      hybbr_recent_ack_points_update(s, sent_time, s->total_bytes_acked);
++      hybbr_ring_clear(&s->a0_candidates);
++      (void)hybbr_ring_push_back(&s->a0_candidates, &s->ack_points[1]);
++    }
++
++    s->total_bytes_sent_at_last_acked_packet = s->total_bytes_sent;
++    s->last_acked_packet_sent_time = sent_time;
++  }
++
++  memset(&sp, 0, sizeof(sp));
++  sp.sent_time = sent_time;
++  sp.size = bytes;
++  sp.total_bytes_sent_at_last_acked_packet =
++    s->total_bytes_sent_at_last_acked_packet;
++  sp.last_acked_packet_sent_time = s->last_acked_packet_sent_time;
++  sp.last_acked_packet_ack_time = s->last_acked_packet_ack_time;
++  sp.send_time_state.is_valid = 1;
++  sp.send_time_state.is_app_limited = s->is_app_limited;
++  sp.send_time_state.total_bytes_sent = s->total_bytes_sent;
++  sp.send_time_state.total_bytes_acked = s->total_bytes_acked;
++  sp.send_time_state.total_bytes_lost = s->total_bytes_lost;
++  sp.send_time_state.bytes_in_flight = bytes_in_flight + bytes;
++
++  (void)hybbr_pnq_emplace(&s->connection_state_map, pkt_num, &sp);
++}
++
++/* core/internal/congestion/bbr/bandwidth_sampler.go:733-760 */
++static int hybbr_sampler_choose_a0(ngtcp2_hybbr_sampler *s,
++                                   uint64_t total_bytes_acked,
++                                   ngtcp2_hybbr_ack_point *a0) {
++  size_t i, j, n = hybbr_ring_len(&s->a0_candidates);
++  ngtcp2_hybbr_ack_point *p;
++
++  if (n == 0) {
++    return 0;
++  }
++
++  if (n == 1) {
++    *a0 = *(ngtcp2_hybbr_ack_point *)hybbr_ring_front(&s->a0_candidates);
++    return 1;
++  }
++
++  for (i = 1; i < n; ++i) {
++    p = hybbr_ring_at(&s->a0_candidates, i);
++    if (p->total_bytes_acked > total_bytes_acked) {
++      *a0 = *(ngtcp2_hybbr_ack_point *)hybbr_ring_at(&s->a0_candidates, i - 1);
++
++      if (i > 1) {
++        for (j = 0; j < i - 1; ++j) {
++          hybbr_ring_pop_front(&s->a0_candidates);
++        }
++      }
++
++      return 1;
++    }
++  }
++
++  *a0 = *(ngtcp2_hybbr_ack_point *)hybbr_ring_back(&s->a0_candidates);
++
++  n = hybbr_ring_len(&s->a0_candidates);
++  for (i = 0; i + 1 < n; ++i) {
++    hybbr_ring_pop_front(&s->a0_candidates);
++  }
++
++  return 1;
++}
++
++/* One acknowledged packet's sample, bandwidthSample (core/internal/congestion/bbr/bandwidth_sampler.go:79-92), made by onPacketAcknowledged (:762-833). */
++typedef struct hybbr_sample {
++  uint64_t bandwidth;
++  ngtcp2_duration rtt;
++  uint64_t send_rate;
++  ngtcp2_hybbr_send_state state_at_send;
++} hybbr_sample;
++
++static void hybbr_sampler_on_packet_acked(ngtcp2_hybbr_sampler *s,
++                                          ngtcp2_tstamp ack_time,
++                                          int64_t pkt_num,
++                                          hybbr_sample *sample) {
++  ngtcp2_hybbr_sent_packet *sp;
++  uint64_t send_rate = HYBBR_INF_BANDWIDTH;
++  uint64_t ack_rate;
++  ngtcp2_hybbr_ack_point a0;
++
++  memset(sample, 0, sizeof(*sample));
++  sample->send_rate = HYBBR_INF_BANDWIDTH;
++
++  s->last_acked_packet = pkt_num;
++
++  sp = hybbr_pnq_get(&s->connection_state_map, pkt_num);
++  if (sp == NULL) {
++    return;
++  }
++
++  s->total_bytes_acked += sp->size;
++  s->total_bytes_sent_at_last_acked_packet =
++    sp->send_time_state.total_bytes_sent;
++  s->last_acked_packet_sent_time = sp->sent_time;
++  s->last_acked_packet_ack_time = ack_time;
++
++  if (s->overestimate_avoidance) {
++    hybbr_recent_ack_points_update(s, ack_time, s->total_bytes_acked);
++  }
++
++  if (s->is_app_limited) {
++    /* The app-limited phase ends when a packet sent after it started is acknowledged. */
++    if (s->end_of_app_limited_phase == HYBBR_INVALID_PACKET_NUMBER ||
++        pkt_num > s->end_of_app_limited_phase) {
++      s->is_app_limited = 0;
++    }
++  }
++
++  /* Nothing had been acknowledged when this packet was sent: there is no slope to take. */
++  if (sp->last_acked_packet_sent_time == 0) {
++    return;
++  }
++
++  if (sp->sent_time > sp->last_acked_packet_sent_time) {
++    send_rate = hybbr_bw_from_delta(sp->send_time_state.total_bytes_sent -
++                                      sp->total_bytes_sent_at_last_acked_packet,
++                                    sp->sent_time -
++                                      sp->last_acked_packet_sent_time);
++  }
++
++  memset(&a0, 0, sizeof(a0));
++
++  if (!(s->overestimate_avoidance &&
++        hybbr_sampler_choose_a0(s, sp->send_time_state.total_bytes_acked,
++                                &a0))) {
++    a0.ack_time = sp->last_acked_packet_ack_time;
++    a0.total_bytes_acked = sp->send_time_state.total_bytes_acked;
++  }
++
++  /* The current ack has to be later than the earlier point, or the slope is a division by zero or
++   * an underflow. */
++  if ((int64_t)(ack_time - a0.ack_time) <= 0) {
++    return;
++  }
++
++  ack_rate = hybbr_bw_from_delta(s->total_bytes_acked - a0.total_bytes_acked,
++                                 ack_time - a0.ack_time);
++
++  sample->bandwidth = hybbr_min_u64(send_rate, ack_rate);
++  sample->rtt = ack_time - sp->sent_time;
++  sample->send_rate = send_rate;
++  sample->state_at_send = sp->send_time_state;
++  sample->state_at_send.is_valid = 1;
++}
++
++static void hybbr_sampler_on_packet_lost(ngtcp2_hybbr_sampler *s,
++                                         int64_t pkt_num, uint64_t bytes_lost,
++                                         ngtcp2_hybbr_send_state *state) {
++  ngtcp2_hybbr_sent_packet *sp;
++
++  memset(state, 0, sizeof(*state));
++
++  s->total_bytes_lost += bytes_lost;
++
++  sp = hybbr_pnq_get(&s->connection_state_map, pkt_num);
++  if (sp != NULL) {
++    *state = sp->send_time_state;
++    state->is_valid = 1;
++  }
++}
++
++/* core/internal/congestion/bbr/bandwidth_sampler.go:835-861 */
++static uint64_t hybbr_sampler_on_ack_event_end(ngtcp2_hybbr_sampler *s,
++                                               uint64_t bandwidth_estimate,
++                                               int is_new_max_bandwidth,
++                                               uint64_t round_trip_count) {
++  uint64_t newly_acked_bytes =
++    s->total_bytes_acked - s->total_bytes_acked_after_last_ack_event;
++  uint64_t extra_acked;
++
++  if (newly_acked_bytes == 0) {
++    return 0;
++  }
++
++  s->total_bytes_acked_after_last_ack_event = s->total_bytes_acked;
++
++  extra_acked = hybbr_ack_height_update(
++    s, bandwidth_estimate, is_new_max_bandwidth, round_trip_count,
++    s->last_sent_packet, s->last_acked_packet, s->last_acked_packet_ack_time,
++    newly_acked_bytes);
++
++  /* A zero means this ack started a new aggregation epoch, so the last ack point of the previous
++   * one becomes a candidate for A_0. */
++  if (s->overestimate_avoidance && extra_acked == 0) {
++    (void)hybbr_ring_push_back(&s->a0_candidates,
++                               hybbr_recent_ack_points_less_recent(s));
++  }
++
++  return extra_acked;
++}
++
++/* What one ack event produces (core/internal/congestion/bbr/bandwidth_sampler.go:413-433). */
++typedef struct hybbr_event_sample {
++  uint64_t sample_max_bandwidth;
++  int sample_is_app_limited;
++  ngtcp2_duration sample_rtt;
++  uint64_t sample_max_inflight;
++  ngtcp2_hybbr_send_state last_packet_send_state;
++  uint64_t extra_acked;
++} hybbr_event_sample;
++
++/* core/internal/congestion/bbr/bandwidth_sampler.go:598-675 */
++static void hybbr_sampler_on_congestion_event(
++  ngtcp2_hybbr_sampler *s, ngtcp2_tstamp ack_time,
++  const ngtcp2_hybbr_pkt *acked, size_t acked_len,
++  const ngtcp2_hybbr_pkt *lost, size_t lost_len, uint64_t max_bandwidth,
++  uint64_t est_bandwidth_upper_bound, uint64_t round_trip_count,
++  hybbr_event_sample *event) {
++  ngtcp2_hybbr_send_state last_lost_state;
++  ngtcp2_hybbr_send_state last_acked_state;
++  ngtcp2_hybbr_send_state state;
++  hybbr_sample sample;
++  uint64_t max_send_rate = 0;
++  uint64_t inflight_sample;
++  int is_new_max_bandwidth;
++  size_t i;
++
++  memset(event, 0, sizeof(*event));
++  event->sample_rtt = HYBBR_INF_RTT;
++
++  memset(&last_lost_state, 0, sizeof(last_lost_state));
++  memset(&last_acked_state, 0, sizeof(last_acked_state));
++
++  for (i = 0; i < lost_len; ++i) {
++    hybbr_sampler_on_packet_lost(s, lost[i].pkt_num, lost[i].bytes, &state);
++    if (state.is_valid) {
++      last_lost_state = state;
++    }
++  }
++
++  if (acked_len == 0) {
++    event->last_packet_send_state = last_lost_state;
++    return;
++  }
++
++  for (i = 0; i < acked_len; ++i) {
++    hybbr_sampler_on_packet_acked(s, ack_time, acked[i].pkt_num, &sample);
++    if (!sample.state_at_send.is_valid) {
++      continue;
++    }
++
++    last_acked_state = sample.state_at_send;
++
++    if (sample.rtt != 0) {
++      event->sample_rtt = hybbr_min_u64(event->sample_rtt, sample.rtt);
++    }
++
++    if (sample.bandwidth > event->sample_max_bandwidth) {
++      event->sample_max_bandwidth = sample.bandwidth;
++      event->sample_is_app_limited = sample.state_at_send.is_app_limited;
++    }
++
++    if (sample.send_rate != HYBBR_INF_BANDWIDTH) {
++      max_send_rate = hybbr_max_u64(max_send_rate, sample.send_rate);
++    }
++
++    inflight_sample = s->total_bytes_acked - last_acked_state.total_bytes_acked;
++    if (inflight_sample > event->sample_max_inflight) {
++      event->sample_max_inflight = inflight_sample;
++    }
++  }
++
++  if (!last_lost_state.is_valid) {
++    event->last_packet_send_state = last_acked_state;
++  } else if (!last_acked_state.is_valid) {
++    event->last_packet_send_state = last_lost_state;
++  } else if (lost[lost_len - 1].pkt_num > acked[acked_len - 1].pkt_num) {
++    /* An alarm that woke late can declare a packet lost after a later one was acknowledged. */
++    event->last_packet_send_state = last_lost_state;
++  } else {
++    event->last_packet_send_state = last_acked_state;
++  }
++
++  is_new_max_bandwidth = event->sample_max_bandwidth > max_bandwidth;
++  max_bandwidth = hybbr_max_u64(max_bandwidth, event->sample_max_bandwidth);
++
++  if (s->limit_max_ack_height_tracker_by_send_rate) {
++    max_bandwidth = hybbr_max_u64(max_bandwidth, max_send_rate);
++  }
++
++  event->extra_acked = hybbr_sampler_on_ack_event_end(
++    s, hybbr_min_u64(est_bandwidth_upper_bound, max_bandwidth),
++    is_new_max_bandwidth, round_trip_count);
++}
++
++static void hybbr_sampler_remove_obsolete(ngtcp2_hybbr_sampler *s,
++                                          int64_t least_unacked) {
++  hybbr_pnq_remove_up_to(&s->connection_state_map, least_unacked);
++}
++/* ---- the pacer (common/pacer.go) -------------------------------------------------
++ *
++ * A token bucket, and it is kept even though ngtcp2 paces by a different mechanism, because two of
++ * its numbers are what ngtcp2 is given: the rate (pacing_interval_m) and the largest burst
++ * (send_quantum). Keeping the bucket itself means those two are computed from the same state the
++ * reference computes them from, rather than from something that resembles it. */
++static uint64_t hybbr_pacer_bandwidth(const ngtcp2_hybbr *hybbr);
++
++static void hybbr_pacer_init(ngtcp2_hybbr_pacer *p) {
++  p->budget_at_last_sent = HYBBR_MAX_BURST_PACKETS * HYBBR_INITIAL_PACKET_SIZE;
++  p->max_datagram_size = HYBBR_INITIAL_PACKET_SIZE;
++  p->last_sent_time = 0;
++}
++
++static uint64_t hybbr_pacer_max_burst_size(const ngtcp2_hybbr *hybbr) {
++  const ngtcp2_hybbr_pacer *p = &hybbr->pacer;
++  uint64_t bw = hybbr_pacer_bandwidth(hybbr);
++
++  return hybbr_max_u64(
++    (uint64_t)(HYBBR_MAX_BURST_PACING_DELAY_MULT * HYBBR_MIN_PACING_DELAY) *
++      bw / NGTCP2_SECONDS,
++    HYBBR_MAX_BURST_PACKETS * p->max_datagram_size);
++}
++
++static uint64_t hybbr_pacer_budget(const ngtcp2_hybbr *hybbr,
++                                   ngtcp2_tstamp now) {
++  const ngtcp2_hybbr_pacer *p = &hybbr->pacer;
++  uint64_t budget;
++
++  if (p->last_sent_time == 0) {
++    return hybbr_pacer_max_burst_size(hybbr);
++  }
++
++  budget = p->budget_at_last_sent +
++           (hybbr_pacer_bandwidth(hybbr) * (now - p->last_sent_time)) /
++             NGTCP2_SECONDS;
++
++  return hybbr_min_u64(hybbr_pacer_max_burst_size(hybbr), budget);
++}
++
++static void hybbr_pacer_sent_packet(ngtcp2_hybbr *hybbr, ngtcp2_tstamp sent_time,
++                                    uint64_t size) {
++  ngtcp2_hybbr_pacer *p = &hybbr->pacer;
++  uint64_t budget = hybbr_pacer_budget(hybbr, sent_time);
++
++  if (size > budget) {
++    p->budget_at_last_sent = 0;
++  } else {
++    p->budget_at_last_sent = budget - size;
++  }
++
++  p->last_sent_time = sent_time;
++}
++
++/* ---- the sender ------------------------------------------------------------------ */
++
++static uint64_t hybbr_bandwidth_estimate(const ngtcp2_hybbr *hybbr) {
++  return hybbr->max_bandwidth[0].sample;
++}
++
++/* The reference's rttStats.MinRTT(), which is zero when there is no sample; ngtcp2 says UINT64_MAX
++ * for the same thing. */
++static ngtcp2_duration hybbr_stats_min_rtt(const ngtcp2_hybbr *hybbr) {
++  if (hybbr->cstat->min_rtt == UINT64_MAX) {
++    return 0;
++  }
++
++  return hybbr->cstat->min_rtt;
++}
++
++/* core/internal/congestion/bbr/bbr_sender.go:674-689 */
++static ngtcp2_duration hybbr_get_min_rtt(const ngtcp2_hybbr *hybbr) {
++  ngtcp2_duration min_rtt;
++
++  if (hybbr->min_rtt != 0) {
++    return hybbr->min_rtt;
++  }
++
++  min_rtt = hybbr_stats_min_rtt(hybbr);
++  if (min_rtt == 0) {
++    return 100 * NGTCP2_MILLISECONDS;
++  }
++
++  return min_rtt;
++}
++
++/* core/internal/congestion/bbr/bbr_sender.go:640-648 */
++static uint64_t hybbr_pacing_rate(const ngtcp2_hybbr *hybbr) {
++  if (hybbr->pacing_rate == 0) {
++    return (uint64_t)(hybbr->high_gain *
++                      (double)hybbr_bw_from_delta(
++                        hybbr->initial_congestion_window,
++                        hybbr_get_min_rtt(hybbr)));
++  }
++
++  return hybbr->pacing_rate;
++}
++
++/* core/internal/congestion/bbr/bbr_sender.go:663-672: bytes per second for the pacer, with the floor that keeps it from ever
++ * being zero. */
++static uint64_t hybbr_pacer_bandwidth(const ngtcp2_hybbr *hybbr) {
++  uint64_t bps = hybbr_pacing_rate(hybbr) / 8;
++
++  if (bps < HYBBR_MIN_BPS) {
++    return HYBBR_MIN_BPS;
++  }
++
++  return bps;
++}
++
++/* core/internal/congestion/bbr/bbr_sender.go:691-702 */
++static uint64_t hybbr_target_cwnd(const ngtcp2_hybbr *hybbr, double gain) {
++  uint64_t bdp = hybbr_bdp_from_rtt_and_bw(hybbr_get_min_rtt(hybbr),
++                                           hybbr_bandwidth_estimate(hybbr));
++  uint64_t cwnd = (uint64_t)(gain * (double)bdp);
++
++  if (cwnd == 0) {
++    cwnd = (uint64_t)(gain * (double)hybbr->initial_congestion_window);
++  }
++
++  return hybbr_max_u64(cwnd, hybbr->min_congestion_window);
++}
++
++static uint64_t hybbr_probe_rtt_cwnd(const ngtcp2_hybbr *hybbr) {
++  return hybbr->min_congestion_window;
++}
++
++/* core/internal/congestion/bbr/bbr_sender.go:521-532 */
++static uint64_t hybbr_get_cwnd(const ngtcp2_hybbr *hybbr) {
++  if (hybbr->mode == HYBBR_MODE_PROBE_RTT) {
++    return hybbr_probe_rtt_cwnd(hybbr);
++  }
++
++  if (hybbr->recovery_state != HYBBR_RECOVERY_NOT_IN_RECOVERY) {
++    return hybbr_min_u64(hybbr->congestion_window, hybbr->recovery_window);
++  }
++
++  return hybbr->congestion_window;
++}
++
++static void hybbr_enter_startup_mode(ngtcp2_hybbr *hybbr) {
++  hybbr->mode = HYBBR_MODE_STARTUP;
++  hybbr->pacing_gain = hybbr->high_gain;
++  hybbr->congestion_window_gain = hybbr->high_cwnd_gain;
++
++  hybbr_debug("Phase: STARTUP");
++}
++
++/* core/internal/congestion/bbr/bbr_sender.go:732-752. The offset is drawn out of {0, 2..7}: one is left out so that a raised
++ * gain and a lowered one never follow each other. */
++static void hybbr_enter_probe_bw_mode(ngtcp2_hybbr *hybbr, ngtcp2_tstamp now) {
++  uint32_t r;
++
++  hybbr->mode = HYBBR_MODE_PROBE_BW;
++  hybbr->congestion_window_gain = hybbr->congestion_window_gain_constant;
++
++  r = ngtcp2_pcg32_rand(hybbr->pcg) % HYBBR_PACKETS_PER_CONNECTION_ID;
++  hybbr->cycle_current_offset = (int)(r % (HYBBR_GAIN_CYCLE_LENGTH - 1));
++
++  if (hybbr->cycle_current_offset >= 1) {
++    hybbr->cycle_current_offset += 1;
++  }
++
++  hybbr->last_cycle_start = now;
++  hybbr->pacing_gain = hybbr_pacing_gain[hybbr->cycle_current_offset];
++
++  hybbr_debug("Phase: PROBE_BW");
++}
++
++/* core/internal/congestion/bbr/bbr_sender.go:756-763 */
++static int hybbr_update_round_trip_counter(ngtcp2_hybbr *hybbr,
++                                           int64_t last_acked_packet) {
++  if (hybbr->current_round_trip_end == HYBBR_INVALID_PACKET_NUMBER ||
++      last_acked_packet > hybbr->current_round_trip_end) {
++    ++hybbr->round_trip_count;
++    hybbr->current_round_trip_end = hybbr->last_sent_packet;
++
++    return 1;
++  }
++
++  return 0;
++}
++
++/* core/internal/congestion/bbr/bbr_sender.go:765-798 */
++static void hybbr_update_gain_cycle_phase(ngtcp2_hybbr *hybbr,
++                                          ngtcp2_tstamp now,
++                                          uint64_t prior_in_flight,
++                                          int has_losses) {
++  int should_advance =
++    now > hybbr->last_cycle_start + hybbr_get_min_rtt(hybbr);
++
++  if (hybbr->pacing_gain > 1.0 && !has_losses &&
++      prior_in_flight < hybbr_target_cwnd(hybbr, hybbr->pacing_gain)) {
++    should_advance = 0;
++  }
++
++  if (hybbr->pacing_gain < 1.0 &&
++      hybbr->bytes_in_flight <= hybbr_target_cwnd(hybbr, 1)) {
++    should_advance = 1;
++  }
++
++  if (!should_advance) {
++    return;
++  }
++
++  hybbr->cycle_current_offset =
++    (hybbr->cycle_current_offset + 1) % HYBBR_GAIN_CYCLE_LENGTH;
++  hybbr->last_cycle_start = now;
++
++  /* Stay in low gain until the target is hit. */
++  if (hybbr->drain_to_target && hybbr->pacing_gain < 1 &&
++      hybbr_pacing_gain[hybbr->cycle_current_offset] == 1 &&
++      hybbr->bytes_in_flight > hybbr_target_cwnd(hybbr, 1)) {
++    return;
++  }
++
++  hybbr->pacing_gain = hybbr_pacing_gain[hybbr->cycle_current_offset];
++}
++
++/* core/internal/congestion/bbr/bbr_sender.go:1042-1057 */
++static int
++hybbr_should_exit_startup_due_to_loss(const ngtcp2_hybbr *hybbr,
++                                      const ngtcp2_hybbr_send_state *state) {
++  uint64_t inflight_at_send;
++
++  if (hybbr->num_loss_events_in_round < HYBBR_DEFAULT_STARTUP_FULL_LOSS_COUNT ||
++      !state->is_valid) {
++    return 0;
++  }
++
++  inflight_at_send = state->bytes_in_flight;
++
++  if (inflight_at_send > 0 && hybbr->bytes_lost_in_round > 0) {
++    return (double)hybbr->bytes_lost_in_round >
++           (double)inflight_at_send * HYBBR_BBR2_DEFAULT_LOSS_THRESHOLD;
++  }
++
++  return 0;
++}
++
++/* core/internal/congestion/bbr/bbr_sender.go:800-823 */
++static void
++hybbr_check_if_full_bandwidth_reached(ngtcp2_hybbr *hybbr,
++                                      const ngtcp2_hybbr_send_state *state) {
++  uint64_t target;
++
++  if (hybbr->last_sample_is_app_limited) {
++    return;
++  }
++
++  target =
++    (uint64_t)((double)hybbr->bandwidth_at_last_round * HYBBR_STARTUP_GROWTH_TARGET);
++
++  if (hybbr_bandwidth_estimate(hybbr) >= target) {
++    hybbr->bandwidth_at_last_round = hybbr_bandwidth_estimate(hybbr);
++    hybbr->rounds_without_bandwidth_gain = 0;
++
++    if (hybbr->expire_ack_aggregation_in_startup) {
++      hybbr_ack_height_reset(&hybbr->sampler, 0, hybbr->round_trip_count);
++    }
++
++    return;
++  }
++
++  ++hybbr->rounds_without_bandwidth_gain;
++
++  if (hybbr->rounds_without_bandwidth_gain >= hybbr->num_startup_rtts ||
++      hybbr_should_exit_startup_due_to_loss(hybbr, state)) {
++    hybbr->is_at_full_bandwidth = 1;
++  }
++}
++
++static void hybbr_maybe_app_limited(ngtcp2_hybbr *hybbr,
++                                    uint64_t bytes_in_flight) {
++  if (bytes_in_flight < hybbr_target_cwnd(hybbr, 1)) {
++    hybbr_sampler_on_app_limited(&hybbr->sampler);
++  }
++}
++
++/* core/internal/congestion/bbr/bbr_sender.go:831-847 */
++static void hybbr_maybe_exit_startup_or_drain(ngtcp2_hybbr *hybbr,
++                                              ngtcp2_tstamp now) {
++  if (hybbr->mode == HYBBR_MODE_STARTUP && hybbr->is_at_full_bandwidth) {
++    hybbr->mode = HYBBR_MODE_DRAIN;
++    hybbr->pacing_gain = hybbr->drain_gain;
++    hybbr->congestion_window_gain = hybbr->high_cwnd_gain;
++
++    hybbr_debug("Phase: DRAIN");
++  }
++
++  if (hybbr->mode == HYBBR_MODE_DRAIN &&
++      hybbr->bytes_in_flight <= hybbr_target_cwnd(hybbr, 1)) {
++    hybbr_enter_probe_bw_mode(hybbr, now);
++  }
++}
++
++/* core/internal/congestion/bbr/bbr_sender.go:849-898 */
++static void hybbr_maybe_enter_or_exit_probe_rtt(ngtcp2_hybbr *hybbr,
++                                                ngtcp2_tstamp now,
++                                                int is_round_start,
++                                                int min_rtt_expired) {
++  if (min_rtt_expired && !hybbr->exiting_quiescence &&
++      hybbr->mode != HYBBR_MODE_PROBE_RTT) {
++    hybbr->mode = HYBBR_MODE_PROBE_RTT;
++    hybbr->pacing_gain = 1.0;
++    hybbr->exit_probe_rtt_at = 0;
++
++    hybbr_debug("BandwidthEstimate: %llu bps, CongestionWindowGain: %.2f, PacingGain: %.2f, "
++                "PacingRate: %llu bps",
++                (unsigned long long)hybbr_bandwidth_estimate(hybbr),
++                hybbr->congestion_window_gain, hybbr->pacing_gain,
++                (unsigned long long)hybbr_pacing_rate(hybbr));
++    hybbr_debug("Phase: PROBE_RTT");
++  }
++
++  if (hybbr->mode == HYBBR_MODE_PROBE_RTT) {
++    hybbr_sampler_on_app_limited(&hybbr->sampler);
++
++    if (hybbr->exit_probe_rtt_at == 0) {
++      if (hybbr->bytes_in_flight <
++          hybbr_probe_rtt_cwnd(hybbr) + HYBBR_MAX_PACKET_BUFFER_SIZE) {
++        hybbr->exit_probe_rtt_at = now + HYBBR_PROBE_RTT_TIME;
++        hybbr->probe_rtt_round_passed = 0;
++      }
++    } else {
++      if (is_round_start) {
++        hybbr->probe_rtt_round_passed = 1;
++      }
++
++      if (now >= hybbr->exit_probe_rtt_at && hybbr->probe_rtt_round_passed) {
++        hybbr->min_rtt_timestamp = now;
++
++        hybbr_debug("MinRTT: %llu us",
++                    (unsigned long long)(hybbr_get_min_rtt(hybbr) / 1000));
++
++        if (!hybbr->is_at_full_bandwidth) {
++          hybbr_enter_startup_mode(hybbr);
++        } else {
++          hybbr_enter_probe_bw_mode(hybbr, now);
++        }
++      }
++    }
++  }
++
++  hybbr->exiting_quiescence = 0;
++}
++
++/* core/internal/congestion/bbr/bbr_sender.go:900-935 */
++static void hybbr_update_recovery_state(ngtcp2_hybbr *hybbr,
++                                        int64_t last_acked_packet,
++                                        int has_losses, int is_round_start) {
++  if (!hybbr->is_at_full_bandwidth) {
++    return;
++  }
++
++  if (has_losses) {
++    hybbr->end_recovery_at = hybbr->last_sent_packet;
++  }
++
++  switch (hybbr->recovery_state) {
++  case HYBBR_RECOVERY_NOT_IN_RECOVERY:
++    if (has_losses) {
++      hybbr->recovery_state = HYBBR_RECOVERY_CONSERVATION;
++      hybbr->recovery_window = 0;
++      hybbr->current_round_trip_end = hybbr->last_sent_packet;
++    }
++
++    break;
++  case HYBBR_RECOVERY_CONSERVATION:
++    if (is_round_start) {
++      hybbr->recovery_state = HYBBR_RECOVERY_GROWTH;
++    }
++
++    /* fall through, exactly as the reference does */
++    if (!has_losses && last_acked_packet > hybbr->end_recovery_at) {
++      hybbr->recovery_state = HYBBR_RECOVERY_NOT_IN_RECOVERY;
++    }
++
++    break;
++  case HYBBR_RECOVERY_GROWTH:
++    if (!has_losses && last_acked_packet > hybbr->end_recovery_at) {
++      hybbr->recovery_state = HYBBR_RECOVERY_NOT_IN_RECOVERY;
++    }
++
++    break;
++  }
++}
++
++/* core/internal/congestion/bbr/bbr_sender.go:937-975 */
++static void hybbr_calculate_pacing_rate(ngtcp2_hybbr *hybbr,
++                                        uint64_t bytes_lost) {
++  uint64_t target_rate;
++
++  if (hybbr_bandwidth_estimate(hybbr) == 0) {
++    return;
++  }
++
++  target_rate =
++    (uint64_t)(hybbr->pacing_gain * (double)hybbr_bandwidth_estimate(hybbr));
++
++  if (hybbr->is_at_full_bandwidth) {
++    hybbr->pacing_rate = target_rate;
++    return;
++  }
++
++  /* Pace at initial window / RTT as soon as there is an RTT to divide by. */
++  if (hybbr->pacing_rate == 0 && hybbr_stats_min_rtt(hybbr) != 0) {
++    hybbr->pacing_rate = hybbr_bw_from_delta(hybbr->initial_congestion_window,
++                                             hybbr_stats_min_rtt(hybbr));
++    return;
++  }
++
++  if (hybbr->detect_overshooting) {
++    hybbr->bytes_lost_while_detecting_overshooting += bytes_lost;
++
++    if (hybbr->pacing_rate > target_rate &&
++        hybbr->bytes_lost_while_detecting_overshooting > 0) {
++      if (hybbr->has_no_app_limited_sample ||
++          hybbr->bytes_lost_while_detecting_overshooting *
++              hybbr->bytes_lost_multiplier_while_detecting_overshooting >
++            hybbr->initial_congestion_window) {
++        hybbr->pacing_rate = hybbr_max_u64(
++          target_rate, hybbr_bw_from_delta(hybbr->cwnd_to_calculate_min_pacing_rate,
++                                           hybbr_stats_min_rtt(hybbr)));
++        hybbr->bytes_lost_while_detecting_overshooting = 0;
++        hybbr->detect_overshooting = 0;
++      }
++    }
++  }
++
++  /* The pacing rate does not fall during startup. */
++  hybbr->pacing_rate = hybbr_max_u64(hybbr->pacing_rate, target_rate);
++}
++
++/* core/internal/congestion/bbr/bbr_sender.go:977-1008 */
++static void hybbr_calculate_congestion_window(ngtcp2_hybbr *hybbr,
++                                              uint64_t bytes_acked,
++                                              uint64_t excess_acked) {
++  uint64_t target_window;
++
++  if (hybbr->mode == HYBBR_MODE_PROBE_RTT) {
++    return;
++  }
++
++  target_window = hybbr_target_cwnd(hybbr, hybbr->congestion_window_gain);
++
++  if (hybbr->is_at_full_bandwidth) {
++    target_window += hybbr_ack_height_get(&hybbr->sampler);
++  } else if (hybbr->enable_ack_aggregation_during_startup) {
++    target_window += excess_acked;
++  }
++
++  if (hybbr->is_at_full_bandwidth) {
++    hybbr->congestion_window = hybbr_min_u64(
++      target_window, hybbr->congestion_window + bytes_acked);
++  } else if (hybbr->congestion_window < target_window ||
++             hybbr->sampler.total_bytes_acked <
++               hybbr->initial_congestion_window) {
++    hybbr->congestion_window += bytes_acked;
++  }
++
++  hybbr->congestion_window =
++    hybbr_max_u64(hybbr->congestion_window, hybbr->min_congestion_window);
++  hybbr->congestion_window =
++    hybbr_min_u64(hybbr->congestion_window, hybbr->max_congestion_window);
++}
++
++/* core/internal/congestion/bbr/bbr_sender.go:1010-1040 */
++static void hybbr_calculate_recovery_window(ngtcp2_hybbr *hybbr,
++                                            uint64_t bytes_acked,
++                                            uint64_t bytes_lost) {
++  if (hybbr->recovery_state == HYBBR_RECOVERY_NOT_IN_RECOVERY) {
++    return;
++  }
++
++  if (hybbr->recovery_window == 0) {
++    hybbr->recovery_window = hybbr->bytes_in_flight + bytes_acked;
++    hybbr->recovery_window =
++      hybbr_max_u64(hybbr->min_congestion_window, hybbr->recovery_window);
++    return;
++  }
++
++  if (hybbr->recovery_window >= bytes_lost) {
++    hybbr->recovery_window -= bytes_lost;
++  } else {
++    hybbr->recovery_window = hybbr->max_datagram_size;
++  }
++
++  if (hybbr->recovery_state == HYBBR_RECOVERY_GROWTH) {
++    hybbr->recovery_window += bytes_acked;
++  }
++
++  hybbr->recovery_window = hybbr_max_u64(
++    hybbr->recovery_window, hybbr->bytes_in_flight + bytes_acked);
++  hybbr->recovery_window =
++    hybbr_max_u64(hybbr->min_congestion_window, hybbr->recovery_window);
++}
++
++/* core/internal/congestion/bbr/bbr_sender.go:709-718 */
++static int hybbr_maybe_update_min_rtt(ngtcp2_hybbr *hybbr, ngtcp2_tstamp now,
++                                      ngtcp2_duration sample_min_rtt) {
++  int min_rtt_expired = hybbr->min_rtt != 0 &&
++                        now > hybbr->min_rtt_timestamp + HYBBR_MIN_RTT_EXPIRY;
++
++  if (min_rtt_expired || sample_min_rtt < hybbr->min_rtt ||
++      hybbr->min_rtt == 0) {
++    hybbr->min_rtt = sample_min_rtt;
++    hybbr->min_rtt_timestamp = now;
++  }
++
++  return min_rtt_expired;
++}
++
++/* SetMaxDatagramSize (core/internal/congestion/bbr/bbr_sender.go:488-509) with the rescaling it does first (:404-427).
++ *
++ * quic-go calls this from its MTU discoverer as the path's size is found; ngtcp2 has no such
++ * callback, so the size is read off the connection's stats and a change is noticed here. The
++ * reference panics on a decrease, which cannot be produced through this path: ngtcp2's PMTUD only
++ * raises max_tx_udp_payload_size. */
++static uint64_t hybbr_scale_window(uint64_t window, uint64_t old_size,
++                                   uint64_t new_size) {
++  if (old_size == new_size) {
++    return window;
++  }
++
++  return window * new_size / old_size;
++}
++
++static void hybbr_set_max_datagram_size(ngtcp2_hybbr *hybbr, uint64_t size) {
++  uint64_t old_min_cwnd = hybbr->min_congestion_window;
++  uint64_t old_initial_cwnd = hybbr->initial_congestion_window;
++  uint64_t old_size = hybbr->max_datagram_size;
++
++  if (size <= hybbr->max_datagram_size) {
++    return;
++  }
++
++  hybbr->max_datagram_size = size;
++  hybbr->initial_congestion_window =
++    hybbr_scale_window(hybbr->initial_congestion_window, old_size, size);
++  hybbr->max_congestion_window =
++    hybbr_scale_window(hybbr->max_congestion_window, old_size, size);
++  hybbr->min_congestion_window = HYBBR_MIN_CWND_PACKETS * size;
++  hybbr->cwnd_to_calculate_min_pacing_rate =
++    hybbr_scale_window(hybbr->cwnd_to_calculate_min_pacing_rate, old_size, size);
++
++  if (hybbr->congestion_window == old_min_cwnd) {
++    hybbr->congestion_window = hybbr->min_congestion_window;
++  } else if (hybbr->congestion_window == old_initial_cwnd) {
++    hybbr->congestion_window = hybbr->initial_congestion_window;
++  } else {
++    hybbr->congestion_window = hybbr_min_u64(
++      hybbr->max_congestion_window,
++      hybbr_max_u64(hybbr->congestion_window, hybbr->min_congestion_window));
++  }
++
++  hybbr->recovery_window = hybbr_min_u64(
++    hybbr->max_congestion_window,
++    hybbr_max_u64(hybbr->recovery_window, hybbr->min_congestion_window));
++
++  hybbr->pacer.max_datagram_size = size;
++
++  hybbr_debug("Max Datagram Size: %llu", (unsigned long long)size);
++}
++
++/* What ngtcp2 is told after every event: the window, the rate and the largest burst.
++ *
++ * pacing_interval_m is "nanoseconds per byte, times 1024" — ngtcp2 multiplies it by the bytes
++ * written and shifts back (ngtcp2_conn_update_pkt_tx_time). send_quantum is the reference pacer's
++ * maxBurstSize, which is the largest run of bytes it will ever hand out at once. */
++static void hybbr_publish(ngtcp2_hybbr *hybbr, ngtcp2_conn_stat *cstat) {
++  uint64_t mds = cstat->max_tx_udp_payload_size;
++  uint64_t bps = hybbr_pacer_bandwidth(hybbr);
++  uint64_t interval_m;
++
++  /* The path's datagram size as PMTUD has found it, which is what quic-go hands the
++   * reference through SetMaxDatagramSize. */
++  if (mds > hybbr->max_datagram_size) {
++    hybbr_set_max_datagram_size(hybbr, mds);
++  }
++
++  cstat->cwnd = hybbr_get_cwnd(hybbr);
++
++  interval_m = (NGTCP2_SECONDS << 10) / bps;
++  cstat->pacing_interval_m = hybbr_max_u64(interval_m, 1);
++
++  cstat->send_quantum = (size_t)hybbr_pacer_max_burst_size(hybbr);
++}
++
++/* OnCongestionEventEx (core/internal/congestion/bbr/bbr_sender.go:538-638), run once per ack with everything that ack
++ * acknowledged and everything it declared lost. */
++static void hybbr_on_congestion_event(ngtcp2_hybbr *hybbr, ngtcp2_tstamp ts) {
++  uint64_t total_bytes_acked_before = hybbr->sampler.total_bytes_acked;
++  uint64_t total_bytes_lost_before = hybbr->sampler.total_bytes_lost;
++  uint64_t prior_in_flight = hybbr->prior_in_flight;
++  int is_round_start = 0, min_rtt_expired = 0;
++  uint64_t excess_acked = 0, bytes_lost = 0, bytes_acked;
++  ngtcp2_hybbr_send_state last_packet_send_state;
++  hybbr_event_sample sample;
++  int64_t last_acked_packet, least_unacked;
++  size_t i;
++
++  if (hybbr->acked_len == 0 && hybbr->lost_len == 0) {
++    return;
++  }
++
++  memset(&last_packet_send_state, 0, sizeof(last_packet_send_state));
++
++  hybbr_maybe_app_limited(hybbr, prior_in_flight);
++
++  hybbr->bytes_in_flight = prior_in_flight;
++  for (i = 0; i < hybbr->acked_len; ++i) {
++    hybbr->bytes_in_flight -= hybbr->acked[i].bytes;
++  }
++  for (i = 0; i < hybbr->lost_len; ++i) {
++    hybbr->bytes_in_flight -= hybbr->lost[i].bytes;
++  }
++
++  if (hybbr->acked_len != 0) {
++    last_acked_packet = hybbr->acked[hybbr->acked_len - 1].pkt_num;
++    is_round_start = hybbr_update_round_trip_counter(hybbr, last_acked_packet);
++    hybbr_update_recovery_state(hybbr, last_acked_packet, hybbr->lost_len != 0,
++                                is_round_start);
++  }
++
++  hybbr_sampler_on_congestion_event(
++    &hybbr->sampler, ts, hybbr->acked, hybbr->acked_len, hybbr->lost,
++    hybbr->lost_len, hybbr_bandwidth_estimate(hybbr), HYBBR_INF_BANDWIDTH,
++    hybbr->round_trip_count, &sample);
++
++  if (sample.last_packet_send_state.is_valid) {
++    hybbr->last_sample_is_app_limited =
++      sample.last_packet_send_state.is_app_limited;
++    hybbr->has_no_app_limited_sample =
++      hybbr->has_no_app_limited_sample || !hybbr->last_sample_is_app_limited;
++  }
++
++  /* The bandwidth is left alone for a loss-only event, and for an ack that produced no valid
++   * sample: in both cases the sampler's total does not move. */
++  if (total_bytes_acked_before != hybbr->sampler.total_bytes_acked) {
++    if (!sample.sample_is_app_limited ||
++        sample.sample_max_bandwidth > hybbr_bandwidth_estimate(hybbr)) {
++      hybbr_bw_filter_update(hybbr->max_bandwidth, hybbr->max_bandwidth_window,
++                             sample.sample_max_bandwidth,
++                             hybbr->round_trip_count);
++    }
++  }
++
++  if (sample.sample_rtt != HYBBR_INF_RTT) {
++    min_rtt_expired = hybbr_maybe_update_min_rtt(hybbr, ts, sample.sample_rtt);
++  }
++
++  bytes_lost = hybbr->sampler.total_bytes_lost - total_bytes_lost_before;
++  excess_acked = sample.extra_acked;
++  last_packet_send_state = sample.last_packet_send_state;
++
++  if (hybbr->lost_len != 0) {
++    ++hybbr->num_loss_events_in_round;
++    hybbr->bytes_lost_in_round += bytes_lost;
++  }
++
++  if (hybbr->mode == HYBBR_MODE_PROBE_BW) {
++    hybbr_update_gain_cycle_phase(hybbr, ts, prior_in_flight,
++                                  hybbr->lost_len != 0);
++  }
++
++  if (is_round_start && !hybbr->is_at_full_bandwidth) {
++    hybbr_check_if_full_bandwidth_reached(hybbr, &last_packet_send_state);
++  }
++
++  hybbr_maybe_exit_startup_or_drain(hybbr, ts);
++  hybbr_maybe_enter_or_exit_probe_rtt(hybbr, ts, is_round_start,
++                                      min_rtt_expired);
++
++  bytes_acked = hybbr->sampler.total_bytes_acked - total_bytes_acked_before;
++
++  hybbr_calculate_pacing_rate(hybbr, bytes_lost);
++  hybbr_calculate_congestion_window(hybbr, bytes_acked, excess_acked);
++  hybbr_calculate_recovery_window(hybbr, bytes_acked, bytes_lost);
++
++  /* The sampler is trimmed with an estimate of the least unacked packet, which is what the
++   * reference does and for the reason its own comment gives: the true value is not passed in, and
++   * fast retransmission keeps the two within a couple of packets. */
++  if (hybbr->acked_len != 0) {
++    least_unacked = hybbr->acked[hybbr->acked_len - 1].pkt_num - 2;
++  } else {
++    least_unacked = hybbr->lost[hybbr->lost_len - 1].pkt_num + 1;
++  }
++
++  hybbr_sampler_remove_obsolete(&hybbr->sampler, least_unacked);
++
++  if (is_round_start) {
++    hybbr->num_loss_events_in_round = 0;
++    hybbr->bytes_lost_in_round = 0;
++  }
++
++  hybbr->acked_len = 0;
++  hybbr->lost_len = 0;
++  hybbr->have_prior_in_flight = 0;
++
++  hybbr_publish(hybbr, hybbr->cstat);
++}
++/* ---- what ngtcp2 calls -----------------------------------------------------------
++ *
++ * ngtcp2 reports one packet at a time; the reference's controller is handed a whole ack at once,
++ * with everything it acknowledged and everything it declared lost (OnCongestionEventEx). The two
++ * are joined here: acknowledged and lost packets are collected as they are reported, and the event
++ * runs when the ack is finished, which is where ngtcp2 calls on_ack_recv.
++ *
++ * The order ngtcp2 uses makes that exact: every acked packet is removed from the in-flight count
++ * BEFORE the first on_pkt_acked, loss detection follows, and on_ack_recv comes last
++ * (ngtcp2_rtb.c, rtb_recv_ack). So the in-flight this event started with is what is left plus what
++ * this event took away, which is what the reference means by priorInFlight. */
++static int hybbr_batch_push(ngtcp2_hybbr *hybbr, ngtcp2_hybbr_pkt **pbuf,
++                            size_t *plen, size_t *pcap, int64_t pkt_num,
++                            uint64_t bytes) {
++  ngtcp2_hybbr_pkt *buf;
++  size_t cap;
++
++  if (*plen == *pcap) {
++    cap = *pcap ? *pcap * 2 : 16;
++    buf = ngtcp2_mem_malloc(hybbr->mem, cap * sizeof(ngtcp2_hybbr_pkt));
++    if (buf == NULL) {
++      /* The event still runs with what was collected: a controller that drops an ack entirely is
++       * worse than one that saw part of it. */
++      return NGTCP2_ERR_NOMEM;
++    }
++
++    if (*plen) {
++      memcpy(buf, *pbuf, *plen * sizeof(ngtcp2_hybbr_pkt));
++    }
++
++    ngtcp2_mem_free(hybbr->mem, *pbuf);
++    *pbuf = buf;
++    *pcap = cap;
++  }
++
++  (*pbuf)[*plen].pkt_num = pkt_num;
++  (*pbuf)[*plen].bytes = bytes;
++  ++*plen;
++
++  return 0;
++}
++
++void ngtcp2_cc_hybbr_on_pkt_sent(ngtcp2_cc *cc, ngtcp2_conn_stat *cstat,
++                                 const ngtcp2_cc_pkt *pkt) {
++  ngtcp2_hybbr *hybbr = ngtcp2_struct_of(cc, ngtcp2_hybbr, cc);
++  uint64_t bytes_in_flight;
++
++  /* The reference is told the in-flight WITH this packet already counted: quic-go adds the packet
++   * to its total and then calls the controller (internal/ackhandler/sent_packet_handler.go:317-325). ngtcp2 calls
++   * before adding, so the packet is added here. */
++  bytes_in_flight = cstat->bytes_in_flight + pkt->pktlen;
++
++  hybbr_pacer_sent_packet(hybbr, pkt->sent_ts, pkt->pktlen);
++
++  hybbr->last_sent_packet = pkt->pkt_num;
++  hybbr->bytes_in_flight = bytes_in_flight;
++
++  if (bytes_in_flight == 0) {
++    hybbr->exiting_quiescence = 1;
++  }
++
++  /* ngtcp2 reports only ack-eliciting packets to a controller, and those are exactly the ones the
++   * reference counts as retransmittable. What it does NOT report is an ACK-only packet, which the
++   * reference sees with isRetransmittable false — where it moves nothing but lastSentPacket. */
++  hybbr_sampler_on_packet_sent(&hybbr->sampler, pkt->sent_ts, pkt->pkt_num,
++                               pkt->pktlen, bytes_in_flight, 1);
++
++  hybbr_publish(hybbr, cstat);
++}
++
++void ngtcp2_cc_hybbr_on_pkt_acked(ngtcp2_cc *cc, ngtcp2_conn_stat *cstat,
++                                  const ngtcp2_cc_pkt *pkt, ngtcp2_tstamp ts) {
++  ngtcp2_hybbr *hybbr = ngtcp2_struct_of(cc, ngtcp2_hybbr, cc);
++  (void)cstat;
++  (void)ts;
++
++  (void)hybbr_batch_push(hybbr, &hybbr->acked, &hybbr->acked_len,
++                         &hybbr->acked_cap, pkt->pkt_num, pkt->pktlen);
++}
++
++void ngtcp2_cc_hybbr_on_pkt_lost(ngtcp2_cc *cc, ngtcp2_conn_stat *cstat,
++                                 const ngtcp2_cc_pkt *pkt, ngtcp2_tstamp ts) {
++  ngtcp2_hybbr *hybbr = ngtcp2_struct_of(cc, ngtcp2_hybbr, cc);
++  (void)cstat;
++  (void)ts;
++
++  (void)hybbr_batch_push(hybbr, &hybbr->lost, &hybbr->lost_len,
++                         &hybbr->lost_cap, pkt->pkt_num, pkt->pktlen);
++}
++
++/* The end of an ack: everything collected becomes one event. */
++void ngtcp2_cc_hybbr_on_ack_recv(ngtcp2_cc *cc, ngtcp2_conn_stat *cstat,
++                                 const ngtcp2_cc_ack *ack, ngtcp2_tstamp ts) {
++  ngtcp2_hybbr *hybbr = ngtcp2_struct_of(cc, ngtcp2_hybbr, cc);
++  uint64_t prior = cstat->bytes_in_flight;
++  size_t i;
++  (void)ack;
++
++  for (i = 0; i < hybbr->acked_len; ++i) {
++    prior += hybbr->acked[i].bytes;
++  }
++
++  for (i = 0; i < hybbr->lost_len; ++i) {
++    prior += hybbr->lost[i].bytes;
++  }
++
++  hybbr->prior_in_flight = prior;
++
++  hybbr_on_congestion_event(hybbr, ts);
++}
++
++/* Loss detected away from an ack — a timer, or ECN. ngtcp2 calls this after reporting the lost
++ * packets, and no on_ack_recv follows, so the event is run here instead. */
++void ngtcp2_cc_hybbr_congestion_event(ngtcp2_cc *cc, ngtcp2_conn_stat *cstat,
++                                      ngtcp2_tstamp sent_ts,
++                                      const ngtcp2_cc_ack *ack,
++                                      ngtcp2_tstamp ts) {
++  ngtcp2_hybbr *hybbr = ngtcp2_struct_of(cc, ngtcp2_hybbr, cc);
++  (void)sent_ts;
++  (void)ack;
++
++  if (hybbr->lost_len == 0 && hybbr->acked_len == 0) {
++    return;
++  }
++
++  ngtcp2_cc_hybbr_on_ack_recv(cc, cstat, ack, ts);
++}
++
++/* A path change: ngtcp2 asks the controller to start again. The reference has no such event — a
++ * quic-go connection makes a new controller — so this is the reference's constructor, run again
++ * over the same memory. */
++void ngtcp2_cc_hybbr_reset(ngtcp2_cc *cc, ngtcp2_conn_stat *cstat,
++                           ngtcp2_tstamp ts) {
++  ngtcp2_hybbr *hybbr = ngtcp2_struct_of(cc, ngtcp2_hybbr, cc);
++  ngtcp2_log *log = hybbr->log;
++  ngtcp2_pcg32 *pcg = hybbr->pcg;
++  const ngtcp2_mem *mem = hybbr->mem;
++
++  ngtcp2_hybbr_free(hybbr);
++  ngtcp2_hybbr_init(hybbr, log, cstat, ts, pcg, mem);
++}
++
++/* ---- construction ---------------------------------------------------------------- */
++
++void ngtcp2_hybbr_init(ngtcp2_hybbr *hybbr, ngtcp2_log *log,
++                       ngtcp2_conn_stat *cstat, ngtcp2_tstamp initial_ts,
++                       ngtcp2_pcg32 *pcg, const ngtcp2_mem *mem) {
++  uint64_t max_datagram_size = HYBBR_INITIAL_PACKET_SIZE;
++  uint64_t initial_cwnd, max_cwnd;
++
++  memset(hybbr, 0, sizeof(*hybbr));
++
++  hybbr->log = log;
++  hybbr->cstat = cstat;
++  hybbr->pcg = pcg;
++  hybbr->mem = mem;
++
++  /* NewBbrSender: thirty-two packets of initial window and twenty thousand of ceiling, both in
++   * units of the datagram size the connection starts with (core/internal/congestion/bbr/bbr_sender.go:321-333). */
++  initial_cwnd = HYBBR_INITIAL_CWND_PACKETS * max_datagram_size;
++  max_cwnd = (uint64_t)HYBBR_MAX_CWND_PACKETS * max_datagram_size;
++
++  hybbr_sampler_init(&hybbr->sampler, HYBBR_BANDWIDTH_WINDOW_SIZE, mem);
++  hybbr_pacer_init(&hybbr->pacer);
++
++  hybbr->mode = HYBBR_MODE_STARTUP;
++  hybbr->last_sent_packet = HYBBR_INVALID_PACKET_NUMBER;
++  hybbr->current_round_trip_end = HYBBR_INVALID_PACKET_NUMBER;
++  hybbr->max_bandwidth_window = HYBBR_BANDWIDTH_WINDOW_SIZE;
++  hybbr->congestion_window = initial_cwnd;
++  hybbr->initial_congestion_window = initial_cwnd;
++  hybbr->max_congestion_window = max_cwnd;
++  hybbr->min_congestion_window = HYBBR_MIN_CWND_PACKETS * max_datagram_size;
++  hybbr->high_gain = HYBBR_DEFAULT_HIGH_GAIN;
++  hybbr->high_cwnd_gain = HYBBR_DERIVED_HIGH_CWND_GAIN;
++  hybbr->drain_gain = 1.0 / HYBBR_DEFAULT_HIGH_GAIN;
++  hybbr->pacing_gain = 1.0;
++  hybbr->congestion_window_gain = 1.0;
++  hybbr->congestion_window_gain_constant = 2.0;
++  hybbr->num_startup_rtts = HYBBR_ROUND_TRIPS_WITHOUT_GROWTH;
++  hybbr->recovery_state = HYBBR_RECOVERY_NOT_IN_RECOVERY;
++  hybbr->end_recovery_at = HYBBR_INVALID_PACKET_NUMBER;
++  hybbr->recovery_window = max_cwnd;
++  hybbr->bytes_lost_multiplier_while_detecting_overshooting = 2;
++  hybbr->cwnd_to_calculate_min_pacing_rate = initial_cwnd;
++  hybbr->max_datagram_size = max_datagram_size;
++  hybbr->pacer.max_datagram_size = max_datagram_size;
++
++  /* The standard profile, which is what a client that names none gets — and this client names none
++   * (configForProfile's default arm, core/internal/congestion/bbr/bbr_sender.go:156-163). The other two profiles change the
++   * gains and the startup rules; nothing in this client's configuration reaches them. */
++  hybbr_enter_startup_mode(hybbr);
++
++  hybbr->cc.on_pkt_acked = ngtcp2_cc_hybbr_on_pkt_acked;
++  hybbr->cc.on_pkt_lost = ngtcp2_cc_hybbr_on_pkt_lost;
++  hybbr->cc.congestion_event = ngtcp2_cc_hybbr_congestion_event;
++  hybbr->cc.on_ack_recv = ngtcp2_cc_hybbr_on_ack_recv;
++  hybbr->cc.on_pkt_sent = ngtcp2_cc_hybbr_on_pkt_sent;
++  hybbr->cc.reset = ngtcp2_cc_hybbr_reset;
++
++  cstat->cwnd = initial_cwnd;
++  /* BBR does not use a slow-start threshold: the state machine is the whole of it. */
++  cstat->ssthresh = UINT64_MAX;
++
++  hybbr_publish(hybbr, cstat);
++
++  (void)initial_ts;
++
++}
++
++
++/* ---- the pacer, as the SEND LOOP consults it ------------------------------------
++ *
++ * WHY THIS IS EXPORTED AT ALL. The rate and the largest burst were enough while ngtcp2 did the
++ * pacing: it writes a batch and then holds the next one back by that batch's worth of time. The
++ * reference does the opposite — its send loop asks the bucket before EVERY packet, sends while
++ * there is budget, and waits only when there is not — and the difference is visible on the wire.
++ * Measured on test/hystand/loss.sh with the relay reporting shape: nine of ten of the reference's
++ * datagrams arrived in the same batch as the one before, against eight of ten here, p90 gap 127
++ * against 18 microseconds. (86 % now: the bucket did not move it, the FEED did — see LC_GSO_BATCH.)
++ *
++ * So the bucket is asked the same way here. These three are the whole of what quic-go's send loop
++ * uses: HasPacingBudget, SentPacket and TimeUntilSend (core/internal/congestion/common/pacer.go:32-76). */
++
++/* HasPacingBudget: whether a datagram may go now (core/internal/congestion/bbr/bbr_sender.go:438-441, over Budget at core/internal/congestion/common/pacer.go:42-51). */
++int ngtcp2_hybbr_pacer_can_send(const ngtcp2_hybbr *hybbr, ngtcp2_tstamp ts) {
++  return hybbr_pacer_budget(hybbr, ts) >= hybbr->pacer.max_datagram_size;
++}
++
++uint64_t ngtcp2_hybbr_pacer_budget(const ngtcp2_hybbr *hybbr, ngtcp2_tstamp ts) {
++  return hybbr_pacer_budget(hybbr, ts);
++}
++
++void ngtcp2_hybbr_pacer_sent(ngtcp2_hybbr *hybbr, ngtcp2_tstamp ts,
++                             uint64_t size) {
++  hybbr_pacer_sent_packet(hybbr, ts, size);
++}
++
++/* TimeUntilSend: zero means "now", and otherwise the moment a datagram's worth of budget will have
++ * accumulated — never sooner than MinPacingDelay, which is where the reference's millisecond floor
++ * lives (core/internal/congestion/common/pacer.go:60-76). */
++ngtcp2_tstamp ngtcp2_hybbr_pacer_next(const ngtcp2_hybbr *hybbr) {
++  const ngtcp2_hybbr_pacer *p = &hybbr->pacer;
++  uint64_t diff, bw, d;
++
++  if (p->budget_at_last_sent >= p->max_datagram_size) {
++    return 0;
++  }
++
++  diff = NGTCP2_SECONDS * (p->max_datagram_size - p->budget_at_last_sent);
++  bw = hybbr_pacer_bandwidth(hybbr);
++  d = diff / bw;
++
++  /* Rounded up, for the reason the reference gives: rounded down, the timer fires with a budget a
++   * few bytes short of a datagram and nothing can be sent. */
++  if (diff % bw) {
++    ++d;
++  }
++
++  if (d < HYBBR_MIN_PACING_DELAY) {
++    d = HYBBR_MIN_PACING_DELAY;
++  }
++
++  return p->last_sent_time + d;
++}
++
++/* The connection's controller, when it is this one — so the send loop can reach the bucket without
++ * knowing how conn stores it. NULL for every other algorithm, which is what a caller that was
++ * built for a different one gets. */
++
++void ngtcp2_hybbr_free(ngtcp2_hybbr *hybbr) {
++  hybbr_sampler_free(&hybbr->sampler);
++  ngtcp2_mem_free(hybbr->mem, hybbr->acked);
++  ngtcp2_mem_free(hybbr->mem, hybbr->lost);
++  hybbr->acked = NULL;
++  hybbr->lost = NULL;
++  hybbr->acked_len = hybbr->acked_cap = 0;
++  hybbr->lost_len = hybbr->lost_cap = 0;
++}
+diff -Naur a/lib/ngtcp2_hybbr.h b/lib/ngtcp2_hybbr.h
+--- a/lib/ngtcp2_hybbr.h
++++ b/lib/ngtcp2_hybbr.h
+@@ -0,0 +1,308 @@
++/*
++ * ngtcp2
++ *
++ * Copyright (c) 2026 the lite-client authors
++ * Translated from Hysteria (github.com/apernet/hysteria, core/internal/congestion/bbr),
++ * Copyright 2023 Toby, under the same MIT terms.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining
++ * a copy of this software and associated documentation files (the
++ * "Software"), to deal in the Software without restriction, including
++ * without limitation the rights to use, copy, modify, merge, publish,
++ * distribute, sublicense, and/or sell copies of the Software, and to
++ * permit persons to whom the Software is furnished to do so, subject to
++ * the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be
++ * included in all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++ * NONINFRINGEMENT.  IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
++ * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
++ * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
++ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++#ifndef NGTCP2_HYBBR_H
++#define NGTCP2_HYBBR_H
++
++#ifdef HAVE_CONFIG_H
++#  include <config.h>
++#endif /* defined(HAVE_CONFIG_H) */
++
++#include <ngtcp2/ngtcp2.h>
++
++#include "ngtcp2_cc.h"
++#include "ngtcp2_mem.h"
++#include "ngtcp2_pcg.h"
++
++/*
++ * THE CONGESTION CONTROL HYSTERIA USES, WHICH IS NOT THE ONE ngtcp2 SHIPS.
++ *
++ * A hysteria client that is given no bandwidth in its configuration does not fall back to the
++ * library's congestion control: it replaces it, with a port of Chromium's BBRv1 that the project
++ * carries itself —
++ * `congestion.UseConfigured(conn, ...)` -> `UseBBR` -> `bbr.NewBbrSender(...)`
++ * (vendor/hysteria/core/client/client.go:153, core/internal/congestion/utils.go:37-43). So the
++ * sending rhythm of every reference client on the wire is this algorithm's, and ngtcp2's own BBR —
++ * a different algorithm, BBRv2, with a different state machine and different constants — is what
++ * this client sent with until now.
++ *
++ * This is that port: the same states, the same gains, the same bandwidth sampler, the same ack
++ * aggregation tracker, from
++ * vendor/hysteria/core/internal/congestion/bbr/{bbr_sender,bandwidth_sampler,windowed_filter,
++ * packet_number_indexed_queue,ringbuffer,bandwidth}.go and core/internal/congestion/common/pacer.go.
++ * Line references in the implementation are to those files.
++ *
++ * WHAT IS NOT THE SAME, and there is one thing: HOW THE PACE IS APPLIED. The reference hands its
++ * pacing rate to a token bucket that quic-go's send loop consults per packet; ngtcp2 paces by
++ * writing a batch and then waiting for the batch's worth of time
++ * (ngtcp2_conn_update_pkt_tx_time). The rate is the same number and the burst ceiling is the same
++ * number — `send_quantum` is given the reference pacer's maxBurstSize — so what differs is which
++ * of the two accounts for a burst, not how fast or how large one is.
++ */
++
++typedef struct ngtcp2_hybbr ngtcp2_hybbr;
++typedef struct ngtcp2_conn ngtcp2_conn;
++
++/* One slot of a windowed filter: Kathleen Nichols' algorithm keeps three. */
++typedef struct ngtcp2_hybbr_bw_entry {
++  uint64_t sample;
++  uint64_t time;
++} ngtcp2_hybbr_bw_entry;
++
++/* The excess bytes acknowledged in one ack-aggregation epoch, which is what the max-ack-height
++ * filter keeps (core/internal/congestion/bbr/bandwidth_sampler.go:59-68). */
++typedef struct ngtcp2_hybbr_extra_acked {
++  uint64_t extra_acked;
++  uint64_t bytes_acked;
++  ngtcp2_duration time_delta;
++  uint64_t round;
++} ngtcp2_hybbr_extra_acked;
++
++typedef struct ngtcp2_hybbr_extra_acked_entry {
++  ngtcp2_hybbr_extra_acked sample;
++  uint64_t time;
++} ngtcp2_hybbr_extra_acked_entry;
++
++/* A point on the ack line: when, and how many bytes had been acknowledged by then
++ * (core/internal/congestion/bbr/bandwidth_sampler.go:243-247). */
++typedef struct ngtcp2_hybbr_ack_point {
++  ngtcp2_tstamp ack_time;
++  uint64_t total_bytes_acked;
++} ngtcp2_hybbr_ack_point;
++
++/* What was true of the connection when a packet was sent, returned to the controller when that
++ * packet is acknowledged or lost (core/internal/congestion/bbr/bandwidth_sampler.go:19-40). */
++typedef struct ngtcp2_hybbr_send_state {
++  int is_valid;
++  int is_app_limited;
++  uint64_t total_bytes_sent;
++  uint64_t total_bytes_acked;
++  uint64_t total_bytes_lost;
++  uint64_t bytes_in_flight;
++} ngtcp2_hybbr_send_state;
++
++/* The whole of what the sampler records about one sent packet (core/internal/congestion/bbr/bandwidth_sampler.go:282-303). */
++typedef struct ngtcp2_hybbr_sent_packet {
++  ngtcp2_tstamp sent_time;
++  uint64_t size;
++  uint64_t total_bytes_sent_at_last_acked_packet;
++  ngtcp2_tstamp last_acked_packet_sent_time;
++  ngtcp2_tstamp last_acked_packet_ack_time;
++  ngtcp2_hybbr_send_state send_time_state;
++} ngtcp2_hybbr_sent_packet;
++
++/* A ring buffer, grown by doubling, holding elements of one size. The reference has one per type
++ * through generics (ringbuffer.go); one with an element size does for both here. */
++typedef struct ngtcp2_hybbr_ring {
++  uint8_t *buf;
++  size_t elem_size;
++  size_t cap;
++  size_t head;
++  size_t tail;
++  int full;
++  const ngtcp2_mem *mem;
++} ngtcp2_hybbr_ring;
++
++/* The packet-number-indexed queue the sampler keeps its sent packets in
++ * (packet_number_indexed_queue.go). Entries are a presence flag and the record. */
++typedef struct ngtcp2_hybbr_pnq {
++  ngtcp2_hybbr_ring entries;
++  int64_t number_of_present_entries;
++  int64_t first_packet;
++} ngtcp2_hybbr_pnq;
++
++/* The bandwidth sampler (core/internal/congestion/bbr/bandwidth_sampler.go:441-497). */
++typedef struct ngtcp2_hybbr_sampler {
++  uint64_t total_bytes_sent;
++  uint64_t total_bytes_acked;
++  uint64_t total_bytes_lost;
++  uint64_t total_bytes_neutered;
++  uint64_t total_bytes_sent_at_last_acked_packet;
++  ngtcp2_tstamp last_acked_packet_sent_time;
++  ngtcp2_tstamp last_acked_packet_ack_time;
++  int64_t last_sent_packet;
++  int64_t last_acked_packet;
++  int is_app_limited;
++  int64_t end_of_app_limited_phase;
++  ngtcp2_hybbr_pnq connection_state_map;
++
++  /* recentAckPoints: the two most recent ack points at distinct times. */
++  ngtcp2_hybbr_ack_point ack_points[2];
++  ngtcp2_hybbr_ring a0_candidates;
++
++  /* maxAckHeightTracker (core/internal/congestion/bbr/bandwidth_sampler.go:100-117). */
++  ngtcp2_hybbr_extra_acked_entry max_ack_height_filter[3];
++  uint64_t max_ack_height_window;
++  ngtcp2_tstamp aggregation_epoch_start_time;
++  uint64_t aggregation_epoch_bytes;
++  int64_t last_sent_packet_number_before_epoch;
++  uint64_t num_ack_aggregation_epochs;
++  double ack_aggregation_bandwidth_threshold;
++  int start_new_aggregation_epoch_after_full_round;
++  int reduce_extra_acked_on_bandwidth_increase;
++
++  uint64_t total_bytes_acked_after_last_ack_event;
++  int overestimate_avoidance;
++  int limit_max_ack_height_tracker_by_send_rate;
++} ngtcp2_hybbr_sampler;
++
++/* One acknowledged or lost packet, as the event batch carries it. */
++typedef struct ngtcp2_hybbr_pkt {
++  int64_t pkt_num;
++  uint64_t bytes;
++} ngtcp2_hybbr_pkt;
++
++/* The token-bucket pacer the reference gives BBR (common/pacer.go). */
++typedef struct ngtcp2_hybbr_pacer {
++  uint64_t budget_at_last_sent;
++  uint64_t max_datagram_size;
++  ngtcp2_tstamp last_sent_time;
++} ngtcp2_hybbr_pacer;
++
++struct ngtcp2_hybbr {
++  ngtcp2_cc cc;
++  ngtcp2_log *log;
++  ngtcp2_conn_stat *cstat;
++  ngtcp2_pcg32 *pcg;
++  const ngtcp2_mem *mem;
++
++  ngtcp2_hybbr_sampler sampler;
++  ngtcp2_hybbr_pacer pacer;
++
++  int mode;
++  int recovery_state;
++
++  uint64_t round_trip_count;
++  int64_t last_sent_packet;
++  int64_t current_round_trip_end;
++
++  uint64_t num_loss_events_in_round;
++  uint64_t bytes_lost_in_round;
++
++  /* maxBandwidth, a windowed max filter over round trips. */
++  ngtcp2_hybbr_bw_entry max_bandwidth[3];
++  uint64_t max_bandwidth_window;
++
++  ngtcp2_duration min_rtt;
++  ngtcp2_tstamp min_rtt_timestamp;
++
++  uint64_t congestion_window;
++  uint64_t initial_congestion_window;
++  uint64_t max_congestion_window;
++  uint64_t min_congestion_window;
++
++  double high_gain;
++  double high_cwnd_gain;
++  double drain_gain;
++
++  uint64_t pacing_rate; /* bits per second */
++  double pacing_gain;
++  double congestion_window_gain;
++  double congestion_window_gain_constant;
++  int64_t num_startup_rtts;
++
++  int cycle_current_offset;
++  ngtcp2_tstamp last_cycle_start;
++
++  int is_at_full_bandwidth;
++  int64_t rounds_without_bandwidth_gain;
++  uint64_t bandwidth_at_last_round;
++
++  int exiting_quiescence;
++
++  ngtcp2_tstamp exit_probe_rtt_at;
++  int probe_rtt_round_passed;
++
++  int last_sample_is_app_limited;
++  int has_no_app_limited_sample;
++
++  int64_t end_recovery_at;
++  uint64_t recovery_window;
++
++  int enable_ack_aggregation_during_startup;
++  int expire_ack_aggregation_in_startup;
++  int drain_to_target;
++  int detect_overshooting;
++  uint64_t bytes_lost_while_detecting_overshooting;
++  uint8_t bytes_lost_multiplier_while_detecting_overshooting;
++  uint64_t cwnd_to_calculate_min_pacing_rate;
++
++  uint64_t max_datagram_size;
++  uint64_t bytes_in_flight;
++
++  /* The batch an ACK builds: ngtcp2 reports acknowledged and lost packets one at a time, and the
++   * reference's controller is handed both lists at once (OnCongestionEventEx). They are collected
++   * here and the event is run when the ACK is finished. */
++  ngtcp2_hybbr_pkt *acked;
++  size_t acked_len;
++  size_t acked_cap;
++  ngtcp2_hybbr_pkt *lost;
++  size_t lost_len;
++  size_t lost_cap;
++  uint64_t prior_in_flight;
++  int have_prior_in_flight;
++};
++
++/*
++ * `ngtcp2_hybbr_init` initializes |hybbr|.  It cannot fail: nothing is allocated until the
++ * first packet is sent.  The connection starts at the datagram size the reference starts at —
++ * congestion.InitialPacketSize, 1280 — and follows the path's as PMTUD finds it.
++ */
++void ngtcp2_hybbr_init(ngtcp2_hybbr *hybbr, ngtcp2_log *log,
++                       ngtcp2_conn_stat *cstat, ngtcp2_tstamp initial_ts,
++                       ngtcp2_pcg32 *pcg, const ngtcp2_mem *mem);
++
++void ngtcp2_hybbr_free(ngtcp2_hybbr *hybbr);
++
++/* The pacer as the send loop consults it — the three calls quic-go's loop makes on the reference's
++ * bucket (core/internal/congestion/common/pacer.go:32-76). `budget` is how many bytes may go now, `sent` accounts for what
++ * went, and `next` is when a datagram's worth will have accumulated (0 = now). */
++int           ngtcp2_hybbr_pacer_can_send(const ngtcp2_hybbr *hybbr, ngtcp2_tstamp ts);
++uint64_t      ngtcp2_hybbr_pacer_budget(const ngtcp2_hybbr *hybbr, ngtcp2_tstamp ts);
++void          ngtcp2_hybbr_pacer_sent(ngtcp2_hybbr *hybbr, ngtcp2_tstamp ts, uint64_t size);
++ngtcp2_tstamp ngtcp2_hybbr_pacer_next(const ngtcp2_hybbr *hybbr);
++
++/* This connection's controller when it is this one, NULL otherwise. */
++ngtcp2_hybbr *ngtcp2_conn_hybbr(ngtcp2_conn *conn);
++
++/* The entry points the ngtcp2_cc vtable is filled with; declared for the tests. */
++void ngtcp2_cc_hybbr_on_pkt_sent(ngtcp2_cc *cc, ngtcp2_conn_stat *cstat,
++                                 const ngtcp2_cc_pkt *pkt);
++void ngtcp2_cc_hybbr_on_pkt_acked(ngtcp2_cc *cc, ngtcp2_conn_stat *cstat,
++                                  const ngtcp2_cc_pkt *pkt, ngtcp2_tstamp ts);
++void ngtcp2_cc_hybbr_on_pkt_lost(ngtcp2_cc *cc, ngtcp2_conn_stat *cstat,
++                                 const ngtcp2_cc_pkt *pkt, ngtcp2_tstamp ts);
++void ngtcp2_cc_hybbr_on_ack_recv(ngtcp2_cc *cc, ngtcp2_conn_stat *cstat,
++                                 const ngtcp2_cc_ack *ack, ngtcp2_tstamp ts);
++void ngtcp2_cc_hybbr_congestion_event(ngtcp2_cc *cc, ngtcp2_conn_stat *cstat,
++                                      ngtcp2_tstamp sent_ts,
++                                      const ngtcp2_cc_ack *ack,
++                                      ngtcp2_tstamp ts);
++void ngtcp2_cc_hybbr_reset(ngtcp2_cc *cc, ngtcp2_conn_stat *cstat,
++                           ngtcp2_tstamp ts);
++
++#endif /* !defined(NGTCP2_HYBBR_H) */

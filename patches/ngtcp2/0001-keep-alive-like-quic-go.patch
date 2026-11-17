@@ -1,0 +1,174 @@
+Keep-alive PING as quic-go schedules it (hysteria client).
+
+quic-go sends a keep-alive PING at lastPacketReceivedTime + max(interval, 1.5 PTO), one per
+silence, and only a received packet re-arms it (vendor/quic-go/connection.go:701-705, :877-885,
+:1729-1731, :1779-1781). The PING is a queued frame, so it rides in the next packet whatever else
+that packet carries.
+
+Upstream ngtcp2 counts the timer from the last packet written or received on the path and puts a
+PING only into an otherwise empty packet, so against a silent peer it keeps sending a PING every
+interval, and an outgoing ACK moves the next one later.
+
+This patch: the base moves only in conn_restart_timer_on_read (every processed packet, any space);
+NGTCP2_CONN_FLAG_KEEP_ALIVE_PING_SENT holds further keep-alives until something arrives; the
+expiry is asked of every 1-RTT packet and the PING is added to an ack-eliciting packet too.
+The interval itself is set by src/quic/conn.c (keep_alive_interval).
+
+--- a/lib/ngtcp2_conn.c
++++ b/lib/ngtcp2_conn.c
+@@ -2163,6 +2163,14 @@
+ static void conn_restart_timer_on_read(ngtcp2_conn *conn, ngtcp2_tstamp ts) {
+   conn->idle_ts = ts;
+   conn->flags |= NGTCP2_CONN_FLAG_RESTART_IDLE_TIMER_ON_WRITE;
++  /* The keep-alive timer counts from the last packet received and
++     from nothing else, as quic-go's nextKeepAliveTime counts from
++     lastPacketReceivedTime, which every processed packet sets and
++     which clears keepAlivePingSent (vendor/quic-go/connection.go:
++     871-877, :1726-1728, :1776-1778). */
++  conn->keep_alive.last_ts = ts;
++  conn->flags &= (uint32_t) ~(NGTCP2_CONN_FLAG_KEEP_ALIVE_CANCELLED |
++                              NGTCP2_CONN_FLAG_KEEP_ALIVE_PING_SENT);
+ }
+ 
+ /*
+@@ -2178,6 +2186,12 @@
+  * expired.
+  */
+ static int conn_keep_alive_expired(const ngtcp2_conn *conn, ngtcp2_tstamp ts) {
++  /* One keep-alive PING per silence: none again until a packet
++     arrives. */
++  if (conn->flags & NGTCP2_CONN_FLAG_KEEP_ALIVE_PING_SENT) {
++    return 0;
++  }
++
+   return ngtcp2_tstamp_elapsed(conn->keep_alive.last_ts,
+                                conn->keep_alive.timeout, ts);
+ }
+@@ -2186,7 +2200,8 @@
+  * conn_keep_alive_expiry returns the expiry time of keep-alive timer.
+  */
+ static ngtcp2_tstamp conn_keep_alive_expiry(const ngtcp2_conn *conn) {
+-  if ((conn->flags & NGTCP2_CONN_FLAG_KEEP_ALIVE_CANCELLED) ||
++  if ((conn->flags & (NGTCP2_CONN_FLAG_KEEP_ALIVE_CANCELLED |
++                      NGTCP2_CONN_FLAG_KEEP_ALIVE_PING_SENT)) ||
+       !(conn->flags & NGTCP2_CONN_FLAG_HANDSHAKE_COMPLETED) ||
+       !conn_keep_alive_enabled(conn) ||
+       conn->keep_alive.last_ts >= UINT64_MAX - conn->keep_alive.timeout) {
+@@ -2208,16 +2223,6 @@
+   }
+ }
+ 
+-/*
+- * conn_update_keep_alive_last_ts updates the base time point of
+- * keep-alive timer.
+- */
+-static void conn_update_keep_alive_last_ts(ngtcp2_conn *conn,
+-                                           ngtcp2_tstamp ts) {
+-  conn->keep_alive.last_ts = ts;
+-  conn->flags &= (uint32_t)~NGTCP2_CONN_FLAG_KEEP_ALIVE_CANCELLED;
+-}
+-
+ void ngtcp2_conn_set_keep_alive_timeout(ngtcp2_conn *conn,
+                                         ngtcp2_duration timeout) {
+   if (timeout == 0) {
+@@ -2851,8 +2856,6 @@
+     --pktns->rtb.probe_pkt_left;
+   }
+ 
+-  conn_update_keep_alive_last_ts(conn, ts);
+-
+   conn->dcid.current.bytes_sent += (uint64_t)spktlen;
+ 
+   conn->tx.pacing.pktlen += (size_t)spktlen;
+@@ -4435,6 +4438,13 @@
+     send_datagram = 0;
+   }
+ 
++  /* Asked of every 1-RTT packet, not only of an empty one: quic-go
++     queues its keep-alive PING as a frame of its own, and the next
++     packet carries it whatever else is in it
++     (vendor/quic-go/connection.go:701-705). */
++  keep_alive_expired =
++    type == NGTCP2_PKT_1RTT && conn_keep_alive_expired(conn, ts);
++
+   if (pkt_empty) {
+     if (*pfrc == NULL && rv == 0 && stream_blocked &&
+         (write_more || !require_padding) &&
+@@ -4451,9 +4461,6 @@
+       return NGTCP2_ERR_STREAM_DATA_BLOCKED;
+     }
+ 
+-    keep_alive_expired =
+-      type == NGTCP2_PKT_1RTT && conn_keep_alive_expired(conn, ts);
+-
+     if (conn->pktns.rtb.probe_pkt_left == 0 && !keep_alive_expired &&
+         !require_padding) {
+       conn_reset_ppe_pending(conn);
+@@ -4516,11 +4523,22 @@
+           rtb_entry_flags |= NGTCP2_RTB_ENTRY_FLAG_PTO_ELICITING;
+         }
+         pktns->tx.non_ack_pkt_start_ts = UINT64_MAX;
++        if (keep_alive_expired) {
++          conn->flags |= NGTCP2_CONN_FLAG_KEEP_ALIVE_PING_SENT;
++        }
+       }
+     } else if (pktns->tx.non_ack_pkt_start_ts == UINT64_MAX) {
+       pktns->tx.non_ack_pkt_start_ts = ts;
+     }
+   } else {
++    if (keep_alive_expired) {
++      lfr.ping.type = NGTCP2_FRAME_PING;
++
++      if (conn_ppe_write_frame_hd_log(conn, ppe, &hd_logged, hd, &lfr) == 0) {
++        rtb_entry_flags |= NGTCP2_RTB_ENTRY_FLAG_PTO_ELICITING;
++        conn->flags |= NGTCP2_CONN_FLAG_KEEP_ALIVE_PING_SENT;
++      }
++    }
+     pktns->tx.non_ack_pkt_start_ts = UINT64_MAX;
+   }
+ 
+@@ -4603,8 +4621,6 @@
+                      "probe pkt size=", nwrite);
+   }
+ 
+-  conn_update_keep_alive_last_ts(conn, ts);
+-
+   conn->dcid.current.bytes_sent += (uint64_t)nwrite;
+ 
+   conn->tx.pacing.pktlen += (size_t)nwrite;
+@@ -4806,10 +4822,6 @@
+     conn_handle_tx_ecn(conn, pi, NULL, pktns, &hd, ts);
+   }
+ 
+-  if (path && ngtcp2_path_eq(&conn->dcid.current.ps.path, path)) {
+-    conn_update_keep_alive_last_ts(conn, ts);
+-  }
+-
+   if (!padded) {
+     switch (fr->hd.type) {
+     case NGTCP2_FRAME_ACK:
+@@ -9825,10 +9837,6 @@
+         conn->early.discard_started_ts == UINT64_MAX) {
+       conn->early.discard_started_ts = ts;
+     }
+-
+-    if (ngtcp2_path_eq(&conn->dcid.current.ps.path, path)) {
+-      conn_update_keep_alive_last_ts(conn, ts);
+-    }
+   }
+ 
+   rv = pktns_commit_recv_pkt_num(pktns, hd.pkt_num, pi, require_ack, pkt_ts);
+--- a/lib/ngtcp2_conn.h
++++ b/lib/ngtcp2_conn.h
+@@ -193,6 +193,11 @@
+    Initial CRYPTO frame into pieces as a countermeasure against Deep
+    Packet Inspection. */
+ #define NGTCP2_CONN_FLAG_CRUMBLE_INITIAL_CRYPTO 0x40000U
++/* NGTCP2_CONN_FLAG_KEEP_ALIVE_PING_SENT is set when a keep-alive PING
++   has been written and no packet has been received since.  quic-go
++   sends one keep-alive PING per silence (keepAlivePingSent,
++   vendor/quic-go/connection.go:701-705 and :879-885). */
++#define NGTCP2_CONN_FLAG_KEEP_ALIVE_PING_SENT 0x80000U
+ 
+ typedef struct ngtcp2_pktns {
+   struct {

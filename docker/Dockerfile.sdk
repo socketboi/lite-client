@@ -1,0 +1,52 @@
+# The machine the PACKAGE can be built on.
+#
+# package/Makefile has been in the tree since August and nothing had ever run it. It is not a sketch
+# — two variants out of one source, conffiles spelled out because the directive takes no wildcards,
+# the fingerprint table installed as a build input with a $(error) if it is missing, the version
+# stamp worked out in $(CURDIR) because git describe in a copied tree answers "unknown". All of that
+# was reasoned about and none of it was executed, so "the recipe is written" and "the recipe builds"
+# were different claims and only the first one was ever true. Phase 6 stayed "partially done" for
+# exactly one missing thing: a machine with an OpenWrt SDK on it.
+#
+#   docker build -t lc-sdk:local -f docker/Dockerfile.sdk .
+#
+# ⚠️ THE SDK ITSELF IS NOT IN THIS IMAGE, by the same rule that keeps the cross-compiler out of
+# lc-build:local: it is fetched, not built, so it belongs in dl/ beside the toolchain tarball and is
+# mounted with the tree at run time. The image is only the things the SDK needs in order to run,
+# which the host cannot supply. See the `sdk-fetch` target in the top-level Makefile for the fetch,
+# which pins a sha256 the way docker/Dockerfile pins Go's.
+ARG BUILD_IMAGE=lc-build:local
+FROM ${BUILD_IMAGE}
+
+# What the OpenWrt build system asks of its host, cut down to what building ONE package needs.
+#
+# zstd is not optional and not obvious: dl/openwrt-sdk-*.tar.zst is zstd-compressed, and while GNU
+# tar accepts --zstd it does not implement it — it execs the zstd binary, so without this the unpack
+# fails with "Cannot exec" and a tar error that reads like a corrupt archive.
+#
+# python3 and gawk are what scripts/ is written in; OpenWrt's makefiles call `gawk` by name and
+# mawk (which build-essential brings) silently mis-handles their scripts rather than refusing.
+# rsync is how the SDK stages files, unzip/wget/file are what package fetch and the apk packer use,
+# and libncurses-dev is needed by the config machinery even when nothing interactive ever runs —
+# `make defconfig` builds and runs conf(1) from scripts/config.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        zstd \
+        python3 \
+        gawk \
+        rsync \
+        unzip \
+        wget \
+        file \
+        libncurses-dev \
+        libssl-dev \
+        gettext \
+        time \
+    && rm -rf /var/lib/apt/lists/*
+
+# OpenWrt refuses to build as root and says so plainly ("Please do not compile as root"), so the
+# package build runs as an ordinary user. The uid is not arbitrary: the tree is bind-mounted from the
+# host, and while PKG_BUILD_DIR lives inside the SDK — unpacked into a volume at /sdk, not into dl/
+# (the top-level Makefile, SDK_DIR) — the package sources it builds from are the bind-mounted tree.
+# A uid that cannot read and write there turns into a permission error deep inside a package rule,
+# which reads as a broken recipe.
+RUN useradd -m -u 1000 -s /bin/sh build

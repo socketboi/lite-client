@@ -1,0 +1,13 @@
+// Copied into GOROOT's x/net/idna by the Makefile (tools/.goroot-x) for tools/unitables, which
+// writes these tables out for C. Exports only: it changes nothing the package does.
+
+package idna
+
+func LCTables() (values, index, sparseOffset []uint16, sparse [][3]uint16, mapIndex []uint16, maps, xor string) {
+	for _, v := range idnaSparseValues {
+		sparse = append(sparse, [3]uint16{v.value, uint16(v.lo), uint16(v.hi)})
+	}
+	return idnaValues[:], idnaIndex[:], idnaSparseOffset, sparse, mappingIndex, mappings, xorData
+}
+
+func LCLookupString(s string) (uint16, int) { return trie.lookupString(s) }

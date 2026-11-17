@@ -1,0 +1,2477 @@
+A client's transport errors as quic-go closes on them.
+
+quic-go puts three things in the CONNECTION_CLOSE a transport error ends the connection with: the
+code, the type of the frame the error happened on, and its own message as the reason
+(vendor/quic-go/packet_packer.go:202-208). ngtcp2 returned a liberr, from which the client inferred
+a code; the frame type went out as 0 and the reason empty. And several checks were not quic-go's
+at all.
+
+Every check a server's packet can fail now records, where it fails, what quic-go says at the same
+point (conn->qgo_close, ngtcp2_conn_qgo_close), and the client closes with it
+(ngtcp2_conn_get_qgo_ccerr); the Frame Type field is written from the ngtcp2_ccerr. Where quic-go
+decides differently, the client decides as quic-go:
+
+- frames are parsed as FrameParser does: PADDING skipped, the type a varint of any length, an
+  unknown type and one not allowed at the level refused as FRAME_ENCODING_ERROR before the body is
+  read (upstream: PROTOCOL_VIOLATION after decoding it); ACK, STREAM, MAX_STREAMS, STREAMS_BLOCKED,
+  NEW_CONNECTION_ID and NEW_TOKEN bodies checked in quic-go's order, with its words;
+- an error in an Initial packet closes the connection, as in any other packet (upstream dropped
+  the packet); a packet's reserved bits and an empty payload are refused before a duplicate is
+  dropped;
+- an ACK is refused for the four skipped packet numbers quic-go remembers, the lowest first;
+- CRYPTO: 16 KiB counted on empty frames too, new data after a level's stream is finished refused,
+  and data left over when the next keys arrive;
+- streams found as streamsMap does (the credit granted, not the credit sent; RESET_STREAM on our
+  own unidirectional stream is STREAM_STATE_ERROR), the final size checked before the windows, and
+  STREAM_DATA_BLOCKED, DATA_BLOCKED and STREAMS_BLOCKED taken without checks;
+- NEW_CONNECTION_ID and RETIRE_CONNECTION_ID as connIDManager.Add and connIDGenerator.Retire;
+- PATH_RESPONSE refused (hysteria turns quic-go's path manager off); DATAGRAM refused over 16383;
+- KEY_UPDATE_ERROR for keys updated too quickly and for an ACK the peer's keys never followed;
+- no glitch limit; 20000 gaps in reassembly, none in acknowledged ranges;
+- transport parameters parsed as Unmarshal (refusals are INTERNAL_ERROR with
+  "TRANSPORT_PARAMETER_ERROR (local): ..." as the reason, what quic-go's TLS layer makes of them),
+  version_information and grease_quic_bit not read, and checkTransportParameters in place of
+  upstream's client checks;
+- a stateless reset answered with the CONNECTION_CLOSE quic-go sends for it;
+- a NEW_CONNECTION_ID reordered or already retired answered with a RETIRE_CONNECTION_ID every time,
+  as connIDManager.add queues one (upstream: once per sequence number, tracked and bounded);
+- more control frames queued than maxControlFrames (vendor/quic-go/framer.go:18, :119-122), 16384,
+  close with INTERNAL_ERROR, no frame type and no reason, asked at the top of each step as the run
+  loop asks QueuedTooManyControlFrames (vendor/quic-go/connection.go:616-619) — here
+  ngtcp2_conn_qgo_check_control_frames;
+- a received ACK read for all its ranges, as parseAckFrame reads them (upstream: 63, which is what
+  this end sends since 0029, and the rest skipped).
+
+The server keeps upstream's code. Checked against quic-go's own code, run by tools/qgovec:
+test/ngpatch.
+
+diff -Naur a/lib/includes/ngtcp2/ngtcp2.h b/lib/includes/ngtcp2/ngtcp2.h
+--- a/lib/includes/ngtcp2/ngtcp2.h
++++ b/lib/includes/ngtcp2/ngtcp2.h
+@@ -6620,6 +6620,34 @@
+ /**
+  * @function
+  *
++ * `ngtcp2_conn_get_qgo_ccerr` fills |ccerr| with the transport error a
++ * quic-go client closes with for the error the last
++ * `ngtcp2_conn_read_pkt` returned: its code, the type of the frame it
++ * happened on and its reason, which points into |conn| and lives as
++ * long as |conn| does.  It returns 1 when there is one, and 0 when the
++ * error has no quic-go counterpart recorded, in which case |ccerr| is
++ * untouched.  A client only.
++ */
++NGTCP2_EXTERN int ngtcp2_conn_get_qgo_ccerr(const ngtcp2_conn *conn,
++                                            ngtcp2_ccerr *ccerr);
++
++/**
++ * @function
++ *
++ * `ngtcp2_conn_qgo_check_control_frames` is the question quic-go's run
++ * loop asks each time round, before anything else
++ * (vendor/quic-go/connection.go:616-619): whether more control frames
++ * were queued than maxControlFrames, 16384, allows
++ * (vendor/quic-go/framer.go:18, :119-122).  If so it records the close
++ * quic-go makes, INTERNAL_ERROR with no frame type and no reason, for
++ * `ngtcp2_conn_get_qgo_ccerr`, and returns
++ * :macro:`NGTCP2_ERR_INTERNAL`; otherwise 0.  A client only.
++ */
++NGTCP2_EXTERN int ngtcp2_conn_qgo_check_control_frames(ngtcp2_conn *conn);
++
++/**
++ * @function
++ *
+  * `ngtcp2_ccerr_set_transport_error` sets :member:`ccerr->type
+  * <ngtcp2_ccerr.type>` to
+  * :enum:`ngtcp2_ccerr_type.NGTCP2_CCERR_TYPE_TRANSPORT`, and
+diff -Naur a/lib/ngtcp2_conn.c b/lib/ngtcp2_conn.c
+--- a/lib/ngtcp2_conn.c
++++ b/lib/ngtcp2_conn.c
+@@ -26,6 +26,8 @@
+ 
+ #include <string.h>
+ #include <assert.h>
++#include <stdarg.h>
++#include <stdio.h>
+ 
+ #include "ngtcp2_macro.h"
+ #include "ngtcp2_log.h"
+@@ -75,6 +77,424 @@
+ ngtcp2_objalloc_def(strm, ngtcp2_strm, oplent)
+ 
+ /*
++ * A client's transport errors as quic-go closes on them.
++ *
++ * quic-go puts three things in the CONNECTION_CLOSE a transport error
++ * ends the connection with: the error code, the type of the frame it
++ * happened on, and its own message as the reason
++ * (vendor/quic-go/packet_packer.go:202-208).  ngtcp2 returns only a
++ * liberr, from which ngtcp2_ccerr_set_liberr infers a code and nothing
++ * else.  So every check a server's packet can fail records, where it
++ * fails, what quic-go says at the same point, and the client closes
++ * with that (ngtcp2_conn_get_qgo_ccerr).
++ */
++
++/*
++ * ngtcp2_conn_qgo_close records |error_code|, |frame_type| and the reason
++ * formatted from |fmt| as the close of a client, unless one is already
++ * recorded in this call: quic-go stops at the first error it meets.
++ * It returns |liberr|, so that a check reads
++ * `return ngtcp2_conn_qgo_close(conn, NGTCP2_ERR_..., ...);`.
++ */
++int ngtcp2_conn_qgo_close(ngtcp2_conn *conn, int liberr, uint64_t error_code,
++                          uint64_t frame_type, const char *fmt, ...) {
++  va_list ap;
++  int n;
++
++  if (conn->server || conn->qgo_close.set) {
++    return liberr;
++  }
++
++  conn->qgo_close.set = 1;
++  conn->qgo_close.error_code = error_code;
++  conn->qgo_close.frame_type = frame_type;
++
++  va_start(ap, fmt);
++  n = vsnprintf((char *)conn->qgo_close.reason, sizeof(conn->qgo_close.reason),
++                fmt, ap);
++  va_end(ap);
++
++  if (n < 0) {
++    n = 0;
++  } else if ((size_t)n >= sizeof(conn->qgo_close.reason)) {
++    n = (int)sizeof(conn->qgo_close.reason) - 1;
++  }
++  conn->qgo_close.reasonlen = (size_t)n;
++
++  return liberr;
++}
++
++int ngtcp2_conn_get_qgo_ccerr(const ngtcp2_conn *conn, ngtcp2_ccerr *ccerr) {
++  if (!conn->qgo_close.set) {
++    return 0;
++  }
++
++  ngtcp2_ccerr_default(ccerr);
++  ccerr->type = NGTCP2_CCERR_TYPE_TRANSPORT;
++  ccerr->error_code = conn->qgo_close.error_code;
++  ccerr->frame_type = conn->qgo_close.frame_type;
++  ccerr->reason = (uint8_t *)conn->qgo_close.reason;
++  ccerr->reasonlen = conn->qgo_close.reasonlen;
++
++  return 1;
++}
++
++/* maxControlFrames (vendor/quic-go/framer.go:18). */
++#define NGTCP2_QGO_MAX_CONTROL_FRAMES 16384
++
++int ngtcp2_conn_qgo_check_control_frames(ngtcp2_conn *conn) {
++  ngtcp2_frame_chain *frc;
++  size_t n = 0;
++
++  /* The 1-RTT queue, which is the one quic-go's framer holds.  quic-go
++     drops the frame that finds maxControlFrames already queued and raises
++     the flag; ngtcp2 keeps it, so the flag is one more than the limit. */
++  for (frc = conn->pktns.tx.frq; frc; frc = frc->next) {
++    if (++n > NGTCP2_QGO_MAX_CONTROL_FRAMES) {
++      return ngtcp2_conn_qgo_close(conn, NGTCP2_ERR_INTERNAL,
++                                   QGO_INTERNAL_ERROR, 0, "");
++    }
++  }
++
++  return 0;
++}
++
++/*
++ * qgo_varint is quicvarint.Parse
++ * (vendor/quic-go/quicvarint/varint.go): the length from the top two
++ * bits of the first byte, and any encoding of a value accepted,
++ * shortest or not.  It returns the length read, or 0 when |n| bytes do
++ * not hold it.
++ */
++static size_t qgo_varint(uint64_t *dest, const uint8_t *p, size_t n) {
++  size_t len;
++
++  if (n == 0) {
++    return 0;
++  }
++
++  len = ngtcp2_get_uvarintlen(p);
++  if (n < len) {
++    return 0;
++  }
++
++  ngtcp2_get_uvarint(dest, p);
++
++  return len;
++}
++
++/* qgo_level_name is EncryptionLevel.String
++   (vendor/quic-go/internal/protocol/encryption_level.go:23-35). */
++static const char *qgo_level_name(ngtcp2_encryption_level level) {
++  switch (level) {
++  case NGTCP2_ENCRYPTION_LEVEL_INITIAL:
++    return "Initial";
++  case NGTCP2_ENCRYPTION_LEVEL_HANDSHAKE:
++    return "Handshake";
++  case NGTCP2_ENCRYPTION_LEVEL_0RTT:
++    return "0-RTT";
++  case NGTCP2_ENCRYPTION_LEVEL_1RTT:
++    return "1-RTT";
++  default:
++    return "unknown";
++  }
++}
++
++/*
++ * conn_qgo_parse_type is quic-go's FrameParser.ParseType
++ * (vendor/quic-go/internal/wire/frame_parser.go:39-76), which a client
++ * runs before it parses a frame's body: it skips PADDING, reads the
++ * type as a varint, and refuses a type it does not know, and one not
++ * allowed at |level| (vendor/quic-go/internal/wire/frame_type.go:59-81),
++ * with FRAME_ENCODING_ERROR — in that order, before a byte of the body
++ * is read.  ngtcp2's decoder instead decoded the whole frame first and
++ * then refused a misplaced one with PROTOCOL_VIOLATION.
++ *
++ * A type is known when it is RFC 9000's (0x00-0x1e), or DATAGRAM when
++ * datagrams are on — hysteria turns them on (EnableDatagrams,
++ * vendor/hysteria/core/client/client.go:91) and leaves RESET_STREAM_AT
++ * and ACK_FREQUENCY off.
++ *
++ * It returns the number of bytes to step over before the frame, whose
++ * type ngtcp2's decoder then reads from its first byte: a type quic-go
++ * read from a longer encoding than one byte is written back, as one
++ * byte, in place where that encoding ended — |p| is ngtcp2's own
++ * decryption buffer.  When nothing but PADDING is left it returns |n|.
++ */
++static ngtcp2_ssize conn_qgo_parse_type(ngtcp2_conn *conn, uint8_t *p,
++                                        size_t n,
++                                        ngtcp2_encryption_level level) {
++  size_t off = 0, len;
++  uint64_t type;
++
++  for (; off < n;) {
++    len = qgo_varint(&type, p + off, n - off);
++    if (len == 0) {
++      return ngtcp2_conn_qgo_close(conn, NGTCP2_ERR_FRAME_ENCODING,
++                            QGO_FRAME_ENCODING_ERROR, 0, "unexpected EOF");
++    }
++
++    if (type == NGTCP2_FRAME_PADDING) {
++      off += len;
++      continue;
++    }
++
++    if (!(type <= NGTCP2_FRAME_HANDSHAKE_DONE ||
++          ((type == NGTCP2_FRAME_DATAGRAM ||
++            type == NGTCP2_FRAME_DATAGRAM_LEN) &&
++           conn->local.transport_params.max_datagram_frame_size))) {
++      return ngtcp2_conn_qgo_close(conn, NGTCP2_ERR_FRAME_ENCODING,
++                            QGO_FRAME_ENCODING_ERROR, type,
++                            "unknown frame type");
++    }
++
++    if ((level == NGTCP2_ENCRYPTION_LEVEL_INITIAL ||
++         level == NGTCP2_ENCRYPTION_LEVEL_HANDSHAKE) &&
++        type != NGTCP2_FRAME_CRYPTO && type != NGTCP2_FRAME_ACK &&
++        type != NGTCP2_FRAME_ACK_ECN &&
++        type != NGTCP2_FRAME_CONNECTION_CLOSE && type != NGTCP2_FRAME_PING) {
++      return ngtcp2_conn_qgo_close(conn, NGTCP2_ERR_FRAME_ENCODING,
++                            QGO_FRAME_ENCODING_ERROR, type,
++                            "%llu not allowed at encryption level %s",
++                            (unsigned long long)type, qgo_level_name(level));
++    }
++
++    off += len - 1;
++    p[off] = (uint8_t)type;
++
++    return (ngtcp2_ssize)off;
++  }
++
++  return (ngtcp2_ssize)off;
++}
++
++/*
++ * conn_qgo_parse_frame is quic-go's parse of the body of the frame at
++ * |p| (its one type byte first), for the frames whose parse refuses
++ * something ngtcp2's decoder takes, or refuses it with words of its
++ * own, or at another point of the frame than ngtcp2 does: ACK
++ * (vendor/quic-go/internal/wire/ack_frame.go:24-118), STREAM
++ * (stream_frame.go:22-87), MAX_STREAMS (max_streams_frame.go:14-34),
++ * STREAMS_BLOCKED (streams_blocked_frame.go:14-34), NEW_CONNECTION_ID
++ * (new_connection_id_frame.go:20-60) and NEW_TOKEN
++ * (new_token_frame.go:15-32).  Every other frame's parse fails only by
++ * running out of bytes, and exactly where ngtcp2's decoder does:
++ * conn_qgo_decode_error says it then.  quic-go wraps each as
++ * FRAME_ENCODING_ERROR with the frame's type
++ * (vendor/quic-go/internal/wire/frame_parser.go:78-179), and a varint
++ * that runs out is "EOF" (replaceUnexpectedEOF, :187-192).
++ *
++ * It returns 0 when quic-go parses the frame, and the error otherwise.
++ */
++static int conn_qgo_parse_frame(ngtcp2_conn *conn, const uint8_t *p,
++                                size_t n) {
++  uint64_t type = p[0], largest, v, v2, smallest, gap, blocks, i;
++  size_t len;
++
++#define QGO_READ(DEST)                                                         \
++  do {                                                                         \
++    len = qgo_varint(&(DEST), p, n);                                           \
++    if (len == 0) {                                                            \
++      goto eof;                                                                \
++    }                                                                          \
++    p += len;                                                                  \
++    n -= len;                                                                  \
++  } while (0)
++
++  ++p;
++  --n;
++
++  switch (type) {
++  case NGTCP2_FRAME_ACK:
++  case NGTCP2_FRAME_ACK_ECN:
++    QGO_READ(largest);
++    QGO_READ(v); /* ACK Delay */
++    QGO_READ(blocks);
++    QGO_READ(v); /* First ACK Range */
++    if (v > largest) {
++      return ngtcp2_conn_qgo_close(conn, NGTCP2_ERR_FRAME_ENCODING,
++                            QGO_FRAME_ENCODING_ERROR, type,
++                            "invalid first ACK range");
++    }
++    smallest = largest - v;
++    for (i = 0; i < blocks; ++i) {
++      QGO_READ(gap);
++      if (smallest < gap + 2) {
++        goto invalid_ack_ranges;
++      }
++      largest = smallest - gap - 2;
++      QGO_READ(v);
++      if (v > largest) {
++        goto invalid_ack_ranges;
++      }
++      smallest = largest - v;
++    }
++    /* validateAckRanges (ack_frame.go:232-259) holds of every list the
++       loop above can build: each range lies at least two below the one
++       before it. */
++    if (type == NGTCP2_FRAME_ACK_ECN) {
++      QGO_READ(v);
++      QGO_READ(v);
++      QGO_READ(v);
++    }
++    return 0;
++
++  invalid_ack_ranges:
++    return ngtcp2_conn_qgo_close(conn, NGTCP2_ERR_FRAME_ENCODING,
++                          QGO_FRAME_ENCODING_ERROR, type,
++                          "AckFrame: ACK frame contains invalid ACK ranges");
++  case NGTCP2_FRAME_MAX_STREAMS_BIDI:
++  case NGTCP2_FRAME_MAX_STREAMS_UNI:
++  case NGTCP2_FRAME_STREAMS_BLOCKED_BIDI:
++  case NGTCP2_FRAME_STREAMS_BLOCKED_UNI:
++    QGO_READ(v);
++    if (v > (uint64_t)NGTCP2_MAX_STREAMS) {
++      return ngtcp2_conn_qgo_close(conn, NGTCP2_ERR_FRAME_ENCODING,
++                            QGO_FRAME_ENCODING_ERROR, type,
++                            "%llu exceeds the maximum stream count",
++                            (unsigned long long)v);
++    }
++    return 0;
++  case NGTCP2_FRAME_NEW_CONNECTION_ID:
++    QGO_READ(v);  /* Sequence Number */
++    QGO_READ(v2); /* Retire Prior To */
++    if (v2 > v) {
++      return ngtcp2_conn_qgo_close(
++        conn, NGTCP2_ERR_FRAME_ENCODING, QGO_FRAME_ENCODING_ERROR, type,
++        "Retire Prior To value (%llu) larger than Sequence Number (%llu)",
++        (unsigned long long)v2, (unsigned long long)v);
++    }
++    if (n == 0) {
++      goto eof;
++    }
++    len = p[0];
++    ++p;
++    --n;
++    if (len == 0) {
++      return ngtcp2_conn_qgo_close(conn, NGTCP2_ERR_FRAME_ENCODING,
++                            QGO_FRAME_ENCODING_ERROR, type,
++                            "invalid zero-length connection ID");
++    }
++    if (len > NGTCP2_MAX_CIDLEN) {
++      return ngtcp2_conn_qgo_close(conn, NGTCP2_ERR_FRAME_ENCODING,
++                            QGO_FRAME_ENCODING_ERROR, type,
++                            "invalid Connection ID length");
++    }
++    if (n < len + NGTCP2_STATELESS_RESET_TOKENLEN) {
++      goto eof;
++    }
++    return 0;
++  case NGTCP2_FRAME_NEW_TOKEN:
++    QGO_READ(v);
++    if (v == 0) {
++      return ngtcp2_conn_qgo_close(conn, NGTCP2_ERR_FRAME_ENCODING,
++                            QGO_FRAME_ENCODING_ERROR, type,
++                            "token must not be empty");
++    }
++    if (n < v) {
++      goto eof;
++    }
++    return 0;
++  default:
++    if (type < NGTCP2_FRAME_STREAM || type > (NGTCP2_FRAME_STREAM | 0x07)) {
++      return 0;
++    }
++    QGO_READ(v); /* Stream ID */
++    v2 = 0;
++    if (type & NGTCP2_STREAM_OFF_BIT) {
++      QGO_READ(v2);
++    }
++    if (type & NGTCP2_STREAM_LEN_BIT) {
++      QGO_READ(v);
++      if (v > n) {
++        goto eof;
++      }
++    } else {
++      v = n;
++    }
++    /* Data of MinStreamFrameBufferSize or more goes into a pooled buffer
++       of MaxPacketBufferSize, and more than that is refused as EOF
++       (vendor/quic-go/internal/protocol/params.go:80,
++       vendor/quic-go/internal/protocol/protocol.go:111). */
++    if (v > 1452) {
++      goto eof;
++    }
++    if (v2 + v > NGTCP2_MAX_VARINT) {
++      return ngtcp2_conn_qgo_close(conn, NGTCP2_ERR_FRAME_ENCODING,
++                            QGO_FRAME_ENCODING_ERROR, type,
++                            "stream data overflows maximum offset");
++    }
++    return 0;
++  }
++
++eof:
++  return ngtcp2_conn_qgo_close(conn, NGTCP2_ERR_FRAME_ENCODING,
++                        QGO_FRAME_ENCODING_ERROR, type, "EOF");
++
++#undef QGO_READ
++}
++
++/*
++ * conn_qgo_decode_error says what quic-go says when ngtcp2's decoder
++ * refuses the frame at |p|, which conn_qgo_parse_frame has already let
++ * through: its bytes ran out.  It returns |liberr|.
++ */
++static int conn_qgo_decode_error(ngtcp2_conn *conn, const uint8_t *p,
++                                 int liberr) {
++  return ngtcp2_conn_qgo_close(conn, liberr, QGO_FRAME_ENCODING_ERROR, p[0], "EOF");
++}
++
++/*
++ * conn_decode_frame decodes the next frame of a packet at |level| into
++ * |fr| and returns the number of bytes it took, or an error.  A client
++ * first runs quic-go's frame parser over it — the type, then the body —
++ * so that what refuses the frame, and in which words, is quic-go's.
++ * PADDING that ends the packet comes back as one PADDING frame, which
++ * is what ngtcp2's decoder made of it too; PADDING before a frame is
++ * stepped over with it, as quic-go steps over it.
++ */
++static ngtcp2_ssize conn_decode_frame(ngtcp2_conn *conn,
++                                      ngtcp2_frame_decoder *frd,
++                                      ngtcp2_frame *fr, const uint8_t *payload,
++                                      size_t payloadlen,
++                                      ngtcp2_encryption_level level) {
++  ngtcp2_ssize skip = 0, nread;
++  int rv;
++
++  if (!conn->server) {
++    skip = conn_qgo_parse_type(conn, (uint8_t *)payload, payloadlen, level);
++    if (skip < 0) {
++      return skip;
++    }
++
++    if ((size_t)skip == payloadlen) {
++      fr->padding.type = NGTCP2_FRAME_PADDING;
++      fr->padding.len = payloadlen;
++      return skip;
++    }
++
++    rv = conn_qgo_parse_frame(conn, payload + skip, payloadlen - (size_t)skip);
++    if (rv != 0) {
++      return rv;
++    }
++  }
++
++  nread = ngtcp2_frame_decoder_decode(frd, fr, payload + skip,
++                                      payloadlen - (size_t)skip);
++  if (nread < 0) {
++    if (!conn->server) {
++      conn_qgo_decode_error(conn, payload + skip, (int)nread);
++    }
++    return nread;
++  }
++
++  return skip + nread;
++}
++
++static int conn_qgo_receive_stream(ngtcp2_conn *conn, int64_t stream_id);
++static int conn_qgo_send_stream(ngtcp2_conn *conn, int64_t stream_id);
++
++/*
+  * conn_local_stream returns nonzero if |stream_id| indicates that it
+  * is the stream initiated by local endpoint.
+  */
+@@ -1299,6 +1719,20 @@
+                    "next skip pkn=", pktns->tx.skip_pkt.next_pkt_num);
+ }
+ 
++/*
++ * pktns_qgo_skipped remembers |pkt_num| as skipped, forgetting the
++ * oldest of four, as quic-go's SkippedPacket does
++ * (vendor/quic-go/internal/ackhandler/sent_packet_history.go:50-59).
++ */
++static void pktns_qgo_skipped(ngtcp2_pktns *pktns, int64_t pkt_num) {
++  if (pktns->tx.qgo_nskipped == ngtcp2_arraylen(pktns->tx.qgo_skipped)) {
++    memmove(pktns->tx.qgo_skipped, pktns->tx.qgo_skipped + 1,
++            sizeof(pktns->tx.qgo_skipped) - sizeof(pktns->tx.qgo_skipped[0]));
++    --pktns->tx.qgo_nskipped;
++  }
++  pktns->tx.qgo_skipped[pktns->tx.qgo_nskipped++] = pkt_num;
++}
++
+ static int conn_handle_skip_pkt(ngtcp2_conn *conn, ngtcp2_pktns *pktns,
+                                 ngtcp2_tstamp ts) {
+   ngtcp2_rtb_entry *rtbent;
+@@ -1330,6 +1764,7 @@
+   }
+ 
+   ++pktns->tx.last_pkt_num;
++  pktns_qgo_skipped(pktns, pktns->tx.last_pkt_num);
+ 
+   conn_update_skip_pkt(conn, pktns);
+ 
+@@ -1367,6 +1802,7 @@
+   }
+ 
+   ++pktns->tx.last_pkt_num;
++  pktns_qgo_skipped(pktns, pktns->tx.last_pkt_num);
+ 
+   return 0;
+ }
+@@ -1620,7 +2056,12 @@
+ 
+   ngtcp2_static_ringbuf_path_history_init(&(*pconn)->path_history);
+ 
+-  ngtcp2_ratelim_init(&(*pconn)->glitch_rlim, settings->glitch_ratelim_burst,
++  /* A client never runs out: quic-go counts no glitches — a duplicate
++     frame, an empty CRYPTO frame, a frame for a stream already closed
++     are taken or dropped without end — so a burst nothing can drain
++     stands in for none. */
++  ngtcp2_ratelim_init(&(*pconn)->glitch_rlim,
++                      server ? settings->glitch_ratelim_burst : UINT64_MAX,
+                       settings->glitch_ratelim_rate, settings->initial_ts);
+ 
+   (*pconn)->callbacks = *callbacks;
+@@ -7070,9 +7511,29 @@
+                          ngtcp2_tstamp pkt_ts, ngtcp2_tstamp ts) {
+   ngtcp2_ssize num_acked;
+   ngtcp2_conn_stat *cstat = &conn->cstat;
++  size_t i;
++  int rv;
+ 
+   if (pktns->tx.last_pkt_num < fr->largest_ack) {
+-    return NGTCP2_ERR_PROTO;
++    return ngtcp2_conn_qgo_close(conn, NGTCP2_ERR_PROTO, QGO_PROTOCOL_VIOLATION,
++                                 0, "received ACK for an unsent packet");
++  }
++
++  /* A client refuses an ACK that covers one of the packet numbers it
++     remembers skipping, the lowest first, before it looks at a packet
++     the ACK covers (detectAndRemoveAckedPackets,
++     vendor/quic-go/internal/ackhandler/sent_packet_handler.go:575-585);
++     a number skipped before those four is covered without a word, as
++     ngtcp2_rtb_recv_ack then lets it be. */
++  if (!conn->server) {
++    for (i = 0; i < pktns->tx.qgo_nskipped; ++i) {
++      if (ngtcp2_ack_covers(fr, pktns->tx.qgo_skipped[i])) {
++        return ngtcp2_conn_qgo_close(
++          conn, NGTCP2_ERR_PROTO, QGO_PROTOCOL_VIOLATION, 0,
++          "received an ACK for skipped packet number: %lld (1-RTT)",
++          (long long)pktns->tx.qgo_skipped[i]);
++      }
++    }
+   }
+ 
+   /* The ranges an acknowledged ACK covered are dropped from the tracker
+@@ -7113,7 +7574,25 @@
+      RFC 9001 section 4.1.2. */
+   if (!conn->server && pktns == &conn->pktns &&
+       !(conn->flags & NGTCP2_CONN_FLAG_HANDSHAKE_CONFIRMED)) {
+-    return conn_recv_handshake_done(conn, ts);
++    rv = conn_recv_handshake_done(conn, ts);
++    if (rv != 0) {
++      return rv;
++    }
++  }
++
++  /* Then SetLargest1RTTAcked: an ACK reaching a packet sealed with the
++     current keys while nothing has opened with them means the peer
++     never followed our key update
++     (vendor/quic-go/connection.go:2176,
++     vendor/quic-go/internal/handshake/updatable_aead.go:306-316). */
++  if (!conn->server && pktns == &conn->pktns &&
++      pktns->crypto.tx.ckm->use_count &&
++      fr->largest_ack >= pktns->crypto.tx.ckm->pkt_num &&
++      pktns->crypto.rx.ckm->lc_rcvd == 0) {
++    return ngtcp2_conn_qgo_close(
++      conn, NGTCP2_ERR_PROTO, QGO_KEY_UPDATE_ERROR, 0,
++      "received ACK for key phase %llu, but peer didn't update keys",
++      (unsigned long long)conn->crypto.key_update.lc_phase);
+   }
+ 
+   return 0;
+@@ -7163,7 +7642,15 @@
+   int bidi = bidi_stream(fr->stream_id);
+   int rv;
+ 
+-  if (bidi) {
++  /* A client finds the stream as quic-go does: see conn_qgo_send_stream. */
++  if (!conn->server) {
++    rv = conn_qgo_send_stream(conn, fr->stream_id);
++    if (rv != 0) {
++      return rv;
++    }
++
++    idtr = bidi ? &conn->remote.bidi.idtr : &conn->remote.uni.idtr;
++  } else if (bidi) {
+     if (local_stream) {
+       if (conn->local.bidi.next_stream_id <= fr->stream_id) {
+         return NGTCP2_ERR_STREAM_STATE;
+@@ -8298,7 +8785,8 @@
+     /* Will return error after decrypting payload */
+   }
+ 
+-  if (pktns_pkt_num_is_duplicate(pktns, hd.pkt_num)) {
++  /* A client asks later, as quic-go does: see below. */
++  if (conn->server && pktns_pkt_num_is_duplicate(pktns, hd.pkt_num)) {
+     ngtcp2_log_info(&conn->log, NGTCP2_LOG_EVENT_PKT,
+                     "packet was discarded because of duplicated packet number");
+     return NGTCP2_ERR_DISCARD_PKT;
+@@ -8321,7 +8809,7 @@
+     return NGTCP2_ERR_DISCARD_PKT;
+   }
+ 
+-  if (invalid_reserved_bits) {
++  if (conn->server && invalid_reserved_bits) {
+     return NGTCP2_ERR_PROTO;
+   }
+ 
+@@ -8368,6 +8856,30 @@
+     ngtcp2_unreachable();
+   }
+ 
++  /* A client in quic-go's order: the packet decrypts, then its reserved
++     bits and an empty payload are refused, the Initial's as any other's
++     (unpackLongHeaderPacket and UnpackLongHeader,
++     vendor/quic-go/packet_unpacker.go:95-100, :127-145, the reserved
++     bits turned into PROTOCOL_VIOLATION by handleUnpackError,
++     vendor/quic-go/connection.go:1442-1446), and only after that is a
++     duplicate dropped (vendor/quic-go/connection.go:1389-1411). */
++  if (!conn->server) {
++    if (invalid_reserved_bits) {
++      return ngtcp2_conn_qgo_close(conn, NGTCP2_ERR_PROTO, QGO_PROTOCOL_VIOLATION, 0,
++                            "invalid reserved bits");
++    }
++    if (payloadlen == 0) {
++      return ngtcp2_conn_qgo_close(conn, NGTCP2_ERR_PROTO, QGO_PROTOCOL_VIOLATION, 0,
++                            "empty packet");
++    }
++    if (pktns_pkt_num_is_duplicate(pktns, hd.pkt_num)) {
++      ngtcp2_log_info(
++        &conn->log, NGTCP2_LOG_EVENT_PKT,
++        "packet was discarded because of duplicated packet number");
++      return NGTCP2_ERR_DISCARD_PKT;
++    }
++  }
++
+   if (payloadlen == 0) {
+     /* QUIC packet must contain at least one frame */
+     if (hd.type == NGTCP2_PKT_INITIAL) {
+@@ -8387,7 +8899,8 @@
+   ngtcp2_qlog_pkt_received_start(&conn->qlog);
+ 
+   for (; payloadlen;) {
+-    nread = ngtcp2_frame_decoder_decode(&frd, &fr, payload, payloadlen);
++    nread = conn_decode_frame(conn, &frd, &fr, payload, payloadlen,
++                              encryption_level);
+     if (nread < 0) {
+       return nread;
+     }
+@@ -8564,7 +9077,13 @@
+             return (ngtcp2_ssize)dgramlen;
+           }
+           /* client */
+-          if (is_unrecoverable_error((int)nread)) {
++          /* And so is every error quic-go closes on, which is every one
++             it meets in an Initial packet as in any other: its
++             handlePacket returns the error of an Initial packet's
++             frames like any packet's (vendor/quic-go/connection.go:
++             1763-1766), and the connection closes on it.  Upstream
++             dropped the packet and carried on. */
++          if (is_unrecoverable_error((int)nread) || conn->qgo_close.set) {
+             /* If client gets crypto error from TLS stack, it is
+                unrecoverable, therefore drop connection. */
+             return nread;
+@@ -8754,6 +9273,42 @@
+  * NGTCP2_ERR_INTERNAL
+  *     Suspicious remote endpoint activity exceeded threshold.
+  */
++/*
++ * conn_qgo_finish_crypto finishes the Initial CRYPTO stream once the
++ * Handshake read key is in and the Handshake stream once the 1-RTT one
++ * is, as quic-go does on EventReceivedHandshakeReadKeys and
++ * EventReceived1RTTReadKeys (vendor/quic-go/connection.go:2055-2063).
++ * A stream that still holds data received out of order refuses
++ * (Finish, vendor/quic-go/crypto_stream.go:64-73).
++ */
++static int conn_qgo_finish_crypto(ngtcp2_conn *conn) {
++  ngtcp2_strm *crypto;
++
++  if (!(conn->qgo_crypto_finished & 1) && conn->hs_pktns &&
++      conn->hs_pktns->crypto.rx.ckm) {
++    conn->qgo_crypto_finished |= 1;
++    crypto = conn->in_pktns ? &conn->in_pktns->crypto.strm : NULL;
++    if (crypto && crypto->rx.last_offset > ngtcp2_strm_rx_offset(crypto)) {
++      goto more_data;
++    }
++  }
++
++  if (!(conn->qgo_crypto_finished & 2) && conn->pktns.crypto.rx.ckm) {
++    conn->qgo_crypto_finished |= 2;
++    crypto = conn->hs_pktns ? &conn->hs_pktns->crypto.strm : NULL;
++    if (crypto && crypto->rx.last_offset > ngtcp2_strm_rx_offset(crypto)) {
++      goto more_data;
++    }
++  }
++
++  return 0;
++
++more_data:
++  return ngtcp2_conn_qgo_close(
++    conn, NGTCP2_ERR_PROTO, QGO_PROTOCOL_VIOLATION, 0,
++    "encryption level changed, but crypto stream has more data to read");
++}
++
+ static int conn_recv_crypto(ngtcp2_conn *conn,
+                             ngtcp2_encryption_level encryption_level,
+                             ngtcp2_strm *crypto, const ngtcp2_stream *fr,
+@@ -8764,6 +9319,34 @@
+   ngtcp2_ssize nwrite;
+   size_t max_offset;
+ 
++  /* A client as quic-go's HandleCryptoFrame
++     (vendor/quic-go/crypto_stream.go:33-54): the end of every frame,
++     empty or not, against MaxCryptoStreamOffset first — which also
++     stands for the 2^62 bound below — then, on a stream already
++     finished, new data refused and old data dropped. */
++  if (!conn->server) {
++    fr_end_offset = fr->offset + (fr->datacnt ? fr->data[0].len : 0);
++
++    if (fr_end_offset > NGTCP2_MAX_1RTT_CRYPTO_OFFSET) {
++      return ngtcp2_conn_qgo_close(
++        conn, NGTCP2_ERR_CRYPTO_BUFFER_EXCEEDED, QGO_CRYPTO_BUFFER_EXCEEDED, 0,
++        "received invalid offset %llu on crypto stream, maximum allowed %d",
++        (unsigned long long)fr_end_offset, NGTCP2_MAX_1RTT_CRYPTO_OFFSET);
++    }
++
++    if ((encryption_level == NGTCP2_ENCRYPTION_LEVEL_INITIAL &&
++         (conn->qgo_crypto_finished & 1)) ||
++        (encryption_level == NGTCP2_ENCRYPTION_LEVEL_HANDSHAKE &&
++         (conn->qgo_crypto_finished & 2))) {
++      if (fr_end_offset > crypto->rx.last_offset) {
++        return ngtcp2_conn_qgo_close(
++          conn, NGTCP2_ERR_PROTO, QGO_PROTOCOL_VIOLATION, 0,
++          "received crypto data after change of encryption level");
++      }
++      return 0;
++    }
++  }
++
+   if (fr->datacnt == 0) {
+     if (encryption_level != NGTCP2_ENCRYPTION_LEVEL_INITIAL &&
+         ngtcp2_ratelim_drain(&conn->glitch_rlim, 1, ts) != 0) {
+@@ -8857,6 +9440,10 @@
+       return rv;
+     }
+ 
++    if (!conn->server) {
++      return conn_qgo_finish_crypto(conn);
++    }
++
+     return 0;
+   }
+ 
+@@ -8912,6 +9499,167 @@
+  * NGTCP2_ERR_INTERNAL
+  *     Suspicious remote endpoint activity exceeded threshold.
+  */
++/*
++ * qgo_max_stream is quic-go's maxStream for the streams the server
++ * opens: the ID of the last it may open, InvalidStreamID (-1) while it
++ * may open none — StreamNum.StreamID of the credit
++ * (vendor/quic-go/internal/protocol/stream.go).  The credit is the one
++ * granted, whether or not MAX_STREAMS has carried it yet: quic-go raises
++ * maxStream when it deletes a stream, before the frame is sent.
++ */
++static int64_t qgo_max_stream(uint64_t max_streams, int bidi) {
++  if (max_streams == 0) {
++    return -1;
++  }
++  return (int64_t)((max_streams - 1) * 4 + (bidi ? 1 : 3));
++}
++
++/*
++ * conn_qgo_incoming_stream is quic-go's incomingStreamsMap.GetOrOpenStream
++ * refusing a stream the server may not open yet
++ * (vendor/quic-go/streams_map_incoming.go:115-123).
++ */
++static int conn_qgo_incoming_stream(ngtcp2_conn *conn, int64_t stream_id,
++                                    int bidi) {
++  int64_t max = qgo_max_stream(bidi ? conn->remote.bidi.unsent_max_streams
++                                    : conn->remote.uni.unsent_max_streams,
++                               bidi);
++
++  if (stream_id > max) {
++    return ngtcp2_conn_qgo_close(
++      conn, NGTCP2_ERR_STREAM_LIMIT, QGO_STREAM_LIMIT_ERROR, 0,
++      "peer tried to open stream %lld (current limit: %lld)",
++      (long long)stream_id, (long long)max);
++  }
++
++  return 0;
++}
++
++/*
++ * conn_qgo_outgoing_stream is quic-go's outgoingStreamsMap.GetStream
++ * refusing a stream of ours not yet opened
++ * (vendor/quic-go/streams_map_outgoing.go:161-172).
++ */
++static int conn_qgo_outgoing_stream(ngtcp2_conn *conn, int64_t stream_id,
++                                    int bidi) {
++  if (stream_id >= (bidi ? conn->local.bidi.next_stream_id
++                         : conn->local.uni.next_stream_id)) {
++    return ngtcp2_conn_qgo_close(conn, NGTCP2_ERR_STREAM_STATE,
++                                 QGO_STREAM_STATE_ERROR, 0,
++                                 "peer attempted to open stream %lld",
++                                 (long long)stream_id);
++  }
++
++  return 0;
++}
++
++/*
++ * conn_qgo_receive_stream is quic-go's streamsMap.getReceiveStream, by
++ * which STREAM, RESET_STREAM and STREAM_DATA_BLOCKED find their stream
++ * (vendor/quic-go/streams_map.go:257-286), and conn_qgo_send_stream is
++ * its getSendStream, for MAX_STREAM_DATA and STOP_SENDING (:196-226).
++ * Each returns 0, or the error quic-go refuses the frame with.
++ */
++static int conn_qgo_receive_stream(ngtcp2_conn *conn, int64_t stream_id) {
++  int local = conn_local_stream(conn, stream_id);
++
++  if (!bidi_stream(stream_id)) {
++    if (local) {
++      return ngtcp2_conn_qgo_close(conn, NGTCP2_ERR_STREAM_STATE,
++                                   QGO_STREAM_STATE_ERROR, 0,
++                                   "invalid frame for receive stream %lld",
++                                   (long long)stream_id);
++    }
++    return conn_qgo_incoming_stream(conn, stream_id, 0);
++  }
++
++  return local ? conn_qgo_outgoing_stream(conn, stream_id, 1)
++               : conn_qgo_incoming_stream(conn, stream_id, 1);
++}
++
++static int conn_qgo_send_stream(ngtcp2_conn *conn, int64_t stream_id) {
++  int local = conn_local_stream(conn, stream_id);
++
++  if (!bidi_stream(stream_id)) {
++    if (!local) {
++      return ngtcp2_conn_qgo_close(conn, NGTCP2_ERR_STREAM_STATE,
++                                   QGO_STREAM_STATE_ERROR, 0,
++                                   "invalid frame for send stream %lld",
++                                   (long long)stream_id);
++    }
++    return conn_qgo_outgoing_stream(conn, stream_id, 0);
++  }
++
++  return local ? conn_qgo_outgoing_stream(conn, stream_id, 1)
++               : conn_qgo_incoming_stream(conn, stream_id, 1);
++}
++
++/*
++ * conn_qgo_update_highest is quic-go's
++ * streamFlowController.UpdateHighestReceived with the connection's
++ * IncrementHighestReceived behind it
++ * (vendor/quic-go/flow_controller_stream.go:50-98,
++ * vendor/quic-go/flow_controller_connection.go:45-62): a STREAM frame
++ * ending at |offset|, final when it carries FIN, or a RESET_STREAM of
++ * that final size, checked against the final size first and the
++ * windows after — upstream checked the stream window first.  The
++ * highest offset received is |strm|->rx.last_offset, and the final
++ * size is known once NGTCP2_STRM_FLAG_SHUT_RD is set.
++ */
++static int conn_qgo_update_highest(ngtcp2_conn *conn, const ngtcp2_strm *strm,
++                                   uint64_t offset, int final) {
++  uint64_t highest = strm->rx.last_offset;
++
++  if (strm->flags & NGTCP2_STRM_FLAG_SHUT_RD) {
++    if (final && offset != highest) {
++      return ngtcp2_conn_qgo_close(
++        conn, NGTCP2_ERR_FINAL_SIZE, QGO_FINAL_SIZE_ERROR, 0,
++        "received inconsistent final offset for stream %lld (old: %llu, "
++        "new: %llu bytes)",
++        (long long)strm->stream_id, (unsigned long long)highest,
++        (unsigned long long)offset);
++    }
++    if (offset > highest) {
++      return ngtcp2_conn_qgo_close(
++        conn, NGTCP2_ERR_FINAL_SIZE, QGO_FINAL_SIZE_ERROR, 0,
++        "received offset %llu for stream %lld, but final offset was "
++        "already received at %llu",
++        (unsigned long long)offset, (long long)strm->stream_id,
++        (unsigned long long)highest);
++    }
++  }
++
++  if (offset <= highest) {
++    if (offset < highest && final) {
++      return ngtcp2_conn_qgo_close(
++        conn, NGTCP2_ERR_FINAL_SIZE, QGO_FINAL_SIZE_ERROR, 0,
++        "received final offset %llu for stream %lld, but already received "
++        "offset %llu before",
++        (unsigned long long)offset, (long long)strm->stream_id,
++        (unsigned long long)highest);
++    }
++    return 0;
++  }
++
++  if (offset > strm->rx.max_offset) {
++    return ngtcp2_conn_qgo_close(
++      conn, NGTCP2_ERR_FLOW_CONTROL, QGO_FLOW_CONTROL_ERROR, 0,
++      "received %llu bytes on stream %lld, allowed %llu bytes",
++      (unsigned long long)offset, (long long)strm->stream_id,
++      (unsigned long long)strm->rx.max_offset);
++  }
++
++  if (conn->rx.offset + (offset - highest) > conn->rx.max_offset) {
++    return ngtcp2_conn_qgo_close(
++      conn, NGTCP2_ERR_FLOW_CONTROL, QGO_FLOW_CONTROL_ERROR, 0,
++      "received %llu bytes for the connection, allowed %llu bytes",
++      (unsigned long long)(conn->rx.offset + (offset - highest)),
++      (unsigned long long)conn->rx.max_offset);
++  }
++
++  return 0;
++}
++
+ static int conn_recv_stream(ngtcp2_conn *conn, const ngtcp2_stream *fr,
+                             ngtcp2_tstamp ts) {
+   int rv;
+@@ -8928,7 +9676,16 @@
+   local_stream = conn_local_stream(conn, fr->stream_id);
+   bidi = bidi_stream(fr->stream_id);
+ 
+-  if (bidi) {
++  /* A client finds the stream as quic-go does, and the offset that
++     overflows was already refused by conn_qgo_parse_frame. */
++  if (!conn->server) {
++    rv = conn_qgo_receive_stream(conn, fr->stream_id);
++    if (rv != 0) {
++      return rv;
++    }
++
++    idtr = bidi ? &conn->remote.bidi.idtr : &conn->remote.uni.idtr;
++  } else if (bidi) {
+     if (local_stream) {
+       if (conn->local.bidi.next_stream_id <= fr->stream_id) {
+         return NGTCP2_ERR_STREAM_STATE;
+@@ -9000,6 +9757,13 @@
+ 
+   fr_end_offset = fr->offset + datalen;
+ 
++  if (!conn->server) {
++    rv = conn_qgo_update_highest(conn, strm, fr_end_offset, fr->fin);
++    if (rv != 0) {
++      return rv;
++    }
++  }
++
+   if (strm->rx.max_offset < fr_end_offset) {
+     return NGTCP2_ERR_FLOW_CONTROL;
+   }
+@@ -9127,6 +9891,14 @@
+     nwrite = ngtcp2_strm_recv_reordering(strm, fr->data[0].base,
+                                          fr->data[0].len, fr->offset);
+     if (nwrite < 0) {
++      /* The frame sorter's limit is a plain error to quic-go
++         (vendor/quic-go/frame_sorter.go:180-182), closed on as
++         INTERNAL_ERROR with its text. */
++      if (nwrite == NGTCP2_ERR_INTERNAL) {
++        return ngtcp2_conn_qgo_close(conn, NGTCP2_ERR_INTERNAL,
++                                     QGO_INTERNAL_ERROR, 0,
++                                     "too many gaps in received data");
++      }
+       return (int)nwrite;
+     }
+ 
+@@ -9243,8 +10015,18 @@
+   ngtcp2_idtr *idtr;
+   int rv;
+ 
+-  /* TODO share this piece of code */
+-  if (bidi) {
++  /* A client as quic-go's HandleResetStreamFrame: the stream found by
++     getReceiveStream, which refuses one of our own unidirectional
++     streams with STREAM_STATE_ERROR where upstream said
++     PROTOCOL_VIOLATION (vendor/quic-go/streams_map.go:297-306). */
++  if (!conn->server) {
++    rv = conn_qgo_receive_stream(conn, fr->stream_id);
++    if (rv != 0) {
++      return rv;
++    }
++
++    idtr = bidi ? &conn->remote.bidi.idtr : &conn->remote.uni.idtr;
++  } else if (bidi) {
+     if (local_stream) {
+       if (conn->local.bidi.next_stream_id <= fr->stream_id) {
+         return NGTCP2_ERR_STREAM_STATE;
+@@ -9294,8 +10076,11 @@
+       return 0;
+     }
+ 
+-    if (conn_initial_stream_rx_offset(conn, fr->stream_id) < fr->final_size ||
+-        conn_max_data_violated(conn, fr->final_size)) {
++    /* A client opens the stream first and checks the size against it
++       below, as quic-go does. */
++    if (conn->server &&
++        (conn_initial_stream_rx_offset(conn, fr->stream_id) < fr->final_size ||
++         conn_max_data_violated(conn, fr->final_size))) {
+       return NGTCP2_ERR_FLOW_CONTROL;
+     }
+ 
+@@ -9316,6 +10101,13 @@
+     }
+   }
+ 
++  if (!conn->server) {
++    rv = conn_qgo_update_highest(conn, strm, fr->final_size, 1);
++    if (rv != 0) {
++      return rv;
++    }
++  }
++
+   if (strm->flags & NGTCP2_STRM_FLAG_SHUT_RD) {
+     if (strm->rx.last_offset != fr->final_size) {
+       return NGTCP2_ERR_FINAL_SIZE;
+@@ -9400,7 +10192,15 @@
+   int local_stream = conn_local_stream(conn, fr->stream_id);
+   int bidi = bidi_stream(fr->stream_id);
+ 
+-  if (bidi) {
++  /* A client finds the stream as quic-go does: see conn_qgo_send_stream. */
++  if (!conn->server) {
++    rv = conn_qgo_send_stream(conn, fr->stream_id);
++    if (rv != 0) {
++      return rv;
++    }
++
++    idtr = bidi ? &conn->remote.bidi.idtr : &conn->remote.uni.idtr;
++  } else if (bidi) {
+     if (local_stream) {
+       if (conn->local.bidi.next_stream_id <= fr->stream_id) {
+         return NGTCP2_ERR_STREAM_STATE;
+@@ -9529,6 +10329,34 @@
+   ngtcp2_pv *pv = conn->pv;
+   ngtcp2_pkt_stateless_reset2 sr;
+ 
++  /* A client as quic-go: a packet that failed to open — not one whose
++     frames failed — at least 21 bytes long, short header, fixed bit set,
++     ending in the active Destination Connection ID's token
++     (vendor/quic-go/connection.go:1220-1233,
++     IsActiveStatelessResetToken, vendor/quic-go/conn_id_manager.go:
++     304-321).  quic-go does not go quiet on it: the StatelessResetError
++     reaches sendConnectionClose, which knows no such type and closes
++     with INTERNAL_ERROR, "connection BUG: unspecified error type"
++     (vendor/quic-go/connection.go:2879-2892).  The caller then fails
++     the read instead of draining, and the close goes out. */
++  if (!conn->server) {
++    if (conn->qgo_unpacked || payloadlen < 21 ||
++        (payload[0] & 0xc0) != 0x40 ||
++        !(conn->dcid.current.flags & NGTCP2_DCID_FLAG_TOKEN_PRESENT) ||
++        !ngtcp2_cmemeq(conn->dcid.current.token.data,
++                       payload + payloadlen - NGTCP2_STATELESS_RESET_TOKENLEN,
++                       NGTCP2_STATELESS_RESET_TOKENLEN)) {
++      return NGTCP2_ERR_INVALID_ARGUMENT;
++    }
++
++    conn->qgo_close.set = 0;
++    ngtcp2_conn_qgo_close(conn, 0, QGO_INTERNAL_ERROR, 0,
++                          "connection BUG: unspecified error type (msg: "
++                          "received a stateless reset)");
++
++    return 0;
++  }
++
+   rv = ngtcp2_pkt_decode_stateless_reset(&sr, payload, payloadlen);
+   if (rv != 0) {
+     return rv;
+@@ -9597,6 +10425,106 @@
+  *     |fr| has the duplicated sequence number with different CID or
+  *     token; or DCID is zero-length.
+  */
++/* PacketsPerConnectionID and MaxActiveConnectionIDs
++   (vendor/quic-go/internal/protocol/params.go:127, :134). */
++#define NGTCP2_QGO_PKTS_PER_DCID 10000
++#define NGTCP2_QGO_MAX_ACTIVE_CONNECTION_IDS 4
++
++/*
++ * conn_qgo_recv_new_connection_id is a client taking NEW_CONNECTION_ID
++ * as quic-go's connIDManager.Add does
++ * (vendor/quic-go/conn_id_manager.go:66-172), on ngtcp2's own state:
++ * the current Destination Connection ID is quic-go's active one,
++ * conn->dcid.retire_prior_to its highestRetired, and the unused ones
++ * its queue.  What differs from upstream's checks: an ID with the
++ * active sequence number is ignored whatever it holds; a conflict is
++ * looked for only among the queued ones, by sequence number, and is a
++ * plain error, which quic-go closes on as INTERNAL_ERROR with its text
++ * (vendor/quic-go/connection.go:2283-2290); and the limit is four
++ * queued IDs (MaxActiveConnectionIDs,
++ * vendor/quic-go/internal/protocol/params.go:127), counted after the
++ * active one has moved on when Retire Prior To asks for it, whatever
++ * active_connection_id_limit this client advertised.
++ */
++static int conn_qgo_recv_new_connection_id(ngtcp2_conn *conn,
++                                           const ngtcp2_new_connection_id *fr) {
++  ngtcp2_ringbuf *rb = &conn->dcid.dtr.unused.rb;
++  ngtcp2_dcid *dcid;
++  size_t i, len, queued;
++  int rv;
++
++  if (conn->dcid.current.cid.datalen == 0) {
++    return ngtcp2_conn_qgo_close(conn, NGTCP2_ERR_PROTO, QGO_PROTOCOL_VIOLATION,
++                                 0,
++                                 "received NEW_CONNECTION_ID frame but "
++                                 "zero-length connection IDs are in use");
++  }
++
++  /* Reordered, or already retired: retired at once, for every such
++     frame, as quic-go queues a RETIRE_CONNECTION_ID each time
++     (vendor/quic-go/conn_id_manager.go:86-93).  Not tracked: upstream's
++     tracking made it once per sequence number and bounded how many could
++     wait for an acknowledgement; what bounds them here is quic-go's own
++     limit on queued control frames
++     (ngtcp2_conn_qgo_check_control_frames). */
++  if (fr->seq < conn->dcid.current.seq ||
++      fr->seq < conn->dcid.retire_prior_to) {
++    return conn_enqueue_retire_connection_id(conn, fr->seq);
++  }
++
++  if (conn->dcid.retire_prior_to < fr->retire_prior_to) {
++    conn->dcid.retire_prior_to = fr->retire_prior_to;
++
++    rv = ngtcp2_dcidtr_retire_inactive_dcid_prior_to(
++      &conn->dcid.dtr, fr->retire_prior_to, dcidtr_on_retire, conn);
++    if (rv != 0) {
++      return rv;
++    }
++  }
++
++  if (fr->seq == conn->dcid.current.seq) {
++    return 0;
++  }
++
++  len = ngtcp2_ringbuf_len(rb);
++  for (i = 0; i < len; ++i) {
++    dcid = ngtcp2_ringbuf_get(rb, i);
++    if (dcid->seq != fr->seq) {
++      continue;
++    }
++    if (!ngtcp2_cid_eq(&dcid->cid, &fr->cid)) {
++      return ngtcp2_conn_qgo_close(
++        conn, NGTCP2_ERR_PROTO, QGO_INTERNAL_ERROR, 0,
++        "received conflicting connection IDs for sequence number %llu",
++        (unsigned long long)fr->seq);
++    }
++    if (!ngtcp2_stateless_reset_token_eq(&dcid->token, &fr->token)) {
++      return ngtcp2_conn_qgo_close(
++        conn, NGTCP2_ERR_PROTO, QGO_INTERNAL_ERROR, 0,
++        "received conflicting stateless reset tokens for sequence number "
++        "%llu",
++        (unsigned long long)fr->seq);
++    }
++    break;
++  }
++
++  if (i == len && len < NGTCP2_DCIDTR_MAX_UNUSED_DCID_SIZE) {
++    ngtcp2_dcidtr_push_unused(&conn->dcid.dtr, fr->seq, &fr->cid, &fr->token);
++  }
++
++  queued = ngtcp2_ringbuf_len(rb);
++  if (queued && conn->dcid.current.seq < conn->dcid.retire_prior_to) {
++    --queued;
++  }
++
++  if (queued >= NGTCP2_QGO_MAX_ACTIVE_CONNECTION_IDS) {
++    return ngtcp2_conn_qgo_close(conn, NGTCP2_ERR_CONNECTION_ID_LIMIT,
++                                 QGO_CONNECTION_ID_LIMIT_ERROR, 0, "");
++  }
++
++  return 0;
++}
++
+ static int conn_recv_new_connection_id(ngtcp2_conn *conn,
+                                        const ngtcp2_new_connection_id *fr) {
+   size_t len;
+@@ -9605,6 +10533,10 @@
+   int found = 0;
+   size_t extra_dcid = 0;
+ 
++  if (!conn->server) {
++    return conn_qgo_recv_new_connection_id(conn, fr);
++  }
++
+   if (conn->dcid.current.cid.datalen == 0) {
+     return NGTCP2_ERR_PROTO;
+   }
+@@ -9717,11 +10649,6 @@
+   return 0;
+ }
+ 
+-/* PacketsPerConnectionID and MaxActiveConnectionIDs
+-   (vendor/quic-go/internal/protocol/params.go:127, :134). */
+-#define NGTCP2_QGO_PKTS_PER_DCID 10000
+-#define NGTCP2_QGO_MAX_ACTIVE_CONNECTION_IDS 4
+-
+ /*
+  * conn_qgo_lowest_unused_first brings the unused Connection ID with
+  * the lowest sequence number to the front, where the next pop takes
+@@ -9958,6 +10885,56 @@
+                                           ngtcp2_tstamp ts) {
+   ngtcp2_ksl_it it;
+   ngtcp2_scid *scid;
++  uint64_t highest;
++  char hex[NGTCP2_MAX_CIDLEN * 2 + 1];
++  size_t i;
++
++  /* A client as quic-go's connIDGenerator.Retire
++     (vendor/quic-go/conn_id_generator.go:99-124): with a zero-length
++     Connection ID, the one Chrome's parrot uses, the only ID ever issued
++     is sequence number 0 and it is the one every packet is sent to; an
++     ID already retired is let be; and the ID is written as hex, or as
++     "(empty)" (vendor/quic-go/internal/protocol/connection_id.go:
++     110-115). */
++  if (!conn->server) {
++    highest = conn->oscid.datalen ? conn->scid.last_seq : 0;
++    if (fr->seq > highest) {
++      return ngtcp2_conn_qgo_close(
++        conn, NGTCP2_ERR_PROTO, QGO_PROTOCOL_VIOLATION, 0,
++        "retired connection ID %llu (highest issued: %llu)",
++        (unsigned long long)fr->seq, (unsigned long long)highest);
++    }
++    if (conn->oscid.datalen == 0) {
++      return ngtcp2_conn_qgo_close(
++        conn, NGTCP2_ERR_PROTO, QGO_PROTOCOL_VIOLATION, 0,
++        "retired connection ID %llu ((empty)), which was used as the "
++        "Destination Connection ID on this packet",
++        (unsigned long long)fr->seq);
++    }
++    for (it = ngtcp2_ksl_begin(&conn->scid.set); !ngtcp2_ksl_it_end(&it);
++         ngtcp2_ksl_it_next(&it)) {
++      scid = ngtcp2_ksl_it_get(&it);
++      if (scid->seq != fr->seq) {
++        continue;
++      }
++      if (scid->flags & NGTCP2_SCID_FLAG_RETIRED) {
++        return 0;
++      }
++      if (ngtcp2_cid_eq(&scid->cid, &hd->dcid)) {
++        for (i = 0; i < scid->cid.datalen; ++i) {
++          hex[i * 2] = "0123456789abcdef"[scid->cid.data[i] >> 4];
++          hex[i * 2 + 1] = "0123456789abcdef"[scid->cid.data[i] & 0xf];
++        }
++        hex[i * 2] = '\0';
++        return ngtcp2_conn_qgo_close(
++          conn, NGTCP2_ERR_PROTO, QGO_PROTOCOL_VIOLATION, 0,
++          "retired connection ID %llu (%s), which was used as the "
++          "Destination Connection ID on this packet",
++          (unsigned long long)fr->seq, hex);
++      }
++      break;
++    }
++  }
+ 
+   if (conn->oscid.datalen == 0 || conn->scid.last_seq < fr->seq) {
+     return NGTCP2_ERR_PROTO;
+@@ -10025,7 +11002,11 @@
+  */
+ static int conn_recv_streams_blocked_bidi(ngtcp2_conn *conn,
+                                           ngtcp2_streams_blocked *fr) {
+-  if (fr->max_streams > conn->remote.bidi.max_streams) {
++  /* A client as quic-go: the parse refused a count above 2^60
++     (conn_qgo_parse_frame), and handleFrame has an empty case for the
++     rest (vendor/quic-go/connection.go:1954).  Upstream refused a count
++     above the one we allowed. */
++  if (conn->server && fr->max_streams > conn->remote.bidi.max_streams) {
+     return NGTCP2_ERR_FRAME_ENCODING;
+   }
+ 
+@@ -10044,7 +11025,11 @@
+  */
+ static int conn_recv_streams_blocked_uni(ngtcp2_conn *conn,
+                                          ngtcp2_streams_blocked *fr) {
+-  if (fr->max_streams > conn->remote.uni.max_streams) {
++  /* A client as quic-go: the parse refused a count above 2^60
++     (conn_qgo_parse_frame), and handleFrame has an empty case for the
++     rest (vendor/quic-go/connection.go:1954).  Upstream refused a count
++     above the one we allowed. */
++  if (conn->server && fr->max_streams > conn->remote.uni.max_streams) {
+     return NGTCP2_ERR_FRAME_ENCODING;
+   }
+ 
+@@ -10082,7 +11067,15 @@
+   int bidi = bidi_stream(fr->stream_id);
+   uint64_t datalen;
+ 
+-  if (bidi) {
++  /* A client finds the stream as quic-go does: see conn_qgo_receive_stream. */
++  if (!conn->server) {
++    rv = conn_qgo_receive_stream(conn, fr->stream_id);
++    if (rv != 0) {
++      return rv;
++    }
++
++    idtr = bidi ? &conn->remote.bidi.idtr : &conn->remote.uni.idtr;
++  } else if (bidi) {
+     if (local_stream) {
+       if (conn->local.bidi.next_stream_id <= fr->stream_id) {
+         return NGTCP2_ERR_STREAM_STATE;
+@@ -10136,6 +11129,15 @@
+     }
+   }
+ 
++  /* quic-go only finds the stream: "We don't need to do anything in
++     response to a STREAM_DATA_BLOCKED frame, but we need to make sure
++     that the stream ID is valid" (vendor/quic-go/streams_map.go:288-295).
++     Upstream checked the offset against both windows and the final
++     size, and counted it as received. */
++  if (!conn->server) {
++    return 0;
++  }
++
+   if (strm->rx.max_offset < fr->offset) {
+     return NGTCP2_ERR_FLOW_CONTROL;
+   }
+@@ -10173,6 +11175,12 @@
+  *     It violates connection-level flow control limit.
+  */
+ static int conn_recv_data_blocked(ngtcp2_conn *conn, ngtcp2_data_blocked *fr) {
++  /* A client takes it as quic-go does, without a check: its handleFrame
++     has an empty case for it (vendor/quic-go/connection.go:1951). */
++  if (!conn->server) {
++    return 0;
++  }
++
+   if (conn->rx.max_offset < fr->offset) {
+     return NGTCP2_ERR_FLOW_CONTROL;
+   }
+@@ -10725,7 +11733,8 @@
+   ngtcp2_qlog_pkt_received_start(&conn->qlog);
+ 
+   for (; payloadlen;) {
+-    nread = ngtcp2_frame_decoder_decode(&frd, &fr, payload, payloadlen);
++    nread = conn_decode_frame(conn, &frd, &fr, payload, payloadlen,
++                              NGTCP2_ENCRYPTION_LEVEL_HANDSHAKE);
+     if (nread < 0) {
+       return (int)nread;
+     }
+@@ -10775,8 +11784,30 @@
+       break;
+     case NGTCP2_FRAME_PING:
+       ++conn->cstat.ping_recv;
+-      /* fall through */
++      require_ack = 1;
++      break;
+     case NGTCP2_FRAME_CRYPTO:
++      /* The Handshake CRYPTO stream of a client whose 1-RTT keys are in
++         is finished: quic-go refuses data past what it has, as
++         HandleCryptoFrame does on a finished stream, after the offset
++         bound (vendor/quic-go/crypto_stream.go:33-54).  Upstream took
++         any. */
++      if (!conn->server) {
++        uint64_t end =
++          fr.stream.offset + (fr.stream.datacnt ? fr.stream.data[0].len : 0);
++
++        if (end > NGTCP2_MAX_HANDSHAKE_CRYPTO_OFFSET) {
++          return ngtcp2_conn_qgo_close(
++            conn, NGTCP2_ERR_CRYPTO_BUFFER_EXCEEDED, QGO_CRYPTO_BUFFER_EXCEEDED,
++            0, "received invalid offset %llu on crypto stream, maximum allowed %d",
++            (unsigned long long)end, NGTCP2_MAX_HANDSHAKE_CRYPTO_OFFSET);
++        }
++        if (end > conn->hs_pktns->crypto.strm.rx.last_offset) {
++          return ngtcp2_conn_qgo_close(
++            conn, NGTCP2_ERR_PROTO, QGO_PROTOCOL_VIOLATION, 0,
++            "received crypto data after change of encryption level");
++        }
++      }
+       require_ack = 1;
+       break;
+     default:
+@@ -10869,6 +11900,8 @@
+   int path_challenge_recved = 0;
+   size_t num_ack_processed = 0;
+ 
++  conn->qgo_unpacked = 0;
++
+   if (pkt[0] & NGTCP2_HEADER_FORM_BIT) {
+     nread = ngtcp2_pkt_decode_hd_long(&hd, pkt, pktlen);
+     if (nread < 0) {
+@@ -11068,7 +12101,10 @@
+     if (hd.type == NGTCP2_PKT_1RTT &&
+         ++conn->crypto.decryption_failure_count >=
+           pktns->crypto.ctx.max_decryption_failure) {
+-      return NGTCP2_ERR_AEAD_LIMIT_REACHED;
++      /* invalidPacketLimit, and no reason
++         (vendor/quic-go/internal/handshake/updatable_aead.go:182-188). */
++      return ngtcp2_conn_qgo_close(conn, NGTCP2_ERR_AEAD_LIMIT_REACHED,
++                                   QGO_AEAD_LIMIT_REACHED, 0, "");
+     }
+ 
+     if (hd.flags & NGTCP2_PKT_FLAG_LONG_FORM) {
+@@ -11086,12 +12122,35 @@
+     ++ckm->lc_rcvd;
+   }
+ 
++  /* The peer's next keys opened the packet — it updated its keys — and
++     a client refuses that while it has sealed nothing with the current
++     ones since the last update, as quic-go's open does
++     (vendor/quic-go/internal/handshake/updatable_aead.go:224-235). */
++  if (!conn->server && hd.type == NGTCP2_PKT_1RTT &&
++      ckm == conn->crypto.key_update.new_rx_ckm &&
++      conn->crypto.key_update.lc_phase > 0 &&
++      pktns->crypto.tx.ckm->use_count == 0) {
++    return ngtcp2_conn_qgo_close(conn, NGTCP2_ERR_PROTO, QGO_KEY_UPDATE_ERROR,
++                                 0, "keys updated too quickly");
++  }
++
+   rv = ngtcp2_pkt_verify_reserved_bits(conn->crypto.decrypt_hp_buf.base[0]);
+   if (rv != 0) {
+     ngtcp2_log_info(&conn->log, NGTCP2_LOG_EVENT_PKT,
+                     "packet has incorrect reserved bits");
+ 
+-    return NGTCP2_ERR_PROTO;
++    return ngtcp2_conn_qgo_close(conn, NGTCP2_ERR_PROTO, QGO_PROTOCOL_VIOLATION, 0,
++                          "invalid reserved bits");
++  }
++
++  /* A client refuses an empty packet before it drops a duplicate, as
++     quic-go's UnpackShortHeader and handleShortHeaderPacket do
++     (vendor/quic-go/packet_unpacker.go:113-123,
++     vendor/quic-go/connection.go); the long header path does the same
++     above. */
++  if (!conn->server && nwrite == 0) {
++    return ngtcp2_conn_qgo_close(conn, NGTCP2_ERR_PROTO, QGO_PROTOCOL_VIOLATION, 0,
++                          "empty packet");
+   }
+ 
+   if (pktns_pkt_num_is_duplicate(pktns, hd.pkt_num)) {
+@@ -11108,6 +12167,8 @@
+     return NGTCP2_ERR_PROTO;
+   }
+ 
++  conn->qgo_unpacked = 1;
++
+   if (hd.flags & NGTCP2_PKT_FLAG_LONG_FORM) {
+     switch (hd.type) {
+     case NGTCP2_PKT_HANDSHAKE:
+@@ -11160,7 +12221,8 @@
+   ngtcp2_qlog_pkt_received_start(&conn->qlog);
+ 
+   for (; payloadlen;) {
+-    nread = ngtcp2_frame_decoder_decode(&frd, &fr, payload, payloadlen);
++    nread = conn_decode_frame(conn, &frd, &fr, payload, payloadlen,
++                              NGTCP2_ENCRYPTION_LEVEL_1RTT);
+     if (nread < 0) {
+       return nread;
+     }
+@@ -11308,6 +12370,16 @@
+       path_challenge_recved = 1;
+       break;
+     case NGTCP2_FRAME_PATH_RESPONSE:
++      /* A client that never probes a path has no path manager to take
++         the answer, and refuses it: hysteria turns the path manager off
++         (DisablePathManager, vendor/hysteria/core/client/client.go:93;
++         handlePathResponseFrameClient,
++         vendor/quic-go/connection.go:2101-2111). */
++      if (!conn->server) {
++        return ngtcp2_conn_qgo_close(conn, NGTCP2_ERR_PROTO,
++                                     QGO_PROTOCOL_VIOLATION, 0,
++                                     "unexpected PATH_RESPONSE frame");
++      }
+       rv = conn_recv_path_response(conn, &hd, &fr.path_response, ts);
+       if (rv != 0) {
+         return rv;
+@@ -11372,8 +12444,25 @@
+       break;
+     case NGTCP2_FRAME_DATAGRAM:
+     case NGTCP2_FRAME_DATAGRAM_LEN:
+-      if ((uint64_t)nread >
+-          conn->local.transport_params.max_datagram_frame_size) {
++      /* A client refuses a frame longer than RFC 9221's 16383 bytes,
++         whatever it advertised, as quic-go's handleDatagramFrame does
++         (vendor/quic-go/connection.go:2179-2188,
++         vendor/quic-go/internal/wire/datagram_frame.go:14). */
++      if (!conn->server) {
++        uint64_t datalen = ngtcp2_vec_len(fr.datagram.data,
++                                          fr.datagram.datacnt);
++        uint64_t frlen = 1 + datalen;
++
++        if (fr.datagram.type == NGTCP2_FRAME_DATAGRAM_LEN) {
++          frlen += ngtcp2_put_uvarintlen(datalen);
++        }
++        if (frlen > 16383) {
++          return ngtcp2_conn_qgo_close(conn, NGTCP2_ERR_PROTO,
++                                       QGO_PROTOCOL_VIOLATION, 0,
++                                       "DATAGRAM frame too large");
++        }
++      } else if ((uint64_t)nread >
++                 conn->local.transport_params.max_datagram_frame_size) {
+         return NGTCP2_ERR_PROTO;
+       }
+       rv = conn_recv_datagram(conn, &fr.datagram);
+@@ -11487,7 +12576,7 @@
+       if (rv == 0) {
+         ngtcp2_pkt_chain_del(*ppc, conn->mem);
+         *ppc = next;
+-        return NGTCP2_ERR_DRAINING;
++        return conn->server ? NGTCP2_ERR_DRAINING : NGTCP2_ERR_PROTO;
+       }
+     }
+ 
+@@ -11695,7 +12784,7 @@
+       if (origpkt == pkt) {
+         rv = conn_on_stateless_reset(conn, path, origpkt, dgramlen);
+         if (rv == 0) {
+-          return NGTCP2_ERR_DRAINING;
++          return conn->server ? NGTCP2_ERR_DRAINING : NGTCP2_ERR_PROTO;
+         }
+       }
+       if (nread == NGTCP2_ERR_DISCARD_PKT) {
+@@ -11979,6 +13068,9 @@
+ 
+   conn_update_timestamp(conn, ts);
+ 
++  /* What this call fails with, if it fails, is recorded afresh. */
++  conn->qgo_close.set = 0;
++
+   if (conn->state != NGTCP2_CS_POST_HANDSHAKE && conn->rx_pkt_ts_floor < ts) {
+     conn->rx_pkt_ts_floor = ts;
+   }
+@@ -13239,95 +14331,69 @@
+ }
+ 
+ /*
+- * conn_client_validate_transport_params validates |params| as client.
+- * |params| must be sent with Encrypted Extensions.
+- *
+- * This function returns 0 if it succeeds, or one of the following
+- * negative error codes:
+- *
+- * NGTCP2_ERR_TRANSPORT_PARAM
+- *     params contains preferred address but server chose zero-length
+- *     connection ID.
+- * NGTCP2_ERR_VERSION_NEGOTIATION_FAILURE
+- *     Validation against version negotiation parameters failed.
++ * qgo_cid_str writes |cid| as quic-go's ConnectionID.String does: hex,
++ * or "(empty)" (vendor/quic-go/internal/protocol/connection_id.go:
++ * 110-115).
+  */
+-static int
+-conn_client_validate_transport_params(const ngtcp2_conn *conn,
+-                                      const ngtcp2_transport_params *params) {
+-  if (!params->original_dcid_present) {
+-    return NGTCP2_ERR_REQUIRED_TRANSPORT_PARAM;
+-  }
++static const char *qgo_cid_str(char *buf, const ngtcp2_cid *cid) {
++  size_t i;
+ 
+-  if (!ngtcp2_cid_eq(&conn->rcid, &params->original_dcid)) {
+-    return NGTCP2_ERR_TRANSPORT_PARAM;
++  if (cid->datalen == 0) {
++    return "(empty)";
+   }
+ 
+-  if (conn->flags & NGTCP2_CONN_FLAG_RECV_RETRY) {
+-    if (!params->retry_scid_present) {
+-      return NGTCP2_ERR_TRANSPORT_PARAM;
+-    }
+-    if (!ngtcp2_cid_eq(&conn->retry_scid, &params->retry_scid)) {
+-      return NGTCP2_ERR_TRANSPORT_PARAM;
+-    }
+-  } else if (params->retry_scid_present) {
+-    return NGTCP2_ERR_TRANSPORT_PARAM;
++  for (i = 0; i < cid->datalen; ++i) {
++    buf[i * 2] = "0123456789abcdef"[cid->data[i] >> 4];
++    buf[i * 2 + 1] = "0123456789abcdef"[cid->data[i] & 0xf];
+   }
++  buf[i * 2] = '\0';
+ 
+-  if (params->preferred_addr_present && conn->dcid.current.cid.datalen == 0) {
+-    return NGTCP2_ERR_TRANSPORT_PARAM;
+-  }
++  return buf;
++}
+ 
+-  if (params->version_info_present) {
+-    if (conn->negotiated_version != params->version_info.chosen_version) {
+-      return NGTCP2_ERR_VERSION_NEGOTIATION_FAILURE;
+-    }
++/*
++ * conn_qgo_check_transport_params is quic-go's checkTransportParameters
++ * for a client (vendor/quic-go/connection.go:2422-2450), whose error
++ * handleTransportParameters closes on as TRANSPORT_PARAMETER_ERROR with
++ * its text: the initial_source_connection_id against the server's
++ * first Source Connection ID, then the
++ * original_destination_connection_id against ours, then the Retry's.
++ */
++static int conn_qgo_check_transport_params(
++  ngtcp2_conn *conn, const ngtcp2_transport_params *params) {
++  char a[NGTCP2_MAX_CIDLEN * 2 + 1], b[NGTCP2_MAX_CIDLEN * 2 + 1];
+ 
+-    assert(vneg_available_versions_includes(conn->vneg.available_versions,
+-                                            conn->vneg.available_versionslen,
+-                                            conn->negotiated_version));
+-  } else if (conn->client_chosen_version != conn->negotiated_version) {
+-    return NGTCP2_ERR_VERSION_NEGOTIATION_FAILURE;
++  if (!ngtcp2_cid_eq(&conn->dcid.current.cid, &params->initial_scid)) {
++    return ngtcp2_conn_qgo_close(
++      conn, NGTCP2_ERR_TRANSPORT_PARAM, QGO_TRANSPORT_PARAMETER_ERROR, 0,
++      "expected initial_source_connection_id to equal %s, is %s",
++      qgo_cid_str(a, &conn->dcid.current.cid),
++      qgo_cid_str(b, &params->initial_scid));
+   }
+ 
+-  /* When client reacted upon Version Negotiation */
+-  if (conn->local.settings.original_version != conn->client_chosen_version) {
+-    if (!params->version_info_present) {
+-      assert(conn->client_chosen_version == conn->negotiated_version);
+-
+-      /* QUIC v1 is treated specially.  If version_info is missing, no
+-         further validation is necessary.  See
+-         https://datatracker.ietf.org/doc/html/rfc9368#section-8
+-       */
+-      if (conn->client_chosen_version == NGTCP2_PROTO_VER_V1) {
+-        return 0;
+-      }
++  if (!ngtcp2_cid_eq(&conn->rcid, &params->original_dcid)) {
++    return ngtcp2_conn_qgo_close(
++      conn, NGTCP2_ERR_TRANSPORT_PARAM, QGO_TRANSPORT_PARAMETER_ERROR, 0,
++      "expected original_destination_connection_id to equal %s, is %s",
++      qgo_cid_str(a, &conn->rcid), qgo_cid_str(b, &params->original_dcid));
++  }
+ 
+-      return NGTCP2_ERR_VERSION_NEGOTIATION_FAILURE;
++  if (conn->flags & NGTCP2_CONN_FLAG_RECV_RETRY) {
++    if (!params->retry_scid_present) {
++      return ngtcp2_conn_qgo_close(
++        conn, NGTCP2_ERR_TRANSPORT_PARAM, QGO_TRANSPORT_PARAMETER_ERROR, 0,
++        "missing retry_source_connection_id");
+     }
+-
+-    /* Server choose original version after Version Negotiation.  RFC
+-       9368 does not say this particular case, but this smells like
+-       misbehaved server because server should accept original_version
+-       in the original connection. */
+-    if (conn->local.settings.original_version ==
+-        params->version_info.chosen_version) {
+-      return NGTCP2_ERR_VERSION_NEGOTIATION_FAILURE;
+-    }
+-
+-    /* Check version downgrade on incompatible version negotiation. */
+-    if (params->version_info.available_versionslen == 0) {
+-      return NGTCP2_ERR_VERSION_NEGOTIATION_FAILURE;
+-    }
+-
+-    if (conn->client_chosen_version !=
+-        select_preferred_version(conn->vneg.preferred_versions,
+-                                 conn->vneg.preferred_versionslen,
+-                                 params->version_info.chosen_version,
+-                                 params->version_info.available_versions,
+-                                 params->version_info.available_versionslen,
+-                                 /* fallback_version = */ 0)) {
+-      return NGTCP2_ERR_VERSION_NEGOTIATION_FAILURE;
++    if (!ngtcp2_cid_eq(&conn->retry_scid, &params->retry_scid)) {
++      return ngtcp2_conn_qgo_close(
++        conn, NGTCP2_ERR_TRANSPORT_PARAM, QGO_TRANSPORT_PARAMETER_ERROR, 0,
++        "expected retry_source_connection_id to equal %s, is %s",
++        qgo_cid_str(a, &conn->retry_scid), qgo_cid_str(b, &params->retry_scid));
+     }
++  } else if (params->retry_scid_present) {
++    return ngtcp2_conn_qgo_close(
++      conn, NGTCP2_ERR_TRANSPORT_PARAM, QGO_TRANSPORT_PARAMETER_ERROR, 0,
++      "received retry_source_connection_id, although no Retry was performed");
+   }
+ 
+   return 0;
+@@ -13358,6 +14424,17 @@
+     return 0;
+   }
+ 
++  /* A client as quic-go's checkTransportParameters, before anything
++     else: its parse has refused already what the checks below refuse,
++     and ngtcp2's own client checks have no counterpart there (see
++     conn_qgo_check_transport_params). */
++  if (!conn->server) {
++    rv = conn_qgo_check_transport_params(conn, params);
++    if (rv != 0) {
++      return rv;
++    }
++  }
++
+   if (!params->initial_scid_present) {
+     return NGTCP2_ERR_REQUIRED_TRANSPORT_PARAM;
+   }
+@@ -13418,12 +14495,11 @@
+     ngtcp2_log_infof(&conn->log, NGTCP2_LOG_EVENT_CON,
+                      "the negotiated version is 0x",
+                      hexw(conn->negotiated_version, 8));
+-  } else {
+-    rv = conn_client_validate_transport_params(conn, params);
+-    if (rv != 0) {
+-      return rv;
+-    }
+   }
++  /* A client was checked above, as quic-go checks: upstream's
++     conn_client_validate_transport_params refused a preferred_address
++     with a zero-length Connection ID and version information quic-go
++     does not read. */
+ 
+   ngtcp2_log_remote_tp(&conn->log, params);
+ 
+@@ -13457,13 +14533,74 @@
+   return 0;
+ }
+ 
++/*
++ * conn_qgo_decode_transport_params decodes the server's transport
++ * parameters for a client, after quic-go's own parse has taken them
++ * (ngtcp2_qgo_transport_params_check).  quic-go's Unmarshal wraps what
++ * it refuses as TRANSPORT_PARAMETER_ERROR, and its TLS layer then wraps
++ * that, as an error that is no TLS alert, in INTERNAL_ERROR with the
++ * whole text as the reason (wrapError,
++ * vendor/quic-go/internal/handshake/crypto_setup.go:700-705; the text
++ * is TransportError.Error, vendor/quic-go/internal/qerr/errors.go:
++ * 33-51).  Two parameters quic-go steps over and ngtcp2's decoder
++ * checks — version_information (0x11) and grease_quic_bit (0x2ab2) —
++ * are left out of what ngtcp2 decodes, so that nothing quic-go takes
++ * is refused here.
++ */
++static int conn_qgo_decode_transport_params(ngtcp2_conn *conn,
++                                            ngtcp2_transport_params *params,
++                                            const uint8_t *data,
++                                            size_t datalen) {
++  char msg[256];
++  uint8_t *buf, *q;
++  const uint8_t *p = data, *end = data + datalen;
++  uint64_t id, len;
++  size_t idlen, lenlen;
++  int rv;
++
++  if (ngtcp2_qgo_transport_params_check(data, datalen, msg, sizeof(msg)) !=
++      0) {
++    return ngtcp2_conn_qgo_close(conn, NGTCP2_ERR_MALFORMED_TRANSPORT_PARAM,
++                                 QGO_INTERNAL_ERROR, 0,
++                                 "TRANSPORT_PARAMETER_ERROR (local): %s", msg);
++  }
++
++  buf = ngtcp2_mem_malloc(conn->mem, datalen ? datalen : 1);
++  if (buf == NULL) {
++    return NGTCP2_ERR_NOMEM;
++  }
++
++  /* Well formed, since quic-go's parse took it. */
++  for (q = buf; p < end;) {
++    idlen = ngtcp2_get_uvarintlen(p);
++    ngtcp2_get_uvarint(&id, p);
++    lenlen = ngtcp2_get_uvarintlen(p + idlen);
++    ngtcp2_get_uvarint(&len, p + idlen);
++    if (id != 0x11 && id != 0x2ab2) {
++      memcpy(q, p, idlen + lenlen + (size_t)len);
++      q += idlen + lenlen + (size_t)len;
++    }
++    p += idlen + lenlen + (size_t)len;
++  }
++
++  rv = ngtcp2_transport_params_decode(params, buf, (size_t)(q - buf));
++
++  ngtcp2_mem_free(conn->mem, buf);
++
++  return rv;
++}
++
+ int ngtcp2_conn_decode_and_set_remote_transport_params(ngtcp2_conn *conn,
+                                                        const uint8_t *data,
+                                                        size_t datalen) {
+   ngtcp2_transport_params params;
+   int rv;
+ 
+-  rv = ngtcp2_transport_params_decode(&params, data, datalen);
++  if (!conn->server) {
++    rv = conn_qgo_decode_transport_params(conn, &params, data, datalen);
++  } else {
++    rv = ngtcp2_transport_params_decode(&params, data, datalen);
++  }
+   if (rv != 0) {
+     return rv;
+   }
+@@ -14478,6 +15615,7 @@
+   fr.connection_close = (ngtcp2_connection_close){
+     .type = NGTCP2_FRAME_CONNECTION_CLOSE,
+     .error_code = error_code,
++    .frame_type = conn->close_frame_type,
+     .reasonlen = reasonlen,
+     .reason = (uint8_t *)reason,
+   };
+@@ -14813,6 +15951,10 @@
+ 
+   switch (ccerr->type) {
+   case NGTCP2_CCERR_TYPE_TRANSPORT:
++    /* The Frame Type field too, which upstream left 0: quic-go writes
++       the type of the frame the error happened on
++       (vendor/quic-go/packet_packer.go:202-208). */
++    conn->close_frame_type = ccerr->frame_type;
+     return ngtcp2_conn_write_connection_close_pkt(
+       conn, path, pi, dest, destlen, ccerr->error_code, ccerr->reason,
+       ccerr->reasonlen, ts);
+diff -Naur a/lib/ngtcp2_conn.h b/lib/ngtcp2_conn.h
+--- a/lib/ngtcp2_conn.h
++++ b/lib/ngtcp2_conn.h
+@@ -269,6 +269,13 @@
+          exponentially. */
+       int64_t exponent;
+     } skip_pkt;
++    /* qgo_skipped holds the last packet numbers skipped in this space,
++       at most four and lowest first: the ones quic-go's history
++       remembers (SkippedPacket and maxSkippedPackets,
++       vendor/quic-go/internal/ackhandler/sent_packet_history.go:11,
++       :50-59), and the only ones an ACK is refused for covering. */
++    int64_t qgo_skipped[4];
++    size_t qgo_nskipped;
+     ngtcp2_frame_chain *frq;
+     /* num_non_ack_eliciting_acks counts the ACK-only 1-RTT packets
+        sent in a row.  The next one past
+@@ -842,6 +849,34 @@
+      queue, and they stay zero if the ClientHello has no SNI to cut. */
+   uint64_t initial_crypto_cut_start;
+   uint64_t initial_crypto_cut_end;
++  /* qgo_close is the CONNECTION_CLOSE a quic-go client sends for the
++     transport error that the current ngtcp2_conn_read_pkt call failed
++     with: the code, the frame type and the reason it would put in its
++     frame (vendor/quic-go/packet_packer.go:202-208).  |set| is zero
++     when the failure has no quic-go counterpart recorded; the first
++     error recorded in a call is the one kept, as quic-go returns the
++     first error it meets.  A client only. */
++  struct {
++    int set;
++    uint64_t error_code;
++    uint64_t frame_type;
++    size_t reasonlen;
++    uint8_t reason[512];
++  } qgo_close;
++  /* qgo_crypto_finished has bit 0 set once the Initial CRYPTO stream
++     is finished and bit 1 once the Handshake one is: from the moment
++     the next level's read key is in, as quic-go finishes them
++     (vendor/quic-go/connection.go:2055-2063). */
++  uint8_t qgo_crypto_finished;
++  /* qgo_unpacked is nonzero once the packet being read has been
++     opened and its frames are being read: a failure from then on is no
++     longer one quic-go looks for a stateless reset behind
++     (vendor/quic-go/connection.go:1220-1233). */
++  uint8_t qgo_unpacked;
++  /* close_frame_type is the Frame Type field of the CONNECTION_CLOSE
++     (0x1c) that ngtcp2_conn_write_connection_close writes: the
++     frame_type of the ngtcp2_ccerr it is given. */
++  uint64_t close_frame_type;
+   ngtcp2_pcg32 pcg;
+   ngtcp2_frame_counts frame_counts;
+   void *user_data;
+@@ -1298,4 +1333,30 @@
+ ngtcp2_conn_find_path_history(const ngtcp2_conn *conn, const ngtcp2_path *path,
+                               ngtcp2_tstamp ts);
+ 
++/* The transport error codes quic-go closes with
++   (vendor/quic-go/internal/qerr/error_codes.go), for
++   ngtcp2_conn_qgo_close. */
++#define QGO_INTERNAL_ERROR 0x1u
++#define QGO_FLOW_CONTROL_ERROR 0x3u
++#define QGO_STREAM_LIMIT_ERROR 0x4u
++#define QGO_STREAM_STATE_ERROR 0x5u
++#define QGO_FINAL_SIZE_ERROR 0x6u
++#define QGO_FRAME_ENCODING_ERROR 0x7u
++#define QGO_TRANSPORT_PARAMETER_ERROR 0x8u
++#define QGO_CONNECTION_ID_LIMIT_ERROR 0x9u
++#define QGO_PROTOCOL_VIOLATION 0xau
++#define QGO_CRYPTO_BUFFER_EXCEEDED 0xdu
++#define QGO_KEY_UPDATE_ERROR 0xeu
++#define QGO_AEAD_LIMIT_REACHED 0xfu
++
++/*
++ * ngtcp2_conn_qgo_close records the CONNECTION_CLOSE a quic-go client
++ * sends for the error a check is about to return: |error_code|,
++ * |frame_type| and a reason formatted from |fmt|, unless one is already
++ * recorded in this ngtcp2_conn_read_pkt call.  It returns |liberr|.
++ * See conn->qgo_close.
++ */
++int ngtcp2_conn_qgo_close(ngtcp2_conn *conn, int liberr, uint64_t error_code,
++                          uint64_t frame_type, const char *fmt, ...);
++
+ #endif /* !defined(NGTCP2_CONN_H) */
+diff -Naur a/lib/ngtcp2_pkt.c b/lib/ngtcp2_pkt.c
+--- a/lib/ngtcp2_pkt.c
++++ b/lib/ngtcp2_pkt.c
+@@ -774,8 +774,9 @@
+     }
+   }
+ 
+-  /* TODO We might not decode all ranges.  It could be very large. */
+-  max_rangecnt = ngtcp2_min(NGTCP2_MAX_ACK_RANGES, rangecnt);
++  /* All of them, as quic-go reads them; see
++     NGTCP2_QGO_MAX_ACK_RANGES_RECV. */
++  max_rangecnt = ngtcp2_min(NGTCP2_QGO_MAX_ACK_RANGES_RECV, rangecnt);
+ 
+   p = payload + 1;
+ 
+diff -Naur a/lib/ngtcp2_pkt.h b/lib/ngtcp2_pkt.h
+--- a/lib/ngtcp2_pkt.h
++++ b/lib/ngtcp2_pkt.h
+@@ -102,6 +102,16 @@
+    params.go:115, received_packet_history.go:41-43); upstream kept 33. */
+ #define NGTCP2_MAX_ACK_RANGES 63
+ 
++/*
++ * NGTCP2_QGO_MAX_ACK_RANGES_RECV is how many ranges of a received ACK
++ * frame are read: all of them, as quic-go's parseAckFrame reads them
++ * (vendor/quic-go/internal/wire/ack_frame.go:66-90), where
++ * NGTCP2_MAX_ACK_RANGES is what this end sends.  A range takes two
++ * bytes at the least, so a packet of up to 2048 bytes (LC_QCONN_PACKET_MAX
++ * in lite-client) cannot hold more than this.
++ */
++#define NGTCP2_QGO_MAX_ACK_RANGES_RECV 1024
++
+ /* NGTCP2_MAX_PKT_NUM is the maximum packet number. */
+ #define NGTCP2_MAX_PKT_NUM ((int64_t)((1LL << 62) - 1))
+ 
+@@ -465,7 +475,7 @@
+ typedef struct ngtcp2_frame_decoder {
+   union {
+     ngtcp2_vec data;
+-    ngtcp2_ack_range ack_ranges[NGTCP2_MAX_ACK_RANGES];
++    ngtcp2_ack_range ack_ranges[NGTCP2_QGO_MAX_ACK_RANGES_RECV];
+   } buf;
+ } ngtcp2_frame_decoder;
+ 
+diff -Naur a/lib/ngtcp2_rtb.c b/lib/ngtcp2_rtb.c
+--- a/lib/ngtcp2_rtb.c
++++ b/lib/ngtcp2_rtb.c
+@@ -888,8 +888,8 @@
+   return conn->tx.ecn.state == NGTCP2_ECN_STATE_CAPABLE && new_ce > 0;
+ }
+ 
+-/* ack_covers returns nonzero if |fr| acknowledges |pkt_num|. */
+-static int ack_covers(const ngtcp2_ack *fr, int64_t pkt_num) {
++/* ngtcp2_ack_covers returns nonzero if |fr| acknowledges |pkt_num|. */
++int ngtcp2_ack_covers(const ngtcp2_ack *fr, int64_t pkt_num) {
+   int64_t largest_ack = fr->largest_ack;
+   int64_t min_ack = largest_ack - (int64_t)fr->first_ack_range;
+   size_t i;
+@@ -930,7 +930,7 @@
+   for (i = 0, j = 0; i < pktns->tx.nae_len; ++i) {
+     int64_t pkt_num = pktns->tx.nae[i].pkt_num;
+ 
+-    if (ack_covers(fr, pkt_num)) {
++    if (ngtcp2_ack_covers(fr, pkt_num)) {
+       if (pkt_num == fr->largest_ack) {
+         *plargest_ts = pktns->tx.nae[i].ts;
+       }
+@@ -1128,6 +1128,15 @@
+     ent = ngtcp2_ksl_it_get(&it);
+ 
+     if (ent->flags & NGTCP2_RTB_ENTRY_FLAG_SKIP) {
++      /* A client has refused the four skipped numbers it remembers
++         already, in conn_recv_ack; an older one is a hole in quic-go's
++         history that its ACK walk steps over
++         (vendor/quic-go/internal/ackhandler/sent_packet_history.go:
++         50-59). */
++      if (qgo) {
++        rtb_remove(rtb, &it, &gone_ent, ent, cstat);
++        continue;
++      }
+       rv = NGTCP2_ERR_PROTO;
+       goto fail;
+     }
+diff -Naur a/lib/ngtcp2_rtb.h b/lib/ngtcp2_rtb.h
+--- a/lib/ngtcp2_rtb.h
++++ b/lib/ngtcp2_rtb.h
+@@ -250,6 +250,11 @@
+                                  ngtcp2_tstamp ts);
+ 
+ /*
++ * ngtcp2_ack_covers returns nonzero if |fr| acknowledges |pkt_num|.
++ */
++int ngtcp2_ack_covers(const ngtcp2_ack *fr, int64_t pkt_num);
++
++/*
+  * ngtcp2_rtb_detect_lost_pkt detects lost packets and prepends the
+  * frames contained them to |*pfrc|.  Even when this function fails,
+  * some frames might be prepended to |*pfrc|, and the caller should
+diff -Naur a/lib/ngtcp2_strm.c b/lib/ngtcp2_strm.c
+--- a/lib/ngtcp2_strm.c
++++ b/lib/ngtcp2_strm.c
+@@ -209,9 +209,13 @@
+ }
+ 
+ /* strm_rob_heavily_fragmented returns nonzero if the number of gaps
+-   in |rob| exceeds the limit. */
++   in |rob| exceeds the limit: quic-go's MaxStreamFrameSorterGaps,
++   20000, which its frame sorter refuses to go past
++   (vendor/quic-go/internal/protocol/params.go:75,
++   vendor/quic-go/frame_sorter.go:180-182).  Upstream stopped at
++   4000. */
+ static int strm_rob_heavily_fragmented(const ngtcp2_rob *rob) {
+-  return ngtcp2_ksl_len(&rob->gapksl) >= 4000;
++  return ngtcp2_ksl_len(&rob->gapksl) > 20000;
+ }
+ 
+ ngtcp2_ssize ngtcp2_strm_recv_reordering(ngtcp2_strm *strm, const uint8_t *data,
+@@ -815,9 +819,10 @@
+     return rv;
+   }
+ 
+-  if (ngtcp2_ksl_len(&strm->tx.acked_offset->gap) >= 4000) {
+-    return NGTCP2_ERR_INTERNAL;
+-  }
++  /* No bound on the gaps between acknowledged ranges: quic-go keeps
++     none — a peer acknowledging our STREAM frames out of every order
++     costs it memory, not the connection.  Upstream closed with
++     INTERNAL_ERROR at 4000. */
+ 
+   return 0;
+ }
+diff -Naur a/lib/ngtcp2_transport_params.c b/lib/ngtcp2_transport_params.c
+--- a/lib/ngtcp2_transport_params.c
++++ b/lib/ngtcp2_transport_params.c
+@@ -26,11 +26,13 @@
+ 
+ #include <string.h>
+ #include <assert.h>
++#include <stdio.h>
+ 
+ #include "ngtcp2_conv.h"
+ #include "ngtcp2_str.h"
+ #include "ngtcp2_mem.h"
+ #include "ngtcp2_unreachable.h"
++#include "ngtcp2_macro.h"
+ 
+ void ngtcp2_transport_params_default_versioned(
+   int transport_params_version, ngtcp2_transport_params *params) {
+@@ -891,3 +893,367 @@
+ 
+   transport_params_copy(dest, src, transport_params_version);
+ }
++
++/*
++ * qgo_varint is quicvarint.Parse (vendor/quic-go/quicvarint/varint.go:
++ * 82-108): it returns the length read, or 0 and |*err| set to what Go
++ * says — "EOF" when there is nothing to read, "unexpected EOF" when the
++ * encoding runs past the end.
++ */
++static size_t qgo_varint(uint64_t *dest, const uint8_t *p, size_t n,
++                         const char **err) {
++  size_t len;
++
++  if (n == 0) {
++    *err = "EOF";
++    return 0;
++  }
++
++  len = ngtcp2_get_uvarintlen(p);
++  if (n < len) {
++    *err = "unexpected EOF";
++    return 0;
++  }
++
++  ngtcp2_get_uvarint(dest, p);
++
++  return len;
++}
++
++/*
++ * qgo_duration writes |u| nanoseconds as Go's Duration.String does
++ * (GOROOT/src/time/time.go: Duration.String, format, fmtFrac and
++ * fmtInt), for a duration that is not negative.
++ */
++static void qgo_duration(char *out, size_t cap, uint64_t u) {
++  char buf[32];
++  size_t w = sizeof(buf), i;
++  int prec, print;
++  uint64_t digit, v;
++
++  buf[--w] = 's';
++
++  if (u < 1000000000ULL) {
++    if (u == 0) {
++      buf[--w] = '0';
++      goto done;
++    }
++    if (u < 1000) {
++      prec = 0;
++      buf[--w] = 'n';
++    } else if (u < 1000000) {
++      prec = 3;
++      /* µ, U+00B5, as UTF-8 */
++      buf[--w] = (char)0xb5;
++      buf[--w] = (char)0xc2;
++    } else {
++      prec = 6;
++      buf[--w] = 'm';
++    }
++  } else {
++    prec = 9;
++  }
++
++  /* fmtFrac: trailing zeros left out, and the point with them. */
++  print = 0;
++  for (i = 0; i < (size_t)prec; ++i) {
++    digit = u % 10;
++    print = print || digit != 0;
++    if (print) {
++      buf[--w] = (char)('0' + digit);
++    }
++    u /= 10;
++  }
++  if (print) {
++    buf[--w] = '.';
++  }
++
++  if (prec != 9) {
++    v = u;
++  } else {
++    /* Seconds, then minutes, then hours: no larger unit. */
++    v = u % 60;
++    u /= 60;
++  }
++
++  /* fmtInt */
++  if (v == 0) {
++    buf[--w] = '0';
++  }
++  for (; v > 0; v /= 10) {
++    buf[--w] = (char)('0' + v % 10);
++  }
++
++  if (prec == 9 && u > 0) {
++    buf[--w] = 'm';
++    v = u % 60;
++    u /= 60;
++    if (v == 0) {
++      buf[--w] = '0';
++    }
++    for (; v > 0; v /= 10) {
++      buf[--w] = (char)('0' + v % 10);
++    }
++    if (u > 0) {
++      buf[--w] = 'h';
++      for (; u > 0; u /= 10) {
++        buf[--w] = (char)('0' + u % 10);
++      }
++    }
++  }
++
++done:
++  snprintf(out, cap, "%.*s", (int)(sizeof(buf) - w), buf + w);
++}
++
++/* The transport parameters quic-go reads a number from
++   (vendor/quic-go/internal/wire/transport_parameters.go:30-56,
++   :146-163). */
++static int qgo_numeric_param(uint64_t id) {
++  switch (id) {
++  case 0x1:           /* max_idle_timeout */
++  case 0x3:           /* max_udp_payload_size */
++  case 0x4:           /* initial_max_data */
++  case 0x5:           /* initial_max_stream_data_bidi_local */
++  case 0x6:           /* initial_max_stream_data_bidi_remote */
++  case 0x7:           /* initial_max_stream_data_uni */
++  case 0x8:           /* initial_max_streams_bidi */
++  case 0x9:           /* initial_max_streams_uni */
++  case 0xa:           /* ack_delay_exponent */
++  case 0xb:           /* max_ack_delay */
++  case 0xe:           /* active_connection_id_limit */
++  case 0x20:          /* max_datagram_frame_size */
++  case 0xff04de1bULL: /* min_ack_delay */
++    return 1;
++  default:
++    return 0;
++  }
++}
++
++int ngtcp2_qgo_transport_params_check(const uint8_t *data, size_t datalen,
++                                      char *msg, size_t msgcap) {
++  const uint8_t *b = data;
++  size_t n = datalen, l, i, j, nids = 0;
++  uint64_t id, len, val, t;
++  uint64_t ids[256];
++  const char *err;
++  int odcid = 0, iscid = 0, min_ack_delay_set = 0;
++  /* Durations in nanoseconds: DefaultMaxAckDelay until one is read
++     (vendor/quic-go/internal/protocol/protocol.go:143). */
++  uint64_t max_ack_delay = 25000000ULL, min_ack_delay = 0;
++  char d1[32], d2[32];
++
++  for (; n > 0;) {
++    l = qgo_varint(&id, b, n, &err);
++    if (l == 0) {
++      snprintf(msg, msgcap, "%s", err);
++      return -1;
++    }
++    b += l;
++    n -= l;
++
++    l = qgo_varint(&len, b, n, &err);
++    if (l == 0) {
++      snprintf(msg, msgcap, "%s", err);
++      return -1;
++    }
++    b += l;
++    n -= l;
++
++    if (n < len) {
++      snprintf(msg, msgcap,
++               "remaining length (%zu) smaller than parameter length (%llu)", n,
++               (unsigned long long)len);
++      return -1;
++    }
++
++    if (nids < ngtcp2_arraylen(ids)) {
++      ids[nids++] = id;
++    }
++
++    if (qgo_numeric_param(id)) {
++      /* The number is read from the rest of the buffer, not from the
++         parameter's own bytes, and its length is compared afterwards
++         (readNumericTransportParameter, :298-305). */
++      l = qgo_varint(&val, b, n, &err);
++      if (l == 0) {
++        snprintf(msg, msgcap, "error while reading transport parameter %llu: %s",
++                 (unsigned long long)id, err);
++        return -1;
++      }
++      if (l != len) {
++        snprintf(msg, msgcap,
++                 "inconsistent transport parameter length for transport "
++                 "parameter %#llx",
++                 (unsigned long long)id);
++        return -1;
++      }
++
++      switch (id) {
++      case 0x8:
++        if (val > (1ULL << 60)) {
++          snprintf(msg, msgcap,
++                   "initial_max_streams_bidi too large: %llu (maximum %llu)",
++                   (unsigned long long)val, 1ULL << 60);
++          return -1;
++        }
++        break;
++      case 0x9:
++        if (val > (1ULL << 60)) {
++          snprintf(msg, msgcap,
++                   "initial_max_streams_uni too large: %llu (maximum %llu)",
++                   (unsigned long long)val, 1ULL << 60);
++          return -1;
++        }
++        break;
++      case 0x3:
++        if (val < 1200) {
++          snprintf(msg, msgcap,
++                   "invalid value for max_udp_payload_size: %llu (minimum "
++                   "1200)",
++                   (unsigned long long)val);
++          return -1;
++        }
++        break;
++      case 0xa:
++        if (val > 20) {
++          snprintf(msg, msgcap,
++                   "invalid value for ack_delay_exponent: %llu (maximum 20)",
++                   (unsigned long long)val);
++          return -1;
++        }
++        break;
++      case 0xb:
++        if (val > 16383) {
++          snprintf(msg, msgcap,
++                   "invalid value for max_ack_delay: %llums (maximum 16383ms)",
++                   (unsigned long long)val);
++          return -1;
++        }
++        max_ack_delay = val * 1000000ULL;
++        break;
++      case 0xe:
++        if (val < 2) {
++          snprintf(msg, msgcap,
++                   "invalid value for active_connection_id_limit: %llu "
++                   "(minimum 2)",
++                   (unsigned long long)val);
++          return -1;
++        }
++        break;
++      case 0xff04de1bULL:
++        /* time.Duration(val) * time.Microsecond, wrapping as Go's int64
++           does, and a negative result taken as the largest. */
++        t = val * 1000ULL;
++        min_ack_delay = (t >> 63) ? (uint64_t)INT64_MAX : t;
++        min_ack_delay_set = 1;
++        break;
++      }
++
++      b += len;
++      n -= len;
++      continue;
++    }
++
++    switch (id) {
++    case 0xd: /* preferred_address, read from the rest of the buffer */
++      if (n < 4 + 2 + 16 + 2 + 1) {
++        snprintf(msg, msgcap, "EOF");
++        return -1;
++      }
++      l = b[4 + 2 + 16 + 2];
++      if (l == 0 || l > 20) {
++        snprintf(msg, msgcap, "invalid connection ID length: %zu", l);
++        return -1;
++      }
++      if (n - (4 + 2 + 16 + 2 + 1) < l + 16) {
++        snprintf(msg, msgcap, "EOF");
++        return -1;
++      }
++      if (4 + 2 + 16 + 2 + 1 + l + 16 != len) {
++        snprintf(msg, msgcap,
++                 "expected preferred_address to be %llu long, read %zu bytes",
++                 (unsigned long long)len, 4 + 2 + 16 + 2 + 1 + l + 16);
++        return -1;
++      }
++      break;
++    case 0xc: /* disable_active_migration */
++      if (len != 0) {
++        snprintf(msg, msgcap,
++                 "wrong length for disable_active_migration: %llu (expected "
++                 "empty)",
++                 (unsigned long long)len);
++        return -1;
++      }
++      break;
++    case 0x2: /* stateless_reset_token */
++      if (len != 16) {
++        snprintf(msg, msgcap,
++                 "wrong length for stateless_reset_token: %llu (expected 16)",
++                 (unsigned long long)len);
++        return -1;
++      }
++      break;
++    case 0x0:  /* original_destination_connection_id */
++    case 0xf:  /* initial_source_connection_id */
++    case 0x10: /* retry_source_connection_id */
++      if (len > 20) {
++        snprintf(msg, msgcap, "invalid Connection ID length");
++        return -1;
++      }
++      if (id == 0x0) {
++        odcid = 1;
++      } else if (id == 0xf) {
++        iscid = 1;
++      }
++      break;
++    case 0x1d:                /* reset_stream_at */
++    case 0x17f7586d2cb571ULL: /* its draft number */
++      if (len != 0) {
++        snprintf(msg, msgcap,
++                 "wrong length for reset_stream_at: %llu (expected empty)",
++                 (unsigned long long)len);
++        return -1;
++      }
++      break;
++    }
++
++    b += len;
++    n -= len;
++  }
++
++  if (min_ack_delay_set && min_ack_delay > max_ack_delay) {
++    qgo_duration(d1, sizeof(d1), min_ack_delay);
++    qgo_duration(d2, sizeof(d2), max_ack_delay);
++    snprintf(msg, msgcap, "min_ack_delay (%s) is greater than max_ack_delay (%s)",
++             d1, d2);
++    return -1;
++  }
++  if (!odcid) {
++    snprintf(msg, msgcap, "missing original_destination_connection_id");
++    return -1;
++  }
++  if (!iscid) {
++    snprintf(msg, msgcap, "missing initial_source_connection_id");
++    return -1;
++  }
++
++  /* Every parameter at most once, the lowest repeated one named: the
++     IDs sorted, then compared with their neighbours (:248-254). */
++  for (i = 0; i < nids; ++i) {
++    for (j = i + 1; j < nids; ++j) {
++      if (ids[j] < ids[i]) {
++        t = ids[i];
++        ids[i] = ids[j];
++        ids[j] = t;
++      }
++    }
++    if (i > 0 && ids[i] == ids[i - 1]) {
++      snprintf(msg, msgcap, "received duplicate transport parameter %#llx",
++               (unsigned long long)ids[i]);
++      return -1;
++    }
++  }
++
++  return 0;
++}
+diff -Naur a/lib/ngtcp2_transport_params.h b/lib/ngtcp2_transport_params.h
+--- a/lib/ngtcp2_transport_params.h
++++ b/lib/ngtcp2_transport_params.h
+@@ -115,4 +115,19 @@
+                                             ngtcp2_transport_params *dest,
+                                             const ngtcp2_transport_params *src);
+ 
++
++/*
++ * ngtcp2_qgo_transport_params_check reads the |datalen| bytes of the
++ * transport parameters a server sent as quic-go's
++ * TransportParameters.Unmarshal does
++ * (vendor/quic-go/internal/wire/transport_parameters.go:103-296): the
++ * same checks, in the same order, and on the first one that fails the
++ * same message, written to |msg| (|msgcap| bytes, NUL-terminated).  It
++ * returns 0 when quic-go takes them and -1 when it does not.  What
++ * quic-go does not know it steps over: version_information and
++ * grease_quic_bit among them, which ngtcp2's own decoder checks.
++ */
++int ngtcp2_qgo_transport_params_check(const uint8_t *data, size_t datalen,
++                                      char *msg, size_t msgcap);
++
+ #endif /* !defined(NGTCP2_TRANSPORT_PARAMS_H) */

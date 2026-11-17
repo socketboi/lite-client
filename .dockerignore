@@ -1,0 +1,5 @@
+**/.git
+build*
+dl
+tools/.goroot-x
+artifacts

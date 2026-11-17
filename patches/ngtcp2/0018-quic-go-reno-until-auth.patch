@@ -1,0 +1,560 @@
+The controller hysteria's connection starts on, and losses the loss timer finds.
+
+hysteria does not start a connection on BBR. quic-go gives every connection its own controller —
+`congestion.NewCubicSender(..., true, // use Reno ...)`
+(vendor/quic-go/internal/ackhandler/sent_packet_handler.go:153-160) — with quic-go's pacer and
+HyStart, and hysteria replaces it with a new BBR only when the authentication is answered
+(UseConfigured, vendor/hysteria/core/client/client.go:147-166). The handshake and the request run
+on NewReno. This client ran the whole connection on BBR.
+
+So ngtcp2_hybbr gets a second mode, quic-go's NewReno sender and pacer
+(vendor/quic-go/internal/congestion/cubic_sender.go, pacer.go, hybrid_slow_start.go), entered by
+ngtcp2_hybbr_start_reno before the first packet and left by the reset that installs a fresh BBR
+— which the client calls on an accepted authentication. The pacer the send loop asks
+(ngtcp2_hybbr_pacer_*) is quic-go's while the mode is on, hysteria's after.
+
+And one thing both modes needed: losses declared by the loss-detection TIMER reach the controller
+when they are declared, as quic-go hands them over — OnCongestionEventEx(priorInFlight, now, nil,
+lost) (vendor/quic-go/internal/ackhandler/sent_packet_handler.go:937-940). ngtcp2 reports them to
+the controller one by one and then says nothing, so they waited in the batch until the next ACK.
+
+diff --git a/lib/ngtcp2_conn.c b/lib/ngtcp2_conn.c
+index a674875..10a254a 100644
+--- a/lib/ngtcp2_conn.c
++++ b/lib/ngtcp2_conn.c
+@@ -14742,6 +14742,11 @@ int ngtcp2_conn_on_loss_detection_timer(ngtcp2_conn *conn, ngtcp2_tstamp ts) {
+     if (rv != 0) {
+       return rv;
+     }
++    /* And what it declared lost goes to the controller now, as quic-go's
++       timer hands it over (see ngtcp2_hybbr_on_loss_timer). */
++    if (conn->cc_algo == NGTCP2_CC_ALGO_HYBBR) {
++      ngtcp2_hybbr_on_loss_timer(&conn->hybbr, cstat, ts);
++    }
+     ngtcp2_conn_set_loss_detection_timer(conn, ts);
+     return 0;
+   }
+diff --git a/lib/ngtcp2_hybbr.c b/lib/ngtcp2_hybbr.c
+index 0a30629..d235888 100644
+--- a/lib/ngtcp2_hybbr.c
++++ b/lib/ngtcp2_hybbr.c
+@@ -1808,11 +1808,348 @@ static int hybbr_batch_push(ngtcp2_hybbr *hybbr, ngtcp2_hybbr_pkt **pbuf,
+   return 0;
+ }
+ 
++/* ---- quic-go's NewReno, which runs until the authentication is answered ---------------
++ *
++ * hysteria does not start its connection on BBR. quic-go creates every connection with its own
++ * controller — `congestion.NewCubicSender(..., true, // use Reno ...)`
++ * (vendor/quic-go/internal/ackhandler/sent_packet_handler.go:153-160) — and hysteria swaps BBR in
++ * only after the authentication has been answered (UseConfigured,
++ * vendor/hysteria/core/client/client.go:147-166). The handshake and the request run on NewReno and
++ * on quic-go's pacer, which is not hysteria's: its burst is at least two milliseconds' worth rather
++ * than four MinPacingDelays', and it paces at five quarters of the estimate
++ * (vendor/quic-go/internal/congestion/pacer.go:22-36). Below is that controller, line for line,
++ * run in place of the BBR above while `reno.on` is set. The reset that installs a new BBR —
++ * ngtcp2_cc_hybbr_reset, which the client calls on an accepted authentication — clears it. */
++
++#define QGO_INITIAL_PACKET_SIZE 1280u      /* protocol.InitialPacketSize, params.go:6 */
++#define QGO_MAX_CONGESTION_WINDOW_PACKETS 20000u /* params.go:9 */
++#define QGO_MIN_PACING_DELAY NGTCP2_MILLISECONDS /* params.go:120 */
++#define QGO_TIMER_GRANULARITY NGTCP2_MILLISECONDS /* params.go:141 */
++
++/* cubic_sender.go:13-21. */
++#define QGO_MAX_BURST_PACKETS 3u
++#define QGO_RENO_BETA 0.7
++#define QGO_MIN_CONGESTION_WINDOW_PACKETS 2u
++#define QGO_INITIAL_CONGESTION_WINDOW 32u
++
++/* pacer.go:11. */
++#define QGO_MAX_BURST_SIZE_PACKETS 10u
++
++/* hybrid_slow_start.go:10-24. */
++#define QGO_HYSTART_LOW_WINDOW 16u
++#define QGO_HYSTART_MIN_SAMPLES 8u
++#define QGO_HYSTART_DELAY_FACTOR_EXP 3
++#define QGO_HYSTART_DELAY_MIN_THRESHOLD_US 4000
++#define QGO_HYSTART_DELAY_MAX_THRESHOLD_US 16000
++
++/* SmoothedRTT (vendor/quic-go/internal/utils/rtt_stats.go:52-56). Before the first sample it holds
++ * DefaultInitialRTT, 100 ms, which NewRTTStats stores (:32-38) — not zero, as this said until the
++ * reference's own code was run (tools/qgovec) — and ngtcp2 holds the initial_rtt the client sets
++ * to the same. */
++static ngtcp2_duration reno_smoothed_rtt(const ngtcp2_conn_stat *cstat) {
++  return cstat->smoothed_rtt;
++}
++
++/* BandwidthEstimate, then the pacer's adjustedBandwidth: bytes per second, five quarters of the
++ * window over the smoothed RTT — TimerGranularity when there is no RTT yet
++ * (cubic_sender.go:278-286, bandwidth.go:20-22, pacer.go:21-32). */
++static uint64_t reno_pacer_bandwidth(const ngtcp2_hybbr *hybbr) {
++  ngtcp2_duration srtt = reno_smoothed_rtt(hybbr->cstat);
++  uint64_t bps;
++
++  if (srtt == 0) {
++    srtt = QGO_TIMER_GRANULARITY;
++  }
++
++  bps = hybbr->reno.cwnd * NGTCP2_SECONDS / srtt;
++
++  return bps * 5 / 4;
++}
++
++/* timeScaledBandwidth (pacer.go:71-89). */
++static uint64_t reno_pacer_time_scaled(const ngtcp2_hybbr *hybbr, uint64_t ns) {
++  uint64_t bw = reno_pacer_bandwidth(hybbr);
++
++  if (bw == 0) {
++    return 0;
++  }
++
++  if (ns > UINT64_MAX / bw) {
++    return QGO_MAX_BURST_SIZE_PACKETS * hybbr->reno.pacer_max_datagram_size;
++  }
++
++  return bw * ns / NGTCP2_SECONDS;
++}
++
++/* maxBurstSize (pacer.go:64-69). */
++static uint64_t reno_pacer_max_burst_size(const ngtcp2_hybbr *hybbr) {
++  return hybbr_max_u64(
++    reno_pacer_time_scaled(hybbr, QGO_MIN_PACING_DELAY + QGO_TIMER_GRANULARITY),
++    QGO_MAX_BURST_SIZE_PACKETS * hybbr->reno.pacer_max_datagram_size);
++}
++
++/* Budget (pacer.go:48-62). A last-sent time of zero is monotime's zero value: nothing sent yet. */
++static uint64_t reno_pacer_budget(const ngtcp2_hybbr *hybbr, ngtcp2_tstamp now) {
++  const ngtcp2_hybbr_reno *r = &hybbr->reno;
++  uint64_t added = 0, budget;
++
++  if (r->pacer_last_sent_time == 0) {
++    return reno_pacer_max_burst_size(hybbr);
++  }
++
++  if (now > r->pacer_last_sent_time) {
++    added = reno_pacer_time_scaled(hybbr, now - r->pacer_last_sent_time);
++  }
++
++  budget = r->pacer_budget_at_last_sent + added;
++  if (added > 0 && budget < r->pacer_budget_at_last_sent) {
++    budget = UINT64_MAX;
++  }
++
++  return hybbr_min_u64(reno_pacer_max_burst_size(hybbr), budget);
++}
++
++/* SentPacket (pacer.go:38-45): `>=`, where hysteria's pacer has `>`. */
++static void reno_pacer_sent_packet(ngtcp2_hybbr *hybbr, ngtcp2_tstamp sent_time,
++                                   uint64_t size) {
++  uint64_t budget = reno_pacer_budget(hybbr, sent_time);
++
++  hybbr->reno.pacer_budget_at_last_sent = size >= budget ? 0 : budget - size;
++  hybbr->reno.pacer_last_sent_time = sent_time;
++}
++
++/* TimeUntilSend (pacer.go:92-106). */
++static ngtcp2_tstamp reno_pacer_next(const ngtcp2_hybbr *hybbr) {
++  const ngtcp2_hybbr_reno *r = &hybbr->reno;
++  uint64_t diff, bw, d;
++
++  if (r->pacer_budget_at_last_sent >= r->pacer_max_datagram_size) {
++    return 0;
++  }
++
++  diff = NGTCP2_SECONDS * (r->pacer_max_datagram_size - r->pacer_budget_at_last_sent);
++  bw = reno_pacer_bandwidth(hybbr);
++  d = diff / bw;
++  if (diff % bw) {
++    ++d;
++  }
++
++  return r->pacer_last_sent_time + hybbr_max_u64(QGO_MIN_PACING_DELAY, d);
++}
++
++static uint64_t reno_min_cwnd(const ngtcp2_hybbr_reno *r) {
++  return r->max_datagram_size * QGO_MIN_CONGESTION_WINDOW_PACKETS;
++}
++
++static uint64_t reno_max_cwnd(const ngtcp2_hybbr_reno *r) {
++  return r->max_datagram_size * QGO_MAX_CONGESTION_WINDOW_PACKETS;
++}
++
++static int reno_in_slow_start(const ngtcp2_hybbr_reno *r) {
++  return r->cwnd < r->ssthresh;
++}
++
++/* InRecovery (cubic_sender.go:162-164). */
++static int reno_in_recovery(const ngtcp2_hybbr_reno *r) {
++  return r->largest_acked != -1 && r->largest_acked <= r->largest_sent_at_last_cutback;
++}
++
++/* HybridSlowStart.ShouldExitSlowStart (hybrid_slow_start.go:53-89). */
++static int reno_hss_should_exit(ngtcp2_hybbr_reno *r, ngtcp2_duration latest_rtt,
++                                ngtcp2_duration min_rtt, uint64_t cwnd_packets) {
++  if (!r->hss_started) {
++    r->hss_end_packet_number = r->hss_last_sent_packet_number;
++    r->hss_current_min_rtt = 0;
++    r->hss_rtt_sample_count = 0;
++    r->hss_started = 1;
++  }
++
++  if (r->hss_found) {
++    return 1;
++  }
++
++  ++r->hss_rtt_sample_count;
++  if (r->hss_rtt_sample_count <= QGO_HYSTART_MIN_SAMPLES) {
++    if (r->hss_current_min_rtt == 0 || r->hss_current_min_rtt > latest_rtt) {
++      r->hss_current_min_rtt = latest_rtt;
++    }
++  }
++
++  if (r->hss_rtt_sample_count == QGO_HYSTART_MIN_SAMPLES) {
++    int64_t thr_us =
++      (int64_t)((min_rtt / NGTCP2_MICROSECONDS) >> QGO_HYSTART_DELAY_FACTOR_EXP);
++    ngtcp2_duration thr;
++
++    if (thr_us > QGO_HYSTART_DELAY_MAX_THRESHOLD_US) {
++      thr_us = QGO_HYSTART_DELAY_MAX_THRESHOLD_US;
++    }
++    if (thr_us < QGO_HYSTART_DELAY_MIN_THRESHOLD_US) {
++      thr_us = QGO_HYSTART_DELAY_MIN_THRESHOLD_US;
++    }
++    thr = (ngtcp2_duration)thr_us * NGTCP2_MICROSECONDS;
++
++    if (r->hss_current_min_rtt > min_rtt + thr) {
++      r->hss_found = 1;
++    }
++  }
++
++  return cwnd_packets >= QGO_HYSTART_LOW_WINDOW && r->hss_found;
++}
++
++/* SetMaxDatagramSize (cubic_sender.go:320-330), when PMTUD has found a larger one. */
++static void reno_set_max_datagram_size(ngtcp2_hybbr_reno *r, uint64_t s) {
++  int cwnd_is_min = r->cwnd == reno_min_cwnd(r);
++
++  r->max_datagram_size = s;
++  if (cwnd_is_min) {
++    r->cwnd = reno_min_cwnd(r);
++  }
++  r->pacer_max_datagram_size = s;
++}
++
++static void reno_publish(ngtcp2_hybbr *hybbr, ngtcp2_conn_stat *cstat) {
++  ngtcp2_hybbr_reno *r = &hybbr->reno;
++  uint64_t bps;
++
++  if (cstat->max_tx_udp_payload_size > r->max_datagram_size) {
++    reno_set_max_datagram_size(r, cstat->max_tx_udp_payload_size);
++  }
++
++  cstat->cwnd = r->cwnd;
++  cstat->ssthresh = r->ssthresh;
++
++  bps = reno_pacer_bandwidth(hybbr);
++  cstat->pacing_interval_m = hybbr_max_u64((NGTCP2_SECONDS << 10) / bps, 1);
++  cstat->send_quantum = (size_t)reno_pacer_max_burst_size(hybbr);
++}
++
++/* MaybeExitSlowStart (cubic_sender.go:174-181). */
++static void reno_maybe_exit_slow_start(ngtcp2_hybbr *hybbr) {
++  ngtcp2_hybbr_reno *r = &hybbr->reno;
++
++  if (reno_in_slow_start(r) &&
++      reno_hss_should_exit(r, hybbr->cstat->latest_rtt, hybbr->cstat->min_rtt,
++                           r->cwnd / r->max_datagram_size)) {
++    r->ssthresh = r->cwnd;
++  }
++}
++
++/* isCwndLimited (cubic_sender.go:267-276). */
++static int reno_is_cwnd_limited(const ngtcp2_hybbr_reno *r, uint64_t bytes_in_flight) {
++  uint64_t available;
++
++  if (bytes_in_flight >= r->cwnd) {
++    return 1;
++  }
++
++  available = r->cwnd - bytes_in_flight;
++
++  return (reno_in_slow_start(r) && bytes_in_flight > r->cwnd / 2) ||
++         available <= QGO_MAX_BURST_PACKETS * r->max_datagram_size;
++}
++
++/* OnPacketAcked and maybeIncreaseCwnd (cubic_sender.go:183-197, :228-265). */
++static void reno_on_packet_acked(ngtcp2_hybbr_reno *r, int64_t pkt_num,
++                                 uint64_t prior_in_flight) {
++  if (pkt_num > r->largest_acked) {
++    r->largest_acked = pkt_num;
++  }
++
++  if (reno_in_recovery(r)) {
++    return;
++  }
++
++  if (reno_is_cwnd_limited(r, prior_in_flight) && r->cwnd < reno_max_cwnd(r)) {
++    if (reno_in_slow_start(r)) {
++      r->cwnd += r->max_datagram_size;
++    } else if (++r->num_acked_packets >= r->cwnd / r->max_datagram_size) {
++      r->cwnd += r->max_datagram_size;
++      r->num_acked_packets = 0;
++    }
++  }
++
++  /* HybridSlowStart.OnPacketAcked (hybrid_slow_start.go:98-102). */
++  if (reno_in_slow_start(r) && r->hss_end_packet_number < pkt_num) {
++    r->hss_started = 0;
++  }
++}
++
++/* OnCongestionEvent (cubic_sender.go:199-226). One loss event per window: a packet sent before the
++ * last cutback changes nothing. */
++static void reno_on_congestion_event(ngtcp2_hybbr_reno *r, int64_t pkt_num) {
++  if (pkt_num <= r->largest_sent_at_last_cutback) {
++    return;
++  }
++
++  r->cwnd = (uint64_t)((double)r->cwnd * QGO_RENO_BETA);
++  if (r->cwnd < reno_min_cwnd(r)) {
++    r->cwnd = reno_min_cwnd(r);
++  }
++  r->ssthresh = r->cwnd;
++  r->largest_sent_at_last_cutback = r->largest_sent;
++  r->num_acked_packets = 0;
++}
++
++/* One ACK, in the order quic-go takes it: the slow-start exit when the ACK gave an RTT sample, the
++ * losses it revealed, then what it acknowledged, all against the in-flight from before it
++ * (vendor/quic-go/internal/ackhandler/sent_packet_handler.go:433-474, :895-901). */
++static void reno_on_ack(ngtcp2_hybbr *hybbr, ngtcp2_conn_stat *cstat, int rtt_sampled) {
++  ngtcp2_hybbr_reno *r = &hybbr->reno;
++  size_t i;
++
++  if (rtt_sampled) {
++    reno_maybe_exit_slow_start(hybbr);
++  }
++
++  for (i = 0; i < hybbr->lost_len; ++i) {
++    reno_on_congestion_event(r, hybbr->lost[i].pkt_num);
++  }
++
++  for (i = 0; i < hybbr->acked_len; ++i) {
++    reno_on_packet_acked(r, hybbr->acked[i].pkt_num, hybbr->prior_in_flight);
++  }
++
++  hybbr->acked_len = 0;
++  hybbr->lost_len = 0;
++
++  reno_publish(hybbr, cstat);
++}
++
++void ngtcp2_hybbr_start_reno(ngtcp2_hybbr *hybbr, ngtcp2_conn_stat *cstat) {
++  ngtcp2_hybbr_reno *r = &hybbr->reno;
++
++  memset(r, 0, sizeof(*r));
++  r->on = 1;
++  /* NewCubicSender with the connection's initial datagram size — 1250 for a client parroting
++   * Chrome, 1280 otherwise — and the pacer at protocol.InitialPacketSize whatever that is
++   * (cubic_sender.go:69-88, :90-124, pacer.go:21-24). */
++  r->max_datagram_size = hybbr->initial_packet_size;
++  r->initial_cwnd = QGO_INITIAL_CONGESTION_WINDOW * hybbr->initial_packet_size;
++  r->cwnd = r->initial_cwnd;
++  r->ssthresh = UINT64_MAX;
++  r->largest_sent = -1;
++  r->largest_acked = -1;
++  r->largest_sent_at_last_cutback = -1;
++  r->pacer_max_datagram_size = QGO_INITIAL_PACKET_SIZE;
++  r->pacer_budget_at_last_sent = reno_pacer_max_burst_size(hybbr);
++
++  reno_publish(hybbr, cstat);
++}
++
+ void ngtcp2_cc_hybbr_on_pkt_sent(ngtcp2_cc *cc, ngtcp2_conn_stat *cstat,
+                                  const ngtcp2_cc_pkt *pkt) {
+   ngtcp2_hybbr *hybbr = ngtcp2_struct_of(cc, ngtcp2_hybbr, cc);
+   uint64_t bytes_in_flight;
+ 
++  if (hybbr->reno.on) {
++    /* OnPacketSent (cubic_sender.go:143-156): the pacer, and the packet numbers. */
++    reno_pacer_sent_packet(hybbr, pkt->sent_ts, pkt->pktlen);
++    hybbr->reno.largest_sent = pkt->pkt_num;
++    hybbr->reno.hss_last_sent_packet_number = pkt->pkt_num;
++    reno_publish(hybbr, cstat);
++    return;
++  }
++
+   /* The reference is told the in-flight WITH this packet already counted: quic-go adds the packet
+    * to its total and then calls the controller (internal/ackhandler/sent_packet_handler.go:317-325). ngtcp2 calls
+    * before adding, so the packet is added here. */
+@@ -1874,6 +2211,41 @@ void ngtcp2_cc_hybbr_on_ack_recv(ngtcp2_cc *cc, ngtcp2_conn_stat *cstat,
+ 
+   hybbr->prior_in_flight = prior;
+ 
++  if (hybbr->reno.on) {
++    reno_on_ack(hybbr, cstat, ack->rtt != UINT64_MAX);
++    return;
++  }
++
++  hybbr_on_congestion_event(hybbr, ts);
++}
++
++/* Losses the loss-detection TIMER declared. quic-go hands them to the controller then and there,
++ * with no acknowledged packets beside them — OnCongestionEventEx(priorInFlight, now, nil, lost)
++ * (vendor/quic-go/internal/ackhandler/sent_packet_handler.go:937-940) — and ngtcp2 had nothing to
++ * say at that moment: the lost packets sat in the batch until the next ACK ran it. The connection
++ * calls this after the timer's detection. */
++void ngtcp2_hybbr_on_loss_timer(ngtcp2_hybbr *hybbr, ngtcp2_conn_stat *cstat,
++                                ngtcp2_tstamp ts) {
++  uint64_t prior = cstat->bytes_in_flight;
++  size_t i;
++
++  if (hybbr->lost_len == 0) {
++    return;
++  }
++
++  for (i = 0; i < hybbr->lost_len; ++i) {
++    prior += hybbr->lost[i].bytes;
++  }
++  for (i = 0; i < hybbr->acked_len; ++i) {
++    prior += hybbr->acked[i].bytes;
++  }
++  hybbr->prior_in_flight = prior;
++
++  if (hybbr->reno.on) {
++    reno_on_ack(hybbr, cstat, 0);
++    return;
++  }
++
+   hybbr_on_congestion_event(hybbr, ts);
+ }
+ 
+@@ -1887,6 +2259,24 @@ void ngtcp2_cc_hybbr_congestion_event(ngtcp2_cc *cc, ngtcp2_conn_stat *cstat,
+   (void)sent_ts;
+   (void)ack;
+ 
++  /* ECN-CE, which is all ngtcp2 calls this for: quic-go's NewReno cuts back as for a loss, at the
++     largest packet acknowledged (vendor/quic-go/internal/ackhandler/sent_packet_handler.go:450-458). */
++  if (hybbr->reno.on) {
++    int64_t largest = hybbr->reno.largest_acked;
++    size_t i;
++
++    for (i = 0; i < hybbr->acked_len; ++i) {
++      if (hybbr->acked[i].pkt_num > largest) {
++        largest = hybbr->acked[i].pkt_num;
++      }
++    }
++    if (largest != -1) {
++      reno_on_congestion_event(&hybbr->reno, largest);
++      reno_publish(hybbr, cstat);
++    }
++    return;
++  }
++
+   if (hybbr->lost_len == 0 && hybbr->acked_len == 0) {
+     return;
+   }
+@@ -2006,15 +2396,26 @@ void ngtcp2_hybbr_init(ngtcp2_hybbr *hybbr, ngtcp2_log *log,
+ 
+ /* HasPacingBudget: whether a datagram may go now (core/internal/congestion/bbr/bbr_sender.go:438-441, over Budget at core/internal/congestion/common/pacer.go:42-51). */
+ int ngtcp2_hybbr_pacer_can_send(const ngtcp2_hybbr *hybbr, ngtcp2_tstamp ts) {
++  if (hybbr->reno.on) {
++    /* HasPacingBudget against the sender's datagram size (cubic_sender.go:131-133). */
++    return reno_pacer_budget(hybbr, ts) >= hybbr->reno.max_datagram_size;
++  }
+   return hybbr_pacer_budget(hybbr, ts) >= hybbr->pacer.max_datagram_size;
+ }
+ 
+ uint64_t ngtcp2_hybbr_pacer_budget(const ngtcp2_hybbr *hybbr, ngtcp2_tstamp ts) {
++  if (hybbr->reno.on) {
++    return reno_pacer_budget(hybbr, ts);
++  }
+   return hybbr_pacer_budget(hybbr, ts);
+ }
+ 
+ void ngtcp2_hybbr_pacer_sent(ngtcp2_hybbr *hybbr, ngtcp2_tstamp ts,
+                              uint64_t size) {
++  if (hybbr->reno.on) {
++    reno_pacer_sent_packet(hybbr, ts, size);
++    return;
++  }
+   hybbr_pacer_sent_packet(hybbr, ts, size);
+ }
+ 
+@@ -2025,6 +2426,10 @@ ngtcp2_tstamp ngtcp2_hybbr_pacer_next(const ngtcp2_hybbr *hybbr) {
+   const ngtcp2_hybbr_pacer *p = &hybbr->pacer;
+   uint64_t diff, bw, d;
+ 
++  if (hybbr->reno.on) {
++    return reno_pacer_next(hybbr);
++  }
++
+   if (p->budget_at_last_sent >= p->max_datagram_size) {
+     return 0;
+   }
+diff --git a/lib/ngtcp2_hybbr.h b/lib/ngtcp2_hybbr.h
+index 79befcf..361b7b0 100644
+--- a/lib/ngtcp2_hybbr.h
++++ b/lib/ngtcp2_hybbr.h
+@@ -181,8 +181,43 @@ typedef struct ngtcp2_hybbr_pacer {
+   ngtcp2_tstamp last_sent_time;
+ } ngtcp2_hybbr_pacer;
+ 
++/* The controller hysteria's connection runs BEFORE it installs BBR: quic-go's own, which is its
++ * cubicSender with reno set — "true, // use Reno"
++ * (vendor/quic-go/internal/ackhandler/sent_packet_handler.go:153-160) — with quic-go's pacer
++ * (vendor/quic-go/internal/congestion/pacer.go) and HyStart
++ * (vendor/quic-go/internal/congestion/hybrid_slow_start.go). hysteria replaces it only once the
++ * authentication is answered (UseConfigured, vendor/hysteria/core/client/client.go:147-166), so
++ * the handshake and the request run on this. See ngtcp2_hybbr_start_reno. */
++typedef struct ngtcp2_hybbr_reno {
++  int on;
++
++  uint64_t cwnd;
++  uint64_t ssthresh;
++  uint64_t num_acked_packets;
++  uint64_t max_datagram_size;
++  uint64_t initial_cwnd;
++  int64_t largest_sent;
++  int64_t largest_acked;
++  int64_t largest_sent_at_last_cutback;
++
++  /* HybridSlowStart. */
++  int64_t hss_end_packet_number;
++  int64_t hss_last_sent_packet_number;
++  int hss_started;
++  ngtcp2_duration hss_current_min_rtt;
++  uint32_t hss_rtt_sample_count;
++  int hss_found;
++
++  /* quic-go's pacer: not hysteria's (see ngtcp2_hybbr_pacer), which differs in the burst and in
++   * scaling the rate by 5/4. */
++  uint64_t pacer_budget_at_last_sent;
++  uint64_t pacer_max_datagram_size;
++  ngtcp2_tstamp pacer_last_sent_time;
++} ngtcp2_hybbr_reno;
++
+ struct ngtcp2_hybbr {
+   ngtcp2_cc cc;
++  ngtcp2_hybbr_reno reno;
+   ngtcp2_log *log;
+   ngtcp2_conn_stat *cstat;
+   ngtcp2_pcg32 *pcg;
+@@ -279,6 +314,17 @@ void ngtcp2_hybbr_init(ngtcp2_hybbr *hybbr, ngtcp2_log *log,
+ 
+ void ngtcp2_hybbr_free(ngtcp2_hybbr *hybbr);
+ 
++/*
++ * `ngtcp2_hybbr_start_reno` puts |hybbr| under quic-go's NewReno and its pacer until the next
++ * reset — which is what the client does when its authentication is accepted, as hysteria
++ * installs a new BBR there.  Called before the first packet is sent.
++ */
++void ngtcp2_hybbr_start_reno(ngtcp2_hybbr *hybbr, ngtcp2_conn_stat *cstat);
++
++/* Losses the loss-detection timer declared, handed over at once — see the definition. */
++void ngtcp2_hybbr_on_loss_timer(ngtcp2_hybbr *hybbr, ngtcp2_conn_stat *cstat,
++                                ngtcp2_tstamp ts);
++
+ /* The pacer as the send loop consults it — the three calls quic-go's loop makes on the reference's
+  * bucket (core/internal/congestion/common/pacer.go:32-76). `budget` is how many bytes may go now, `sent` accounts for what
+  * went, and `next` is when a datagram's worth will have accumulated (0 = now). */

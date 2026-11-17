@@ -1,0 +1,40 @@
+A client confirms the handshake on an acknowledgement of a 1-RTT packet, as quic-go does.
+
+quic-go's handleAckFrame, when the ACK it has just processed acknowledged a 1-RTT packet — which
+it can only have done in a 1-RTT packet — confirms the handshake on the client side at once
+(vendor/quic-go/connection.go:2150-2166, acked1RTTPacket from
+vendor/quic-go/internal/ackhandler/sent_packet_handler.go:467-478), as RFC 9001 section 4.1.2
+allows, rather than waiting for HANDSHAKE_DONE. Confirming drops the Handshake keys and ends
+whatever the client still had to send in that space. ngtcp2 waits for HANDSHAKE_DONE, so a lost
+one left the client in the Handshake space for a round trip or more where the reference was not.
+
+diff --git a/lib/ngtcp2_conn.c b/lib/ngtcp2_conn.c
+--- a/lib/ngtcp2_conn.c
++++ b/lib/ngtcp2_conn.c
+@@ -6869,6 +6869,8 @@
+  * NGTCP2_ERR_CALLBACK_FAILURE
+  *     User callback failed.
+  */
++static int conn_recv_handshake_done(ngtcp2_conn *conn, ngtcp2_tstamp ts);
++
+ static int conn_recv_ack(ngtcp2_conn *conn, ngtcp2_pktns *pktns, ngtcp2_ack *fr,
+                          ngtcp2_tstamp pkt_ts, ngtcp2_tstamp ts) {
+   ngtcp2_ssize num_acked;
+@@ -6901,6 +6903,17 @@
+ 
+   ngtcp2_conn_set_loss_detection_timer(conn, ts);
+ 
++  /* A client takes an ACK of one of its 1-RTT packets, arriving in a
++     1-RTT packet, as the handshake confirmed, without waiting for
++     HANDSHAKE_DONE: quic-go's handleAckFrame, from acked1RTTPacket
++     (vendor/quic-go/connection.go:2150-2166,
++     vendor/quic-go/internal/ackhandler/sent_packet_handler.go:467-478),
++     RFC 9001 section 4.1.2. */
++  if (!conn->server && pktns == &conn->pktns &&
++      !(conn->flags & NGTCP2_CONN_FLAG_HANDSHAKE_CONFIRMED)) {
++    return conn_recv_handshake_done(conn, ts);
++  }
++
+   return 0;
+ }
+ 

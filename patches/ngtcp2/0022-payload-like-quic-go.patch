@@ -1,0 +1,552 @@
+The payload of a 1-RTT packet laid out as quic-go lays it out, and its STREAM frames sized as
+quic-go sizes them.
+
+quic-go's appendPacketPayload (vendor/quic-go/packet_packer.go:1055-1092) writes the ACK, then the
+padding, then every frame that is neither ACK nor STREAM — DATAGRAM, PING, the control frames of
+the streams and of the connection, STREAM_DATA_BLOCKED — in an order drawn for each packet by a PCG
+seeded from crypto/rand (:180), then the STREAM frames. The last STREAM frame of the packet goes
+without its Length field, and every STREAM frame is sized as if it were the last: popStreamFrame is
+asked with the length of that field added to the room left (vendor/quic-go/framer.go:442-446, :222-
+229), and MaxDataLen reckons the field at one byte, two once the data is longer
+(vendor/quic-go/internal/wire/stream_frame.go:136-155). No STREAM frame is taken with less than 128
+bytes of the packet left (MinStreamFrameSize, vendor/quic-go/framer.go:177-184,
+vendor/quic-go/internal/protocol/params.go:103).
+
+Upstream ngtcp2 wrote the frames in an order of its own — the connection's control frames, the
+streams', STREAM frames, the DATAGRAM after all of them, the padding at the end — gave every STREAM
+frame its Length, and took a new STREAM frame only if 256 bytes of data fit or all of it did.
+
+Now ngtcp2_ppe_encode_frame records where each frame went, and before a 1-RTT packet is sealed
+conn_lc_quicgo_payload lays it out again: ACK, the others shuffled uniformly, STREAM frames in the
+order they were taken with the last one's Length dropped; the padding is moved to after the ACK
+(conn_write_pkt, and ngtcp2_conn_write_single_frame_pkt, which writes PMTUD probes: quic-go's probe
+is its padding and then the PING). A new STREAM frame is sized by conn_lc_stream_max_datalen and
+written without its Length when it would not fit with one — then it fills the packet and is last.
+The order is inside the encryption, for the node alone to see; the Length is not only that: a packet
+that ends in a STREAM frame short of full is one or two bytes shorter than ngtcp2 made it, as
+quic-go's is, and packet sizes are what the path sees.
+
+The DATAGRAM gets its room right after the ACK, before any control frame, as quic-go gives it
+(vendor/quic-go/packet_packer.go:736-761); ngtcp2 took it after everything it had queued. One that
+does not fit waits while the packet goes on with other frames (ngtcp2 answers WRITE_MORE, and the
+client's loop goes on to its streams), is dropped when the packet has no ACK, and is dropped after
+being passed over more than DatagramFrameMaxPeekTimes times in a row (:147), counted as quic-go
+counts. With ack_datagram or lost_datagram set, which this client does not, the DATAGRAM keeps
+ngtcp2's place.
+
+Checked in test/ngpatch: the sizing against quic-go's MaxDataLen on 12 432 cases (tools/qgovec),
+the layout and a chi-square over the 24 orders of four frames, the 128-byte floor at 128 and 127,
+the DATAGRAM's room, and a PMTUD probe.
+
+diff --git a/lib/ngtcp2_conn.c b/lib/ngtcp2_conn.c
+index 6ccf56e..d3df983 100644
+--- a/lib/ngtcp2_conn.c
++++ b/lib/ngtcp2_conn.c
+@@ -1932,6 +1932,7 @@ void ngtcp2_conn_del(ngtcp2_conn *conn) {
+   ngtcp2_objalloc_free(&conn->rtb_entry_objalloc);
+   ngtcp2_objalloc_free(&conn->frc_objalloc);
+ 
++  ngtcp2_mem_free(conn->mem, conn->lc_payload);
+   ngtcp2_mem_free(conn->mem, conn);
+ }
+ 
+@@ -4389,6 +4390,161 @@ static void conn_reset_ppe_pending(ngtcp2_conn *conn) {
+   memset(&conn->pkt, 0, sizeof(conn->pkt));
+ }
+ 
++/*
++ * conn_lc_stream_max_datalen is how much of |ndatalen| bytes of new
++ * stream data quic-go puts in a STREAM frame for a stream |stream_id|
++ * at |offset| when |left| bytes of the packet are left: popStreamFrame
++ * is asked with the length of the Length field added to |left|, since
++ * the last STREAM frame of a packet goes without one
++ * (vendor/quic-go/framer.go:442-446), and MaxDataLen sizes the frame
++ * as if it had one of a byte, two when the data is longer than that
++ * (vendor/quic-go/internal/wire/stream_frame.go:136-155).
++ */
++static size_t conn_lc_stream_max_datalen(int64_t stream_id, uint64_t offset,
++                                         size_t ndatalen, size_t left) {
++  size_t max_bytes = left + ngtcp2_put_uvarintlen(left);
++  size_t hdlen = 1 + ngtcp2_put_uvarintlen((uint64_t)stream_id) + 1;
++  size_t n;
++
++  if (offset) {
++    hdlen += ngtcp2_put_uvarintlen(offset);
++  }
++
++  if (hdlen > max_bytes) {
++    return 0;
++  }
++
++  n = max_bytes - hdlen;
++  if (ngtcp2_put_uvarintlen(n) != 1) {
++    --n;
++  }
++
++  return ngtcp2_min(n, ndatalen);
++}
++
++/*
++ * conn_lc_rand_below returns a uniformly drawn integer in [0, |n|).
++ */
++static size_t conn_lc_rand_below(ngtcp2_conn *conn, size_t n) {
++  uint32_t r, lim = (uint32_t)(0x100000000ULL - 0x100000000ULL % n);
++
++  for (;;) {
++    conn->callbacks.rand((uint8_t *)&r, sizeof(r),
++                         &conn->local.settings.rand_ctx);
++    if (lim == 0 || r < lim) {
++      return r % n;
++    }
++  }
++}
++
++/*
++ * conn_lc_quicgo_payload lays the payload of the 1-RTT packet being
++ * written in |ppe| out as quic-go's appendPacketPayload does
++ * (vendor/quic-go/packet_packer.go:1055-1092): the ACK first, then
++ * every frame that is neither ACK nor STREAM in an order drawn afresh
++ * for each packet — quic-go shuffles them with a PCG seeded from
++ * crypto/rand (vendor/quic-go/packet_packer.go:180), which makes every
++ * order equally likely, and so does this — then the STREAM frames in
++ * the order they were taken, the last without its Length field
++ * (vendor/quic-go/framer.go:222-229).  ngtcp2 writes them in an order
++ * of its own: control frames of the connection, then of the streams,
++ * STREAM frames, and a DATAGRAM after all of them. |*acklen|
++ * receives the length of the ACK, after which the padding goes.
++ */
++static int conn_lc_quicgo_payload(ngtcp2_conn *conn, ngtcp2_ppe *ppe,
++                                  size_t *acklen) {
++  ngtcp2_buf *buf = &ppe->buf;
++  size_t n = ppe->lc_nspans, nother = 0, i, j, k, len;
++  uint16_t order[NGTCP2_PPE_LC_MAX_SPANS], other[NGTCP2_PPE_LC_MAX_SPANS], t;
++  size_t payloadlen = ngtcp2_buf_len(buf) - ppe->hdlen;
++  size_t last_stream = n;
++  uint8_t *p, *q;
++  uint16_t type;
++
++  *acklen = 0;
++  if (n == 0) {
++    return 0;
++  }
++
++  if (conn->lc_payloadcap < payloadlen) {
++    p = ngtcp2_mem_realloc(conn->mem, conn->lc_payload, payloadlen);
++    if (p == NULL) {
++      return NGTCP2_ERR_NOMEM;
++    }
++    conn->lc_payload = p;
++    conn->lc_payloadcap = payloadlen;
++  }
++
++  /* The frames lie back to back from the end of the header. */
++  assert(ppe->lc_spans[0].off == ppe->hdlen);
++  assert((size_t)ppe->lc_spans[n - 1].off + ppe->lc_spans[n - 1].len ==
++         ngtcp2_buf_len(buf));
++
++  k = 0;
++  for (i = 0; i < n; ++i) {
++    type = ppe->lc_spans[i].type;
++    if (type == NGTCP2_FRAME_ACK || type == NGTCP2_FRAME_ACK_ECN) {
++      order[k++] = (uint16_t)i;
++      *acklen += ppe->lc_spans[i].len;
++    } else if (type != NGTCP2_FRAME_STREAM) {
++      other[nother++] = (uint16_t)i;
++    }
++  }
++
++  for (i = nother; i > 1; --i) {
++    j = conn_lc_rand_below(conn, i);
++    t = other[i - 1];
++    other[i - 1] = other[j];
++    other[j] = t;
++  }
++  for (i = 0; i < nother; ++i) {
++    order[k++] = other[i];
++  }
++
++  for (i = 0; i < n; ++i) {
++    if (ppe->lc_spans[i].type == NGTCP2_FRAME_STREAM) {
++      last_stream = k;
++      order[k++] = (uint16_t)i;
++    }
++  }
++  assert(k == n);
++
++  memcpy(conn->lc_payload, buf->begin + ppe->hdlen, payloadlen);
++
++  q = buf->begin + ppe->hdlen;
++  for (k = 0; k < n; ++k) {
++    i = order[k];
++    p = conn->lc_payload + (ppe->lc_spans[i].off - ppe->hdlen);
++    len = ppe->lc_spans[i].len;
++
++    if (k == last_stream && (p[0] & NGTCP2_STREAM_LEN_BIT)) {
++      /* type, Stream ID, Offset if there is one, then the Length, which
++         goes. */
++      size_t hd = 1 + ngtcp2_get_uvarintlen(p + 1);
++      size_t lenlen;
++
++      if (p[0] & NGTCP2_STREAM_OFF_BIT) {
++        hd += ngtcp2_get_uvarintlen(p + hd);
++      }
++      lenlen = ngtcp2_get_uvarintlen(p + hd);
++
++      *q = (uint8_t)(p[0] & ~NGTCP2_STREAM_LEN_BIT);
++      memcpy(q + 1, p + 1, hd - 1);
++      memcpy(q + hd, p + hd + lenlen, len - hd - lenlen);
++      q += len - lenlen;
++      continue;
++    }
++
++    memcpy(q, p, len);
++    q += len;
++  }
++
++  buf->last = q;
++  ppe->lc_nspans = 0;
++
++  return 0;
++}
++
+ /*
+  * conn_write_pkt writes a protected packet in the buffer pointed by
+  * |dest| whose length if |destlen|.  |dgram_offset| is the offset in
+@@ -4424,6 +4580,8 @@ static ngtcp2_ssize conn_write_pkt(ngtcp2_conn *conn, ngtcp2_pkt_info *pi,
+                                    size_t dgram_offset, ngtcp2_vmsg *vmsg,
+                                    uint8_t type, uint8_t flags,
+                                    ngtcp2_tstamp ts) {
++  int lc_has_ack = 0, lc_dgram_early = 0, lc_dgram_more = 0;
++  size_t lc_acklen = 0;
+   int rv = 0;
+   ngtcp2_crypto_cc *cc = &conn->pkt.cc;
+   ngtcp2_ppe *ppe = &conn->pkt.ppe;
+@@ -4655,6 +4813,54 @@ static ngtcp2_ssize conn_write_pkt(ngtcp2_conn *conn, ngtcp2_pkt_info *pi,
+         conn_handle_unconfirmed_key_update_from_remote(conn,
+                                                        lfr.ack.largest_ack, ts);
+         pkt_empty = 0;
++        lc_has_ack = 1;
++      }
++    }
++
++    /* quic-go gives the DATAGRAM its room right after the ACK, before
++       any control frame or STREAM frame (vendor/quic-go/packet_packer.go:
++       736-761); ngtcp2 took it last, after everything queued.  One that
++       does not fit waits for a later packet while this one goes on with
++       other frames, and is dropped instead when the packet has no ACK,
++       or when it has been passed over more than DatagramFrameMaxPeekTimes
++       times in a row (:147), counted as quic-go counts: from one again
++       after a DATAGRAM goes or is dropped.  With ack_datagram or
++       lost_datagram set the DATAGRAM is booked in the frame queue, whose
++       loop below starts over from its head, and it keeps upstream's
++       place, last. */
++    if (send_datagram && type == NGTCP2_PKT_1RTT &&
++        !conn->callbacks.ack_datagram && !conn->callbacks.lost_datagram) {
++      int dropped = 0;
++
++      if (ngtcp2_ppe_left(ppe) >=
++          ngtcp2_pkt_datagram_framelen((size_t)datalen)) {
++        lfr.datagram.type = NGTCP2_FRAME_DATAGRAM_LEN;
++        lfr.datagram.datacnt = vmsg->datagram.datacnt;
++        lfr.datagram.data = (ngtcp2_vec *)vmsg->datagram.data;
++
++        rv = conn_ppe_write_frame_hd_log(conn, ppe, &hd_logged, hd, &lfr);
++        assert(rv == 0);
++
++        pkt_empty = 0;
++        rtb_entry_flags |= NGTCP2_RTB_ENTRY_FLAG_ACK_ELICITING |
++                           NGTCP2_RTB_ENTRY_FLAG_PTO_ELICITING |
++                           NGTCP2_RTB_ENTRY_FLAG_DATAGRAM;
++        lc_dgram_early = 1;
++        conn->lc_dgram_peeks = 0;
++      } else if (!lc_has_ack) {
++        dropped = 1;
++        conn->lc_dgram_peeks = 0;
++      }
++      if (++conn->lc_dgram_peeks > 10 && !lc_dgram_early && !dropped) {
++        dropped = 1;
++        conn->lc_dgram_peeks = 0;
++      }
++      if ((lc_dgram_early || dropped) && vmsg->datagram.paccepted) {
++        *vmsg->datagram.paccepted = 1;
++      }
++      if (!lc_dgram_early) {
++        send_datagram = 0;
++        lc_dgram_more = 1;
+       }
+     }
+ 
+@@ -5137,12 +5343,17 @@ static ngtcp2_ssize conn_write_pkt(ngtcp2_conn *conn, ngtcp2_pkt_info *pi,
+ 
+   left = ngtcp2_ppe_left(ppe);
+ 
++  /* quic-go takes another STREAM frame while 128 bytes of the packet
++     are left (MinStreamFrameSize, vendor/quic-go/framer.go:177-184,
++     vendor/quic-go/internal/protocol/params.go:103) and sizes it as
++     conn_lc_stream_max_datalen does; ngtcp2 wanted 256 bytes of data
++     to fit unless all of it did. */
+   if (*pfrc == NULL && send_stream && ngtcp2_pq_empty(&conn->tx.strmq) &&
+-      (wdatalen = ngtcp2_pkt_stream_max_datalen(
+-         vmsg->stream.strm->stream_id, vmsg->stream.strm->tx.offset, ndatalen,
+-         left)) != (size_t)-1 &&
+-      (wdatalen == ndatalen || wdatalen >= NGTCP2_MIN_STREAM_DATALEN) &&
+-      (wdatalen || datalen == 0)) {
++      left >= 128 &&
++      ((wdatalen = conn_lc_stream_max_datalen(
++          vmsg->stream.strm->stream_id, vmsg->stream.strm->tx.offset,
++          ndatalen, left)) ||
++       datalen == 0)) {
+     ndatalen = wdatalen;
+     datacnt = ngtcp2_vec_copy_at_most(data, NGTCP2_MAX_STREAM_DATACNT,
+                                       vmsg->stream.data, vmsg->stream.datacnt,
+@@ -5160,6 +5371,16 @@ static ngtcp2_ssize conn_write_pkt(ngtcp2_conn *conn, ngtcp2_pkt_info *pi,
+ 
+     nfrc->fr.stream.type = NGTCP2_FRAME_STREAM;
+     nfrc->fr.stream.flags = 0;
++    /* Sized for no Length field, it may not fit with one: then it
++       fills the packet and is the last STREAM frame in it. */
++    if (1 + ngtcp2_put_uvarintlen((uint64_t)vmsg->stream.strm->stream_id) +
++          (vmsg->stream.strm->tx.offset
++             ? ngtcp2_put_uvarintlen(vmsg->stream.strm->tx.offset)
++             : 0) +
++          ngtcp2_put_uvarintlen(ndatalen) + ndatalen >
++        left) {
++      nfrc->fr.stream.flags = NGTCP2_STREAM_LC_NOLEN_BIT;
++    }
+     nfrc->fr.stream.fin = (vmsg->stream.flags & NGTCP2_WRITE_STREAM_FLAG_FIN) &&
+                           ndatalen == datalen;
+     nfrc->fr.stream.stream_id = vmsg->stream.strm->stream_id;
+@@ -5277,8 +5498,10 @@ static ngtcp2_ssize conn_write_pkt(ngtcp2_conn *conn, ngtcp2_pkt_info *pi,
+     }
+   }
+ 
+-  if (*pfrc == NULL && send_datagram &&
+-      left >= ngtcp2_pkt_datagram_framelen((size_t)datalen)) {
++  if (lc_dgram_early) {
++    /* written after the ACK, above */
++  } else if (*pfrc == NULL && send_datagram &&
++             left >= ngtcp2_pkt_datagram_framelen((size_t)datalen)) {
+     if (conn->callbacks.ack_datagram || conn->callbacks.lost_datagram) {
+       rv = ngtcp2_frame_chain_objalloc_new(&nfrc, &conn->frc_objalloc);
+       if (rv != 0) {
+@@ -5378,7 +5601,7 @@ static ngtcp2_ssize conn_write_pkt(ngtcp2_conn *conn, ngtcp2_pkt_info *pi,
+       }
+       break;
+     case NGTCP2_VMSG_TYPE_DATAGRAM:
+-      if (send_datagram && ngtcp2_ppe_left(ppe)) {
++      if ((send_datagram || lc_dgram_more) && ngtcp2_ppe_left(ppe)) {
+         return NGTCP2_ERR_WRITE_MORE;
+       }
+       /* If DATAGRAM cannot be written due to insufficient space,
+@@ -5433,6 +5656,14 @@ static ngtcp2_ssize conn_write_pkt(ngtcp2_conn *conn, ngtcp2_pkt_info *pi,
+     pktns->tx.num_non_ack_eliciting_acks = 0;
+   }
+ 
++  if (!(hd->flags & NGTCP2_PKT_FLAG_LONG_FORM)) {
++    rv = conn_lc_quicgo_payload(conn, ppe, &lc_acklen);
++    if (rv != 0) {
++      assert(ngtcp2_err_is_fatal(rv));
++      return rv;
++    }
++  }
++
+   /* TODO Push STREAM frame back to ngtcp2_strm if there is an error
+      before ngtcp2_rtb_entry is safely created and added. */
+   if ((flags & (NGTCP2_WRITE_PKT_FLAG_PADDING_IF_NOT_EMPTY)) &&
+@@ -5455,6 +5686,18 @@ static ngtcp2_ssize conn_write_pkt(ngtcp2_conn *conn, ngtcp2_pkt_info *pi,
+     ngtcp2_qlog_write_frame(&conn->qlog, &lfr);
+   }
+ 
++  /* quic-go pads right after the ACK, before any other frame
++     (vendor/quic-go/packet_packer.go:1064-1066); ngtcp2 appended the
++     padding. */
++  if (!(hd->flags & NGTCP2_PKT_FLAG_LONG_FORM) && lfr.padding.len) {
++    uint8_t *pad = ppe->buf.begin + ppe->hdlen + lc_acklen;
++    size_t rest = ngtcp2_buf_len(&ppe->buf) - ppe->hdlen - lc_acklen -
++                  lfr.padding.len;
++
++    memmove(pad + lfr.padding.len, pad, rest);
++    memset(pad, 0, lfr.padding.len);
++  }
++
+   nwrite = ngtcp2_ppe_final(ppe, NULL);
+   if (nwrite < 0) {
+     assert(ngtcp2_err_is_fatal((int)nwrite));
+@@ -5530,6 +5773,7 @@ ngtcp2_ssize ngtcp2_conn_write_single_frame_pkt(
+   ngtcp2_conn *conn, ngtcp2_pkt_info *pi, uint8_t *dest, size_t destlen,
+   uint8_t type, uint8_t flags, const ngtcp2_cid *dcid, ngtcp2_frame *fr,
+   uint16_t rtb_entry_flags, const ngtcp2_path *path, ngtcp2_tstamp ts) {
++  size_t lc_acklen = 0;
+   int rv;
+   ngtcp2_ppe ppe;
+   ngtcp2_pkt_hd hd;
+@@ -5633,6 +5877,13 @@ ngtcp2_ssize ngtcp2_conn_write_single_frame_pkt(
+     }
+   }
+ 
++  if (type == NGTCP2_PKT_1RTT) {
++    rv = conn_lc_quicgo_payload(conn, &ppe, &lc_acklen);
++    if (rv != 0) {
++      return rv;
++    }
++  }
++
+   lfr.padding.type = NGTCP2_FRAME_PADDING;
+   if (flags & NGTCP2_WRITE_PKT_FLAG_REQUIRE_PADDING_FULL) {
+     lfr.padding.len = ngtcp2_ppe_dgram_padding_size(&ppe, destlen);
+@@ -5658,6 +5909,17 @@ ngtcp2_ssize ngtcp2_conn_write_single_frame_pkt(
+     ngtcp2_qlog_write_frame(&conn->qlog, &lfr);
+   }
+ 
++  /* quic-go pads right after the ACK, and so before the PING of a
++     probe (vendor/quic-go/packet_packer.go:1064-1066). */
++  if (type == NGTCP2_PKT_1RTT && lfr.padding.len) {
++    uint8_t *pad = ppe.buf.begin + ppe.hdlen + lc_acklen;
++    size_t rest = ngtcp2_buf_len(&ppe.buf) - ppe.hdlen - lc_acklen -
++                  lfr.padding.len;
++
++    memmove(pad + lfr.padding.len, pad, rest);
++    memset(pad, 0, lfr.padding.len);
++  }
++
+   nwrite = ngtcp2_ppe_final(&ppe, NULL);
+   if (nwrite < 0) {
+     return nwrite;
+diff --git a/lib/ngtcp2_conn.h b/lib/ngtcp2_conn.h
+index 99aed5d..bbd9d83 100644
+--- a/lib/ngtcp2_conn.h
++++ b/lib/ngtcp2_conn.h
+@@ -745,6 +745,14 @@ struct ngtcp2_conn {
+      closed. */
+   ngtcp2_ratelim glitch_rlim;
+   const ngtcp2_mem *mem;
++  /* lc_payload is where conn_lc_quicgo_payload copies a payload
++     while it lays it out again, lc_payloadcap bytes long. */
++  uint8_t *lc_payload;
++  size_t lc_payloadcap;
++  /* lc_dgram_peeks is quic-go's peekTimes: how many packets in a row
++     have passed over the DATAGRAM at the head of the queue
++     (vendor/quic-go/packet_packer.go:736-761). */
++  size_t lc_dgram_peeks;
+   /* idle_ts is the time instant when idle timer started. */
+   ngtcp2_tstamp idle_ts;
+   /* handshake_confirmed_ts is the time instant when handshake is
+diff --git a/lib/ngtcp2_pkt.c b/lib/ngtcp2_pkt.c
+index 67240c0..f219cc7 100644
+--- a/lib/ngtcp2_pkt.c
++++ b/lib/ngtcp2_pkt.c
+@@ -1571,7 +1571,8 @@ ngtcp2_ssize ngtcp2_pkt_encode_frame(uint8_t *out, size_t outlen,
+ ngtcp2_ssize ngtcp2_pkt_encode_stream_frame(uint8_t *out, size_t outlen,
+                                             ngtcp2_stream *fr) {
+   size_t len = 1;
+-  uint8_t flags = NGTCP2_STREAM_LEN_BIT;
++  int nolen = (fr->flags & NGTCP2_STREAM_LC_NOLEN_BIT) != 0;
++  uint8_t flags = nolen ? 0 : NGTCP2_STREAM_LEN_BIT;
+   uint8_t *p;
+   size_t i;
+   size_t datalen = 0;
+@@ -1591,7 +1592,9 @@ ngtcp2_ssize ngtcp2_pkt_encode_stream_frame(uint8_t *out, size_t outlen,
+     datalen += fr->data[i].len;
+   }
+ 
+-  len += ngtcp2_put_uvarintlen(datalen);
++  if (!nolen) {
++    len += ngtcp2_put_uvarintlen(datalen);
++  }
+   len += datalen;
+ 
+   if (outlen < len) {
+@@ -1610,7 +1613,9 @@ ngtcp2_ssize ngtcp2_pkt_encode_stream_frame(uint8_t *out, size_t outlen,
+     p = ngtcp2_put_uvarint(p, fr->offset);
+   }
+ 
+-  p = ngtcp2_put_uvarint(p, datalen);
++  if (!nolen) {
++    p = ngtcp2_put_uvarint(p, datalen);
++  }
+ 
+   for (i = 0; i < fr->datacnt; ++i) {
+     assert(fr->data[i].len);
+diff --git a/lib/ngtcp2_pkt.h b/lib/ngtcp2_pkt.h
+index 3f6b679..ff5973a 100644
+--- a/lib/ngtcp2_pkt.h
++++ b/lib/ngtcp2_pkt.h
+@@ -55,6 +55,12 @@
+ /* STREAM frame specific macros */
+ #define NGTCP2_STREAM_FIN_BIT 0x01U
+ #define NGTCP2_STREAM_LEN_BIT 0x02U
++/* NGTCP2_STREAM_LC_NOLEN_BIT, set in ngtcp2_stream.flags before encoding,
++   asks ngtcp2_pkt_encode_stream_frame for a frame without the Length
++   field: the last STREAM frame of a packet, as quic-go writes it
++   (framer.go:222-229).  The encoder clears it, so that a frame encoded
++   again later carries its length. */
++#define NGTCP2_STREAM_LC_NOLEN_BIT 0x80U
+ #define NGTCP2_STREAM_OFF_BIT 0x04U
+ 
+ /* NGTCP2_MIN_QUIC_PKTLEN is the minimum length of a valid QUIC
+diff --git a/lib/ngtcp2_ppe.c b/lib/ngtcp2_ppe.c
+index c793feb..a2e5fce 100644
+--- a/lib/ngtcp2_ppe.c
++++ b/lib/ngtcp2_ppe.c
+@@ -42,6 +42,7 @@ void ngtcp2_ppe_init(ngtcp2_ppe *ppe, uint8_t *out, size_t outlen,
+   ppe->pkt_numlen = 0;
+   ppe->pkt_num = 0;
+   ppe->cc = cc;
++  ppe->lc_nspans = 0;
+ }
+ 
+ /*
+@@ -103,7 +104,8 @@ int ngtcp2_ppe_encode_frame(ngtcp2_ppe *ppe, ngtcp2_frame *fr) {
+   size_t buf_left = ngtcp2_buf_left(buf);
+   ngtcp2_crypto_cc *cc = ppe->cc;
+ 
+-  if (buf_left <= cc->aead.max_overhead) {
++  if (buf_left <= cc->aead.max_overhead ||
++      ppe->lc_nspans == NGTCP2_PPE_LC_MAX_SPANS) {
+     return NGTCP2_ERR_NOBUF;
+   }
+ 
+@@ -112,6 +114,11 @@ int ngtcp2_ppe_encode_frame(ngtcp2_ppe *ppe, ngtcp2_frame *fr) {
+     return (int)rv;
+   }
+ 
++  ppe->lc_spans[ppe->lc_nspans].off = (uint16_t)(buf->last - buf->begin);
++  ppe->lc_spans[ppe->lc_nspans].len = (uint16_t)rv;
++  ppe->lc_spans[ppe->lc_nspans].type = (uint16_t)fr->hd.type;
++  ++ppe->lc_nspans;
++
+   buf->last += rv;
+ 
+   return 0;
+diff --git a/lib/ngtcp2_ppe.h b/lib/ngtcp2_ppe.h
+index ba9edc6..d7d3c9b 100644
+--- a/lib/ngtcp2_ppe.h
++++ b/lib/ngtcp2_ppe.h
+@@ -38,6 +38,8 @@
+ /*
+  * ngtcp2_ppe is the QUIC Packet Encoder.
+  */
++#define NGTCP2_PPE_LC_MAX_SPANS 1024
++
+ typedef struct ngtcp2_ppe {
+   /* buf is the buffer where a QUIC packet is written. */
+   ngtcp2_buf buf;
+@@ -61,6 +63,18 @@ typedef struct ngtcp2_ppe {
+   /* nonce is the buffer to store nonce.  It should be equal or longer
+      than the length of IV. */
+   uint8_t nonce[32];
++  /* lc_spans records where each frame went and of what type, in the
++     order written, so that a 1-RTT payload can be laid out as quic-go
++     lays it out before it is sealed (ngtcp2_conn.c,
++     conn_lc_quicgo_payload).  A frame is at least 2 bytes but for one
++     PING, so NGTCP2_PPE_LC_MAX_SPANS frames fill 2046 bytes, more than
++     any packet this client writes. */
++  struct {
++    uint16_t off;
++    uint16_t len;
++    uint16_t type;
++  } lc_spans[NGTCP2_PPE_LC_MAX_SPANS];
++  size_t lc_nspans;
+ } ngtcp2_ppe;
+ 
+ /*

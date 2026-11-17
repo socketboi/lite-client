@@ -1,0 +1,96 @@
+The 1-RTT keys a packet from the peer is opened with, for reading.
+
+Nothing here changes what the library does. It lets the client open the node's next packets ahead
+of ngtcp2_conn_read_pkt — Salamander off, header protection off, the AEAD opened — on other cores,
+with the key, IV and packet number the library will itself use, which it could not see before:
+the key's IV and the largest packet number received live inside the connection. The decrypt and
+hp_mask callbacks then answer from what was computed when, and only when, every input they are
+called with is the one the computation had (src/quic/rxopen.c); otherwise they compute as always.
+So what the library decides, and everything on the wire, is unchanged.
+
+quic-go opens a packet in the connection's own goroutine (vendor/quic-go/connection.go, handlePacket
+→ unpacker.UnpackShortHeader), so this is not the reference's arrangement: it is the maintainer's
+decision of 2026-09-29, to use the cores an MT7621 leaves idle while one of them holds a Hysteria2
+download (CONCURRENCY.md).
+
+diff -Naur a/lib/includes/ngtcp2/ngtcp2.h b/lib/includes/ngtcp2/ngtcp2.h
+--- a/lib/includes/ngtcp2/ngtcp2.h
++++ b/lib/includes/ngtcp2/ngtcp2.h
+@@ -6618,6 +6618,42 @@
+ NGTCP2_EXTERN void ngtcp2_ccerr_default(ngtcp2_ccerr *ccerr);
+ 
+ /**
++ * @struct
++ *
++ * :type:`ngtcp2_rx1rtt_keys` is what a 1-RTT packet from the peer is
++ * opened with at this moment, as `conn_recv_pkt` finds it for a short
++ * header whose Key Phase bit has not changed: the key, its IV and its
++ * phase, the header protection context, the largest packet number
++ * received so far, against which a truncated one is decoded, and the
++ * length of the Destination Connection ID a short header carries.
++ * The pointers point into |conn| and are good until the next call
++ * into it.
++ */
++typedef struct ngtcp2_rx1rtt_keys {
++  const ngtcp2_crypto_aead_ctx *aead_ctx;
++  const ngtcp2_crypto_cipher_ctx *hp_ctx;
++  const uint8_t *iv;
++  size_t ivlen;
++  int key_phase;
++  int64_t max_pkt_num;
++  size_t dcidlen;
++} ngtcp2_rx1rtt_keys;
++
++/**
++ * @function
++ *
++ * `ngtcp2_conn_get_rx1rtt_keys` fills |keys| as
++ * :type:`ngtcp2_rx1rtt_keys` describes, and returns 0; before the
++ * 1-RTT keys are installed it returns -1 and leaves |keys| untouched.
++ * It changes nothing: it only lets a caller open the peer's next
++ * packets ahead of `ngtcp2_conn_read_pkt`, with the same key and the
++ * same packet number the library will use, so that the decrypt and
++ * hp_mask callbacks can answer with what was computed.
++ */
++NGTCP2_EXTERN int ngtcp2_conn_get_rx1rtt_keys(const ngtcp2_conn *conn,
++                                              ngtcp2_rx1rtt_keys *keys);
++
++/**
+  * @function
+  *
+  * `ngtcp2_conn_get_qgo_ccerr` fills |ccerr| with the transport error a
+diff -Naur a/lib/ngtcp2_conn.c b/lib/ngtcp2_conn.c
+--- a/lib/ngtcp2_conn.c
++++ b/lib/ngtcp2_conn.c
+@@ -124,6 +124,31 @@
+   return liberr;
+ }
+ 
++int ngtcp2_conn_get_rx1rtt_keys(const ngtcp2_conn *conn,
++                                ngtcp2_rx1rtt_keys *keys) {
++  const ngtcp2_pktns *pktns = &conn->pktns;
++  const ngtcp2_crypto_km *ckm = pktns->crypto.rx.ckm;
++
++  if (!ckm || !pktns->crypto.rx.hp_ctx.native_handle) {
++    return -1;
++  }
++
++  /* What conn_recv_pkt takes for a short header when
++     conn_key_phase_changed is false: pktns->crypto.rx.ckm and
++     pktns->crypto.rx.hp_ctx, the packet number adjusted against
++     pktns->acktr.max_pkt_num, and a short header decoded with
++     conn->oscid.datalen. */
++  keys->aead_ctx = &ckm->aead_ctx;
++  keys->hp_ctx = &pktns->crypto.rx.hp_ctx;
++  keys->iv = ckm->iv.base;
++  keys->ivlen = ckm->iv.len;
++  keys->key_phase = (ckm->flags & NGTCP2_CRYPTO_KM_FLAG_KEY_PHASE_ONE) != 0;
++  keys->max_pkt_num = pktns->acktr.max_pkt_num;
++  keys->dcidlen = conn->oscid.datalen;
++
++  return 0;
++}
++
+ int ngtcp2_conn_get_qgo_ccerr(const ngtcp2_conn *conn, ngtcp2_ccerr *ccerr) {
+   if (!conn->qgo_close.set) {
+     return 0;

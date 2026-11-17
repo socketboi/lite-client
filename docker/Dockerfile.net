@@ -1,0 +1,42 @@
+# The machine the TRANSPARENT path can be exercised on.
+#
+# lc-build:local is the machine `make check` runs on, and it is deliberately lean: formats, parsers,
+# vectors. None of that needs a routing table. But the part of this client that no test touches at
+# all is the one that decides whether a household has an internet connection — tproxy, the mark, the
+# reply socket bound to the address the client was talking to — and it has only ever been run on a
+# router or in a netns on a test server. Locally there was nothing: no `ip`, no `nft`.
+#
+# That gap is not academic. The UDP session model here is the reference's — one xudp stream per
+# client carrying every destination, saying which is which in each frame
+# (vendor/Xray-core/common/xudp/xudp.go:117-121), with a reply socket per destination (lc-tunnel,
+# "THE DESTINATIONS THIS ONE SESSION CARRIES") — and that reply path and the
+# socket lifetimes are what nothing local could run before this image.
+#
+#   docker build -t lc-net:local -f docker/Dockerfile.net .
+#
+# Run it privileged and with its own network namespace; tproxy needs the mangle table and
+# IP_TRANSPARENT, and neither is reachable from an ordinary container:
+#
+#   docker run --rm --privileged --network none -v "$PWD:/w" -w /w lc-net:local sh test/…
+#
+# ⚠️ AND IT WILL NOT WORK ON A WINDOWS WORKSTATION, which is measured rather than assumed. Docker
+# Desktop runs on the WSL2 kernel — 5.15.153.1-microsoft-standard-WSL2 at the time of writing — and
+# that kernel ships no loadable modules at all (`/lib/modules` does not exist, there is no
+# `modprobe`) and no nft_tproxy built in. The routing half succeeds and is misleading: `ip rule add
+# fwmark 1 lookup 100` returns cleanly, and only the nftables rule fails, with
+#
+#   Error: Could not process rule: No such file or directory
+#       ip protocol udp meta mark set 1 tproxy to 127.0.0.1:19998 accept
+#
+# which reads as a syntax problem and is a missing kernel feature. On a real Linux host — a node, or
+# a Linux workstation — the same commands work; that is where this image is for.
+FROM lc-build:local
+
+# iproute2 for the routing rule and the table the mark points at; nftables for the mangle chain that
+# does the TPROXY. Both are what the router itself uses, which is the point — a stand that exercises
+# a different mechanism than the device would prove something about the stand.
+#
+# --no-install-recommends, because the recommends of iproute2 pull in a quarter of a desktop.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends iproute2 nftables iputils-ping \
+    && rm -rf /var/lib/apt/lists/*

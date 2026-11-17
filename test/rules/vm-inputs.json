@@ -1,0 +1,17 @@
+{
+  "release": "25.12.5",
+  "kernel": "6.12.94",
+  "target_base": "https://downloads.openwrt.org/releases/25.12.5/targets/x86/64/",
+  "package_base": "https://downloads.openwrt.org/releases/25.12.5/packages/x86_64/base/",
+  "files": [
+    {"name":"openwrt-25.12.5-x86-64-generic-kernel.bin","location":"target","role":"kernel","sha256":"e440f082d59550072b1421f10d1a83449c6a4cf356eea5bfa9ac1306978d649b"},
+    {"name":"openwrt-25.12.5-x86-64-generic-targz-rootfs.tar.gz","location":"target","role":"rootfs","sha256":"4f191a9684949b15db02bb1ccdacaa8192ffb4598ce92e70b5337ca50df7912a"},
+    {"name":"kmod-nf-socket-6.12.94-r1.apk","location":"target","path":"kmods/6.12.94-1-a7bc15f451f9652701ba04af9cfb0b95/","role":"addon","sha256":"c5afd23633480f33f940c4bac28cd46e4dd9a066543e8d50fbd38fdb5a72bfbb"},
+    {"name":"kmod-nf-tproxy-6.12.94-r1.apk","location":"target","path":"kmods/6.12.94-1-a7bc15f451f9652701ba04af9cfb0b95/","role":"addon","sha256":"4957d7646295e4160134657f937339517fc8bc04a5eafbbbfd07c4093152c13c"},
+    {"name":"kmod-nft-socket-6.12.94-r1.apk","location":"target","path":"kmods/6.12.94-1-a7bc15f451f9652701ba04af9cfb0b95/","role":"addon","sha256":"6fd0d348e386d1f232ff12732e991076ff81de787f1685754047bd2ab6d78193"},
+    {"name":"kmod-nft-tproxy-6.12.94-r1.apk","location":"target","path":"kmods/6.12.94-1-a7bc15f451f9652701ba04af9cfb0b95/","role":"addon","sha256":"0e787ee2f382cdc4bba3aa685ed18ca043d8dfad5a539e066a53a906c74ea789"},
+    {"name":"ip-full-6.18.0-r2.apk","location":"package","role":"addon","sha256":"ccb056ae416635ceeedec2bf1d137c1b9a181069f818e0f1404547e8e16ad22d"},
+    {"name":"libbpf1-1.6.2-r1.apk","location":"package","role":"addon","sha256":"60511f7f251599c0c27246aaa3c2cc46f267d52dd76070195eb9f707124f1699"},
+    {"name":"libelf1-0.192-r1.apk","location":"package","role":"addon","sha256":"aa3a66998ddc4f306a27c4aff6387726cb834c45a572bad1cf2ff24dc6722d24"}
+  ]
+}

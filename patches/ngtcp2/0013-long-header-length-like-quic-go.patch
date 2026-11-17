@@ -1,0 +1,101 @@
+The Length field of a long header in two bytes, as quic-go writes it.
+
+quic-go encodes Length with a fixed two-byte varint — `quicvarint.AppendWithLen(b,
+uint64(h.Length), 2)` (vendor/quic-go/internal/wire/extended_header.go:109) — on every Initial,
+0-RTT and Handshake packet, whether or not the client parrots Chrome. Upstream ngtcp2 writes the
+same field in four bytes (NGTCP2_PKT_LENGTHLEN), fills it once the payload is known, and so leaves a
+packet two bytes longer and with a different second byte in its length, readable by anyone who
+derives the Initial keys from the connection ID in the clear. Measured on tools/vendorcap/qstand:
+the reference's Initial header was 19 bytes for an 8-byte DCID and an empty SCID, ours 2 more.
+
+Two bytes hold up to 16383, and a long-header packet is never larger than a datagram this client
+sends, so the field is written with a new ngtcp2_put_uvarint14 in the two places it was written
+with ngtcp2_put_uvarint30. Reading is unchanged: a varint of any width is decoded as before.
+
+Applies on top of 0012.
+
+diff --git a/lib/ngtcp2_conv.c b/lib/ngtcp2_conv.c
+index 42651cd..adae13a 100644
+--- a/lib/ngtcp2_conv.c
++++ b/lib/ngtcp2_conv.c
+@@ -175,6 +175,17 @@ uint8_t *ngtcp2_put_uvarint30(uint8_t *p, uint32_t n) {
+   return rv;
+ }
+ 
++uint8_t *ngtcp2_put_uvarint14(uint8_t *p, uint16_t n) {
++  uint8_t *rv;
++
++  assert(n < 16384);
++
++  rv = ngtcp2_put_uint16be(p, n);
++  *p |= 0x40U;
++
++  return rv;
++}
++
+ uint8_t *ngtcp2_put_pkt_num(uint8_t *p, int64_t pkt_num, size_t len) {
+   switch (len) {
+   case 1:
+diff --git a/lib/ngtcp2_conv.h b/lib/ngtcp2_conv.h
+index 7e7b9f4..256d96f 100644
+--- a/lib/ngtcp2_conv.h
++++ b/lib/ngtcp2_conv.h
+@@ -144,6 +144,13 @@ uint8_t *ngtcp2_put_uvarint(uint8_t *p, uint64_t n);
+  */
+ uint8_t *ngtcp2_put_uvarint30(uint8_t *p, uint32_t n);
+ 
++/*
++ * ngtcp2_put_uvarint14 writes |n| in |p| as a variable-length integer
++ * of exactly two bytes, and returns the one beyond the last written
++ * position.  |n| must be less than 16384.
++ */
++uint8_t *ngtcp2_put_uvarint14(uint8_t *p, uint16_t n);
++
+ /*
+  * ngtcp2_put_pkt_num encodes |pkt_num| using |len| bytes.  It
+  * returns the one beyond of the last written position.
+diff --git a/lib/ngtcp2_pkt.c b/lib/ngtcp2_pkt.c
+index 1247110..67240c0 100644
+--- a/lib/ngtcp2_pkt.c
++++ b/lib/ngtcp2_pkt.c
+@@ -439,7 +439,7 @@ ngtcp2_ssize ngtcp2_pkt_encode_hd_long(uint8_t *out, size_t outlen,
+   }
+ 
+   if (hd->type != NGTCP2_PKT_RETRY) {
+-    p = ngtcp2_put_uvarint30(p, (uint32_t)hd->len);
++    p = ngtcp2_put_uvarint14(p, (uint16_t)hd->len);
+     p = ngtcp2_put_pkt_num(p, hd->pkt_num, hd->pkt_numlen);
+   }
+ 
+diff --git a/lib/ngtcp2_pkt.h b/lib/ngtcp2_pkt.h
+index 0a893a1..3f6b679 100644
+--- a/lib/ngtcp2_pkt.h
++++ b/lib/ngtcp2_pkt.h
+@@ -104,8 +104,12 @@
+ #define NGTCP2_RETRY_TAGLEN 16
+ 
+ /* NGTCP2_PKT_LENGTHLEN is the number of bytes that is occupied by
+-   Length field in Long packet header. */
+-#define NGTCP2_PKT_LENGTHLEN 4
++   Length field in Long packet header.  Two, as quic-go writes it
++   (quicvarint.AppendWithLen(b, uint64(h.Length), 2),
++   vendor/quic-go/internal/wire/extended_header.go:109); upstream
++   writes four, and the width is in the clear in every Initial and
++   Handshake packet. */
++#define NGTCP2_PKT_LENGTHLEN 2
+ 
+ /* NGTCP2_PKT_TYPE_INITIAL_V1 is Initial long header packet type for
+    QUIC v1. */
+diff --git a/lib/ngtcp2_ppe.c b/lib/ngtcp2_ppe.c
+index 81bc329..c793feb 100644
+--- a/lib/ngtcp2_ppe.c
++++ b/lib/ngtcp2_ppe.c
+@@ -131,7 +131,7 @@ ngtcp2_ssize ngtcp2_ppe_final(ngtcp2_ppe *ppe, const uint8_t **ppkt) {
+   assert(cc->hp_mask);
+ 
+   if (ppe->len_offset) {
+-    ngtcp2_put_uvarint30(
++    ngtcp2_put_uvarint14(
+       buf->begin + ppe->len_offset,
+       (uint16_t)(payloadlen + ppe->pkt_numlen + cc->aead.max_overhead));
+   }

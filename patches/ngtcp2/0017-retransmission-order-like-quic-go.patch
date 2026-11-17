@@ -1,0 +1,90 @@
+Retransmissions in the order quic-go sends them.
+
+quic-go sends every stream's lost data before any stream's new data, and so does ngtcp2 — its
+conn->tx.strmq is drained into each packet before the application's stream data is asked for. What
+differed was the order AMONG streams with something to retransmit:
+
+  - quic-go queues a stream the first time it has lost data, at the back
+    (AddStreamWithRetransmission, vendor/quic-go/framer.go:314-324), and ngtcp2 put it at the head
+    of the current cycle with ties broken by stream ID — lowest first, whatever lost first;
+  - quic-go leaves a stream at the front until it has nothing left to retransmit, carrying it into
+    the next packet (vendor/quic-go/framer.go:142-176), and ngtcp2 moved it behind every other
+    stream after each packet.
+
+Ties now go first in, first out, and a stream keeps its place until its retransmissions are sent.
+Within one stream ngtcp2 still resends lost ranges lowest offset first where quic-go resends them
+in the order they were declared lost; the two differ only for data lost twice.
+
+diff --git a/lib/ngtcp2_conn.c b/lib/ngtcp2_conn.c
+index fbb39d7..a674875 100644
+--- a/lib/ngtcp2_conn.c
++++ b/lib/ngtcp2_conn.c
+@@ -836,7 +836,7 @@ static int cycle_less(const ngtcp2_pq_entry *lhs, const ngtcp2_pq_entry *rhs) {
+   ngtcp2_strm *rs = ngtcp2_struct_of(rhs, ngtcp2_strm, pe);
+ 
+   if (ls->cycle == rs->cycle) {
+-    return ls->stream_id < rs->stream_id;
++    return ls->qseq < rs->qseq;
+   }
+ 
+   return rs->cycle - ls->cycle <= 1;
+@@ -4974,13 +4974,12 @@ static ngtcp2_ssize conn_write_pkt(ngtcp2_conn *conn, ngtcp2_pkt_info *pi,
+           continue;
+         }
+ 
+-        ngtcp2_conn_tx_strmq_pop(conn);
+-        ++strm->cycle;
+-        rv = ngtcp2_conn_tx_strmq_push(conn, strm);
+-        if (rv != 0) {
+-          assert(ngtcp2_err_is_fatal(rv));
+-          return rv;
+-        }
++        /* A stream with more to retransmit keeps its place at the
++           front, and the next frame of it goes in this packet if it
++           fits and in the next one if not: quic-go leaves a stream
++           at the head of its retransmission queue until it has none
++           left (vendor/quic-go/framer.go:142-176).  Upstream moved
++           it behind every other stream once per packet. */
+       }
+     }
+ 
+@@ -14921,6 +14920,8 @@ void ngtcp2_conn_tx_strmq_pop(ngtcp2_conn *conn) {
+ }
+ 
+ int ngtcp2_conn_tx_strmq_push(ngtcp2_conn *conn, ngtcp2_strm *strm) {
++  strm->qseq = ++conn->tx.strmq_seq;
++
+   return ngtcp2_pq_push(&conn->tx.strmq, &strm->pe);
+ }
+ 
+diff --git a/lib/ngtcp2_conn.h b/lib/ngtcp2_conn.h
+index 42a9951..99aed5d 100644
+--- a/lib/ngtcp2_conn.h
++++ b/lib/ngtcp2_conn.h
+@@ -454,6 +454,9 @@ struct ngtcp2_conn {
+   struct {
+     /* strmq contains ngtcp2_strm which has frames to send. */
+     ngtcp2_pq strmq;
++    /* strmq_seq numbers the entries into strmq; see
++       ngtcp2_strm.qseq. */
++    uint64_t strmq_seq;
+     /* offset is the offset the local endpoint has sent to the remote
+        endpoint. */
+     uint64_t offset;
+diff --git a/lib/ngtcp2_strm.h b/lib/ngtcp2_strm.h
+index b8b0a87..92bf910 100644
+--- a/lib/ngtcp2_strm.h
++++ b/lib/ngtcp2_strm.h
+@@ -109,6 +109,12 @@ struct ngtcp2_strm {
+     struct {
+       ngtcp2_pq_entry pe;
+       uint64_t cycle;
++      /* qseq is the order in which the stream last entered
++         conn->tx.strmq, which breaks ties between streams of one
++         cycle: first in, first out, as quic-go's retransmission
++         queue is (vendor/quic-go/framer.go:314-324).  Upstream broke
++         them by stream ID. */
++      uint64_t qseq;
+       ngtcp2_objalloc *frc_objalloc;
+ 
+       struct {

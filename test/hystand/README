@@ -1,0 +1,91 @@
+A live Hysteria2 stand: our client against the REFERENCE server, on one machine, with nothing
+production anywhere near it.
+
+The current local qualification driver is qualify.py; see
+../../docs/HYSTERIA-COMPATIBILITY.md for the pinned 2.13.0 server preparation,
+loopback mixed-load/obfuscation matrix, negative control and standalone evidence
+replay. Its unit tests run in make check. The older Docker orchestration below
+retains its original process names; use a clean, isolated stand when replaying
+it. Reference executables are rebuilt from the current vendor pin on every run.
+
+WHY IT EXISTS. The uplink path in lc-tunnel — the read from the client and what happens to those
+bytes before hy_pump hands them to the QUIC stream — is a seam, and no unit suite in this tree can
+see it: the pieces are all correct on their own, and `make check` proves the program COMPILES with
+the plane and that every format it parses is the reference's. Whether the bytes arrive is a
+different question, and it needs a node. This makes one out of vendor/.
+
+  vendor/hysteria/app   built with the Go in lc-build:local, run as `server`
+  echo/                 an echo target on the SERVER's own loopback, so the only path the bytes
+                        travel that belongs to us is the tunnel
+  load/                 pushes a position-dependent pattern up and checks every byte that returns
+
+The pattern is a function of the offset, so a truncation, a duplicated chunk or a reordering shows
+as a mismatch at a named position instead of as a length that happens to agree.
+
+RUN IT:
+
+    sh test/hystand/run.sh
+
+About two and a half minutes, two containers on the `lcnet` docker network, both removed at the end.
+
+After the bytes, the connection's life, which is the reference's reconnectableClientImpl
+(vendor/hysteria/core/client/reconnect.go): the node is paused, and the client must end the
+connection on its idle timeout, dial nothing while nobody asks, refuse the first request after that
+at once and without dialling — the reference still holds the dead client until a call fails on it —
+make exactly one attempt for the next, failed by the handshake's five seconds of silence, and make
+the connection itself for the first request after the node is back.
+
+Then the node's hysteria is killed with its container still up, so every packet to the port is
+answered with ICMP port unreachable: the connection must live through twenty seconds of that and end
+only on its idle timeout, because the reference's socket is unconnected and never hears of ICMP. And
+last, a client started while the node is paused must exit with status 1 after the handshake's
+silence, never having listened — the reference's "failed to initialize client".
+
+⚠️ AND RUN THE CONTROL, which is the half that gets skipped. A stand that cannot fail reports
+nothing, and this one is easy to leave testing the loopback instead of the tunnel. Break the client
+on purpose and watch it fail — from a copy of the file, not `git checkout`, which also takes any
+uncommitted work with it.
+
+The uplink is read by the reader thread (src/net/reader.c), which reads as much as the queue has
+room for and adds what it got to the queue's length under the stage lock. Lose a byte of every read:
+
+    cp src/net/reader.c /tmp/reader.c.orig
+    sed -i 's|        \*st->len += (size_t)got;|        *st->len += (size_t)got - 1u;|' src/net/reader.c
+    sh test/hystand/run.sh          # must print MISMATCH (2026-09-23: at byte 18692)
+    cp /tmp/reader.c.orig src/net/reader.c
+
+It replaced the two controls written for the loop's own read (`HY_READ_ROUNDS` in
+src/cmd/lc-tunnel/main.c), which the reader thread made dead: their sed matched nothing, the stand
+passed, and a control that changes nothing looks exactly like one that was run.
+
+⚠️ AND THE CONTROL THAT IS NOT HERE, on purpose. The reader stops when the queue is full, and the
+loop wakes it once it has made room (lc_reader_rearm). This stand sees neither half. With the
+reader's own compaction removed every scenario still passes, because the loop compacts the same
+queue under the same lock (hy_feed_up); with the loop's re-arm after hy_feed_up taken out they
+pass too, only slower — 891 Mbit/s round trip against 1166, and 3378 write passes with nothing to
+write against 491 — because the loop re-arms from a second place as well. Both were tried on
+2026-09-23 as the second control and both came back green. That path is held by test/reader
+instead, where nothing else re-arms: a queue of sixteen bytes, filled, drained and re-armed, with
+the no-op re-arm caught as a mutant.
+
+For the lifecycle, four controls, each put in and taken out the same way:
+
+    reconnect while idle: `if (hy.on && !hy.up && hy.pending == 0) (void)hy_connect(loop);` before
+                          the loop's `sessions_expire(loop);`        — must FAIL "connect attempts
+                          in 20 s with no requests"
+    refuse while down:    `if (!hy.up) return -1;` at the top of hy_start — must FAIL "a request
+                          while the node is silent": no attempt, refused at once
+    connected socket:     `(void)connect(fd, (struct sockaddr *)out_addr, *out_len);` after
+                          `c->peer_addr = *out_addr;` in dial_node (src/quic/conn.c) — must FAIL,
+                          and on this stand it does so at start: the client's first Initial
+                          reaches the server's port before hysteria has bound it, and the
+                          connected socket takes that ICMP as "cannot send: Connection refused"
+                          where the reference simply sends the Initial again
+    stay up at start:     drop the `return LC_EXIT_FAILED;` after "failed to initialize client"
+                          in main — must FAIL the last check, with exit 124 from its timeout
+
+NOT PART OF `make check`, deliberately. The gate runs with `--network none` and builds from the tree
+alone; building the reference server needs the Go module cache, which is a volume on the machine
+that has already built it once. Wiring this in would make the gate depend on a download, and a gate
+that fails for a reason that is not the code is a gate people learn to ignore. It is a tool, like
+test/storm, and it is named in the commit that needed it.

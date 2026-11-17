@@ -1,0 +1,980 @@
+A client that parrots Chrome, as hysteria's does unless told not to.
+
+From hysteria 2.11 the reference client parrots Chrome's QUIC stack by default
+(DisableChromeParrot, vendor/hysteria/core/client/client.go:95-103). What that changes above the
+wire — the ClientHello, the transport parameters, the connection IDs, how the handshake is read —
+is src/quic's. What it changes in how packets are laid out is this patch, behind a new setting,
+`chrome_parrot`, which only a client reads:
+
+  - the first Initial packet is numbered 1 (vendor/quic-go/transport.go:265-269); the other two
+    spaces start at 0;
+  - datagrams start at 1250 bytes, chromeInitialPacketSize (vendor/quic-go/chrome_parrot.go:18-19),
+    and the BBR sender is seeded with that — seedPacketSize takes the smaller of what QUIC starts at
+    and 1280 (vendor/hysteria/core/internal/congestion/utils.go:45-59);
+  - the packet number length follows Chrome's rule: the larger of the unacknowledged range and the
+    congestion window in packets, quadrupled, in one, two or four bytes
+    (vendor/quic-go/internal/protocol/packet_number.go:59-84), the window counted in the room the
+    last datagram's Initial left when that is forty bytes or more
+    (vendor/quic-go/internal/ackhandler/sent_packet_handler.go:1014-1039), a record cleared when
+    read keys change (vendor/quic-go/connection.go:2054-2067);
+  - no two encryption levels share a datagram before the handshake is confirmed
+    (noCoalescing, vendor/quic-go/packet_packer.go:185-191, :391-393, :427-429), so an Initial is
+    padded alone and never deferred behind the packets that follow it;
+  - the ACK of the server's Handshake flight goes in a packet of its own and our Finished in the
+    next one, unless what is queued is a retransmission (splitAckFromCrypto,
+    vendor/quic-go/packet_packer.go:193-199, :603-610);
+  - the CRYPTO of an Initial packet is laid out as the parrot lays it out: a ClientHello too large
+    for one packet goes head and tail first (chromeCryptoSplit,
+    vendor/quic-go/packet_packer_chaos.go:38-78), and a padded Initial is chaos protected — CRYPTO
+    cut at random points, two to ten PINGs, the padding in runs, all shuffled, the packet exactly
+    its size (vendor/quic-go/packet_packer_chaos.go:94-274). The SNI scrambling of patch 0005 is
+    quic-go's WITHOUT the parrot and is not applied with it (vendor/quic-go/crypto_stream.go:144-163).
+
+The draws come from the connection's PRNG, seeded from the rand callback as quic-go seeds its
+packer's PCG from crypto/rand, and are unbiased as Go's IntN is.
+
+Applies on top of 0013.
+
+diff --git a/lib/includes/ngtcp2/ngtcp2.h b/lib/includes/ngtcp2/ngtcp2.h
+index f5bc0e7..88e1aea 100644
+--- a/lib/includes/ngtcp2/ngtcp2.h
++++ b/lib/includes/ngtcp2/ngtcp2.h
+@@ -333,6 +333,16 @@ typedef struct ngtcp2_mem {
+  */
+ #define NGTCP2_INITIAL_UDP_PAYLOAD_SIZE 1280
+ 
++/**
++ * @macro
++ *
++ * :macro:`NGTCP2_CHROME_INITIAL_UDP_PAYLOAD_SIZE` is where a client
++ * parroting Chrome starts instead: chromeInitialPacketSize
++ * (`vendor/quic-go/chrome_parrot.go:18-19`), put in place of quic-go's
++ * own by populateConfig (`vendor/quic-go/config.go:121`).
++ */
++#define NGTCP2_CHROME_INITIAL_UDP_PAYLOAD_SIZE 1250
++
+ /**
+  * @macro
+  *
+@@ -2129,6 +2139,17 @@ typedef struct ngtcp2_settings {
+    * .. version-added:: 1.23.0
+    */
+   ngtcp2_log_write log_write;
++  /**
++   * :member:`chrome_parrot`, if set to nonzero, makes a client send the
++   * way hysteria's client does while it parrots Chrome's QUIC stack,
++   * which it does unless told not to (DisableChromeParrot,
++   * vendor/hysteria/core/client/client.go:95-103): the first Initial
++   * packet is numbered 1, datagrams start at 1250 bytes, the packet
++   * number length follows Chrome's rule, no two encryption levels share
++   * a datagram during the handshake, and the ACK of the server's
++   * Handshake flight goes alone.  Not read on a server.
++   */
++  uint8_t chrome_parrot;
+ } ngtcp2_settings;
+ 
+ /**
+diff --git a/lib/ngtcp2_conn.c b/lib/ngtcp2_conn.c
+index de6bd91..0bb9b2e 100644
+--- a/lib/ngtcp2_conn.c
++++ b/lib/ngtcp2_conn.c
+@@ -1411,7 +1411,8 @@ static int conn_new(ngtcp2_conn **pconn, const ngtcp2_cid *dcid,
+        a path at NGTCP2_MAX_UDP_PAYLOAD_SIZE, the 1200 every path must
+        carry. */
+     (*pconn)->dcid.current.max_udp_payload_size =
+-      NGTCP2_INITIAL_UDP_PAYLOAD_SIZE;
++      settings->chrome_parrot ? NGTCP2_CHROME_INITIAL_UDP_PAYLOAD_SIZE
++                              : NGTCP2_INITIAL_UDP_PAYLOAD_SIZE;
+   }
+ 
+   assert((size_t)path->local.addrlen <= sizeof((*pconn)->hs_local_addr));
+@@ -1446,7 +1447,8 @@ static int conn_new(ngtcp2_conn **pconn, const ngtcp2_cid *dcid,
+      * the BBR below: see lib/ngtcp2_hybbr.h. It is the only one here that allocates, so it is
+      * also the only one ngtcp2_conn_del has to free. */
+     ngtcp2_hybbr_init(&(*pconn)->hybbr, &(*pconn)->log, &(*pconn)->cstat,
+-                      settings->initial_ts, &(*pconn)->pcg, mem);
++                      settings->initial_ts, &(*pconn)->pcg, mem,
++                      (*pconn)->dcid.current.max_udp_payload_size);
+ 
+     break;
+   case NGTCP2_CC_ALGO_BBR:
+@@ -1465,8 +1467,13 @@ static int conn_new(ngtcp2_conn **pconn, const ngtcp2_cid *dcid,
+ 
+   (*pconn)->callbacks = *callbacks;
+ 
++  /* A client parroting Chrome numbers its first Initial packet 1, not
++     0 (vendor/quic-go/transport.go:265-269); the other two spaces
++     start where they always do. */
+   rv = pktns_new(&(*pconn)->in_pktns, NGTCP2_PKTNS_ID_INITIAL, &(*pconn)->rst,
+-                 &(*pconn)->cc, settings->initial_pkt_num, &(*pconn)->log,
++                 &(*pconn)->cc,
++                 !server && settings->chrome_parrot ? 1 : settings->initial_pkt_num,
++                 &(*pconn)->log,
+                  &(*pconn)->qlog, &(*pconn)->rtb_entry_objalloc,
+                  &(*pconn)->frc_objalloc, mem);
+   if (rv != 0) {
+@@ -1654,7 +1661,11 @@ int ngtcp2_conn_client_new_versioned(
+   (*pconn)->state = NGTCP2_CS_CLIENT_INITIAL;
+   (*pconn)->local.bidi.next_stream_id = 0;
+   (*pconn)->local.uni.next_stream_id = 2;
+-  (*pconn)->flags |= NGTCP2_CONN_FLAG_SCRAMBLE_INITIAL_CRYPTO;
++  /* Not under the parrot, which lays out its Initial CRYPTO its own
++     way: see conn_chrome_initial_crypto. */
++  if (!settings->chrome_parrot) {
++    (*pconn)->flags |= NGTCP2_CONN_FLAG_SCRAMBLE_INITIAL_CRYPTO;
++  }
+ 
+   rv = ngtcp2_conn_commit_local_transport_params(*pconn);
+   if (rv != 0) {
+@@ -1990,6 +2001,35 @@ static size_t pktns_select_pkt_numlen(const ngtcp2_conn *conn,
+   const ngtcp2_rtb *rtb = &pktns->rtb;
+   int64_t n = pkt_num - rtb->largest_acked_tx_pkt_num;
+ 
++  if (!conn->server && conn->local.settings.chrome_parrot) {
++    /* A client parroting Chrome sizes the number Chrome's way: the
++       larger of the unacknowledged range and the congestion window in
++       packets, quadrupled, in the shortest of one, two or four bytes
++       that holds it — never three
++       (PacketNumberLengthForHeaderChrome,
++       vendor/quic-go/internal/protocol/packet_number.go:59-84).  The
++       window is counted in the room the last datagram left when that
++       was at least forty bytes, and in the datagram size otherwise
++       (packetNumberSizingUnit and PeekPacketNumber,
++       vendor/quic-go/internal/ackhandler/sent_packet_handler.go:
++       1014-1039); see chrome_last_dgram_padding. */
++    uint64_t unit = conn->tx.chrome_last_dgram_padding >= 40
++                      ? conn->tx.chrome_last_dgram_padding
++                      : conn->dcid.current.max_udp_payload_size;
++    int64_t cwnd_pkts = unit ? (int64_t)(conn->cstat.cwnd / unit) : 0;
++    int64_t delta = ngtcp2_max(n, cwnd_pkts);
++
++    if (delta < (1 << 8) / 4) {
++      return 1;
++    }
++
++    if (delta < (1 << 16) / 4) {
++      return 2;
++    }
++
++    return 4;
++  }
++
+   if (!conn->server) {
+     /* quic-go never encodes a packet number in one byte — "it never
+        chooses a PacketNumberLen of 1 byte, since this is too short
+@@ -2169,6 +2209,12 @@ static int conn_should_pad_pkt(const ngtcp2_conn *conn, uint8_t type,
+       } else {
+         return 1;
+       }
++    } else if (conn->local.settings.chrome_parrot) {
++      /* Under the parrot nothing follows an Initial packet in its
++         datagram, so it is padded whatever it carries: a client's
++         Initial is always given `maxPacketSize - currentSize`
++         (initialPaddingLen, vendor/quic-go/packet_packer.go:347-356). */
++      return 1;
+     } else {
+       if (require_padding) {
+         /* A client's Initial packet leads the datagram and carries the
+@@ -2599,6 +2645,505 @@ static size_t conn_dgram_padding(const ngtcp2_conn *conn, ngtcp2_ppe *ppe) {
+ 
+ static size_t conn_min_pktlen(const ngtcp2_conn *conn);
+ 
++/* ---- the Initial packet of a client parroting Chrome ------------------- */
++
++/* chrome_rand_n draws uniformly from [0, n), rejecting as Go's IntN
++   does (math/rand/v2, Lemire's method), from the connection's PRNG,
++   which is seeded from the rand callback as quic-go's packer seeds its
++   PCG from crypto/rand (vendor/quic-go/packet_packer.go:176-180). */
++static uint32_t chrome_rand_n(ngtcp2_conn *conn, uint32_t n) {
++  uint64_t m = (uint64_t)ngtcp2_pcg32_rand(&conn->pcg) * n;
++  uint32_t lo = (uint32_t)m;
++
++  if (lo < n) {
++    uint32_t thresh = (uint32_t)(-n) % n;
++
++    while (lo < thresh) {
++      m = (uint64_t)ngtcp2_pcg32_rand(&conn->pcg) * n;
++      lo = (uint32_t)m;
++    }
++  }
++
++  return (uint32_t)(m >> 32);
++}
++
++/* cryptoFrameHeaderLen (vendor/quic-go/packet_packer_chaos.go:80-85). */
++static uint64_t chrome_crypto_hdlen(uint64_t offset, uint64_t datalen) {
++  return 1 + ngtcp2_put_uvarintlen(offset) + ngtcp2_put_uvarintlen(datalen);
++}
++
++/*
++ * chrome_crypto_split is chromeCryptoSplit
++ * (vendor/quic-go/packet_packer_chaos.go:38-78): for a ClientHello too
++ * large for one Initial packet, the length of the leading frame and of
++ * the trailing one, both of which the first packet carries; zero for
++ * both when no split is due.
++ */
++static void chrome_crypto_split(ngtcp2_conn *conn, uint64_t pending,
++                                uint64_t offset, uint64_t available,
++                                uint64_t *pfirst, uint64_t *plast) {
++  uint64_t min_frame, max_first, max_other, occupied, npkts, data_other;
++  uint64_t data_first, first;
++
++  *pfirst = *plast = 0;
++
++  if (pending == 0 || available == 0) {
++    return;
++  }
++
++  min_frame = chrome_crypto_hdlen(offset + pending - 1, pending);
++  if (available < 2 * min_frame) {
++    return;
++  }
++
++  max_first = available - 2 * min_frame;
++  max_other = available - min_frame;
++  if (pending <= max_first) {
++    return;
++  }
++
++  occupied = max_other - max_first;
++  npkts = (pending + occupied + max_other - 1) / max_other;
++  data_other = (pending + occupied + npkts - 1) / npkts;
++  if (data_other < occupied) {
++    return;
++  }
++
++  data_first = data_other - occupied;
++  first = 55 + chrome_rand_n(conn, 32);
++  if (pending <= first || data_first <= first) {
++    return;
++  }
++
++  *pfirst = first;
++  *plast = data_first - first;
++}
++
++/*
++ * chrome_vec_slice copies into |dst| the vectors that cover bytes
++ * [|from|, |to|) of the data |src| describes, and returns how many it
++ * wrote, or 0 when they do not fit |maxcnt|.
++ */
++static size_t chrome_vec_slice(ngtcp2_vec *dst, size_t maxcnt,
++                               const ngtcp2_vec *src, size_t srccnt,
++                               uint64_t from, uint64_t to) {
++  size_t i, n = 0;
++  uint64_t pos = 0, a, b;
++
++  for (i = 0; i < srccnt && pos < to; pos += src[i].len, ++i) {
++    if (pos + src[i].len <= from) {
++      continue;
++    }
++
++    a = from > pos ? from - pos : 0;
++    b = ngtcp2_min(to - pos, (uint64_t)src[i].len);
++
++    if (n == maxcnt) {
++      return 0;
++    }
++
++    dst[n].base = src[i].base + a;
++    dst[n].len = (size_t)(b - a);
++    ++n;
++  }
++
++  return n;
++}
++
++/*
++ * chrome_crypto_chain makes a CRYPTO frame chain for bytes [|from|,
++ * |to|) of |fr|.
++ */
++static int chrome_crypto_chain(ngtcp2_conn *conn, ngtcp2_frame_chain **pfrc,
++                               const ngtcp2_stream *fr, uint64_t from,
++                               uint64_t to) {
++  ngtcp2_vec v[NGTCP2_MAX_STREAM_DATACNT];
++  size_t n = chrome_vec_slice(v, NGTCP2_MAX_STREAM_DATACNT, fr->data,
++                              fr->datacnt, from, to);
++  ngtcp2_stream *nfr;
++  int rv;
++
++  if (n == 0) {
++    return NGTCP2_ERR_NOMEM;
++  }
++
++  rv = ngtcp2_frame_chain_stream_datacnt_objalloc_new(pfrc, n,
++                                                      &conn->frc_objalloc,
++                                                      conn->mem);
++  if (rv != 0) {
++    return rv;
++  }
++
++  nfr = &(*pfrc)->fr.stream;
++  nfr->type = NGTCP2_FRAME_CRYPTO;
++  nfr->flags = 0;
++  nfr->fin = 0;
++  nfr->stream_id = 0;
++  nfr->offset = fr->offset + from;
++  nfr->datacnt = n;
++  ngtcp2_vec_copy(nfr->data, v, n);
++
++  return 0;
++}
++
++/* The most CRYPTO frames one Initial packet carries under the parrot:
++   what it is packed with, and up to ten cuts of them. */
++#define NGTCP2_CHROME_MAX_CRYPTO 32
++
++/* One element of the shuffled payload (chaosItem,
++   vendor/quic-go/packet_packer_chaos.go:87-92): a CRYPTO piece, a
++   PING, or a run of padding. */
++/* The vectors one piece may span.  CRYPTO in an Initial packet is one
++   or two submitted buffers; a frame spanning more is written without
++   being cut. */
++#define NGTCP2_CHROME_ITEM_DATACNT 8
++
++typedef struct ngtcp2_chrome_item {
++  int kind; /* 0 CRYPTO piece, 1 PING, 2 padding */
++  uint64_t offset;
++  size_t datacnt;
++  ngtcp2_vec data[NGTCP2_CHROME_ITEM_DATACNT];
++  size_t padlen;
++} ngtcp2_chrome_item;
++
++/*
++ * conn_chrome_initial_crypto packs and writes the CRYPTO of one Initial
++ * packet the way hysteria's client does while it parrots Chrome.
++ *
++ * Packing: the first packet of a ClientHello too large for one carries
++ * its head and its tail (chromeCryptoSplit, with the pops at
++ * vendor/quic-go/packet_packer.go:625-646), the middle left in the
++ * queue for the packets after it; any other packet takes CRYPTO frames
++ * in offset order while they fit (:647-657).
++ *
++ * Writing: when the packet is to be padded, the payload is chaos
++ * protected (appendChaosProtectedPayload,
++ * vendor/quic-go/packet_packer_chaos.go:94-165, entered at
++ * packet_packer.go:976-977): the CRYPTO frames cut at random points,
++ * two to ten PINGs, the padding in runs, all of it shuffled, the
++ * packet exactly the size it would have been.  Without padding the
++ * frames are shuffled and written (appendPacketPayload, :1054-1080).
++ *
++ * The frames written are pieces; what goes to loss recovery through
++ * |*pfrc| is the frames as packed, as quic-go hands its ackhandler the
++ * unshredded ones.  |*ppadding| receives the padding the packet
++ * carried, or (size_t)-1 when it wrote none and the caller pads.
++ * Returns the number of frames packed, or a negative error.
++ */
++static ngtcp2_ssize conn_chrome_initial_crypto(ngtcp2_conn *conn,
++                                               ngtcp2_ppe *ppe,
++                                               ngtcp2_pkt_hd *hd,
++                                               int *phd_logged,
++                                               ngtcp2_pktns *pktns,
++                                               ngtcp2_frame_chain **pfrc,
++                                               size_t *ppadding) {
++  ngtcp2_strm *strm = &pktns->crypto.strm;
++  ngtcp2_frame_chain *frames[NGTCP2_CHROME_MAX_CRYPTO];
++  ngtcp2_frame_chain *frc, *rest, *mid, *tail, **pnext;
++  ngtcp2_chrome_item items[NGTCP2_CHROME_MAX_CRYPTO * 2 + 16];
++  int cuttable = 1;
++  size_t nframes = 0, nitems = 0, npieces, i, j;
++  uint64_t left = ngtcp2_ppe_left(ppe), pending = 0, first, last, datalen;
++  uint64_t payloadlen = 0, budget, lo, hi, max_overhead, attempts, npings;
++  uint64_t crypto_offset, cut, restlen, target;
++  ngtcp2_ksl_it it;
++  ngtcp2_frame fr;
++  ngtcp2_chrome_item t;
++  int rv;
++
++  *pfrc = NULL;
++  *ppadding = 0;
++
++  /* The split, for a ClientHello none of which has been sent. */
++  if (pktns->crypto.tx.chrome_sent_end == 0 &&
++      !ngtcp2_strm_streamfrq_empty(strm) &&
++      ngtcp2_strm_streamfrq_unacked_offset(strm) == 0) {
++    for (it = ngtcp2_ksl_begin(strm->tx.streamfrq); !ngtcp2_ksl_it_end(&it);
++         ngtcp2_ksl_it_next(&it)) {
++      frc = ngtcp2_ksl_it_get(&it);
++      pending += ngtcp2_vec_len(frc->fr.stream.data, frc->fr.stream.datacnt);
++    }
++
++    chrome_crypto_split(conn, pending, 0, left, &first, &last);
++
++    if (first) {
++      rv = ngtcp2_strm_streamfrq_pop(strm, &frc, (size_t)first);
++      if (rv != 0) {
++        return rv;
++      }
++      rv = ngtcp2_strm_streamfrq_pop(strm, &rest, (size_t)(pending - first));
++      if (rv != 0) {
++        ngtcp2_frame_chain_objalloc_del(frc, &conn->frc_objalloc, conn->mem);
++        return rv;
++      }
++
++      restlen = rest ? ngtcp2_vec_len(rest->fr.stream.data,
++                                      rest->fr.stream.datacnt)
++                     : 0;
++      if (restlen != pending - first) {
++        /* The queue was not one run of bytes after all: put back what
++           was taken, and pack in order. */
++        if (rest) {
++          ngtcp2_strm_streamfrq_push(strm, rest);
++        }
++        ngtcp2_strm_streamfrq_push(strm, frc);
++      } else {
++        rv = chrome_crypto_chain(conn, &mid, &rest->fr.stream, 0,
++                                 restlen - last);
++        if (rv == 0) {
++          rv = chrome_crypto_chain(conn, &tail, &rest->fr.stream,
++                                   restlen - last, restlen);
++          if (rv != 0) {
++            ngtcp2_frame_chain_objalloc_del(mid, &conn->frc_objalloc,
++                                            conn->mem);
++          }
++        }
++        ngtcp2_frame_chain_objalloc_del(rest, &conn->frc_objalloc,
++                                        conn->mem);
++        if (rv != 0) {
++          ngtcp2_frame_chain_objalloc_del(frc, &conn->frc_objalloc,
++                                          conn->mem);
++          return rv;
++        }
++
++        rv = ngtcp2_strm_streamfrq_push(strm, mid);
++        if (rv != 0) {
++          ngtcp2_frame_chain_objalloc_del(mid, &conn->frc_objalloc,
++                                          conn->mem);
++          ngtcp2_frame_chain_objalloc_del(tail, &conn->frc_objalloc,
++                                          conn->mem);
++          ngtcp2_frame_chain_objalloc_del(frc, &conn->frc_objalloc,
++                                          conn->mem);
++          return rv;
++        }
++
++        /* Head, then tail: the order quic-go appends them in. */
++        frames[nframes++] = frc;
++        frames[nframes++] = tail;
++      }
++    }
++  }
++
++  /* Otherwise in offset order, while they fit. */
++  if (nframes == 0) {
++    for (; nframes < NGTCP2_CHROME_MAX_CRYPTO &&
++           !ngtcp2_strm_streamfrq_empty(strm);) {
++      crypto_offset = ngtcp2_strm_streamfrq_unacked_offset(strm);
++      if (crypto_offset == (uint64_t)-1) {
++        ngtcp2_strm_streamfrq_clear(strm);
++        break;
++      }
++
++      datalen = ngtcp2_pkt_crypto_max_datalen(crypto_offset, (size_t)left,
++                                              (size_t)left);
++      if (datalen == (size_t)-1) {
++        break;
++      }
++
++      rv = ngtcp2_strm_streamfrq_pop(strm, &frc, (size_t)datalen);
++      if (rv != 0) {
++        assert(ngtcp2_err_is_fatal(rv));
++        goto fail;
++      }
++      if (frc == NULL) {
++        break;
++      }
++
++      frames[nframes++] = frc;
++      datalen = ngtcp2_vec_len(frc->fr.stream.data, frc->fr.stream.datacnt);
++      left -= chrome_crypto_hdlen(frc->fr.stream.offset, datalen) + datalen;
++    }
++  }
++
++  if (nframes == 0) {
++    return 0;
++  }
++
++  for (i = 0; i < nframes; ++i) {
++    datalen = ngtcp2_vec_len(frames[i]->fr.stream.data,
++                             frames[i]->fr.stream.datacnt);
++    payloadlen += chrome_crypto_hdlen(frames[i]->fr.stream.offset, datalen) +
++                  datalen;
++  }
++
++  /* initialPaddingLen: what brings the datagram, this packet alone in
++     it, to the size this endpoint sends at (packet_packer.go:347-356). */
++  if (conn->local.settings.no_tx_udp_payload_size_shaping) {
++    target = conn->local.settings.max_tx_udp_payload_size;
++  } else {
++    target = ngtcp2_min(conn->local.settings.max_tx_udp_payload_size,
++                        conn->dcid.current.max_udp_payload_size);
++  }
++  target = ngtcp2_min(target, ppe->dgram_offset + ngtcp2_buf_cap(&ppe->buf));
++  datalen = ppe->dgram_offset + ngtcp2_buf_len(&ppe->buf) +
++            ppe->cc->aead.max_overhead + payloadlen;
++  budget = target > datalen ? target - datalen : 0;
++  /* Recorded only where this function spends it; otherwise the caller's
++     padding is the answer. */
++  *ppadding = budget ? (size_t)budget : (size_t)-1;
++
++  for (i = 0; i < nframes; ++i) {
++    if (frames[i]->fr.stream.datacnt > NGTCP2_CHROME_ITEM_DATACNT) {
++      cuttable = 0;
++    }
++  }
++  if (!cuttable) {
++    /* Written as packed, padded after them. */
++    for (i = 0; i < nframes; ++i) {
++      rv = conn_ppe_write_frame_hd_log(conn, ppe, phd_logged, hd,
++                                       &frames[i]->fr);
++      if (rv != 0) {
++        ngtcp2_unreachable();
++      }
++    }
++    *ppadding = (size_t)-1;
++    goto done;
++  }
++
++  for (i = 0; i < nframes; ++i) {
++    items[i].kind = 0;
++    items[i].offset = frames[i]->fr.stream.offset;
++    items[i].datacnt = frames[i]->fr.stream.datacnt;
++    ngtcp2_vec_copy(items[i].data, frames[i]->fr.stream.data,
++                    items[i].datacnt);
++  }
++  nitems = npieces = nframes;
++
++  if (budget > 0) {
++    /* shredCryptoFrames (packet_packer_chaos.go:198-244). */
++    lo = items[0].offset;
++    hi = 0;
++    for (i = 0; i < npieces; ++i) {
++      datalen = ngtcp2_vec_len(items[i].data, items[i].datacnt);
++      lo = ngtcp2_min(lo, items[i].offset);
++      hi = ngtcp2_max(hi, items[i].offset + datalen);
++    }
++    max_overhead = chrome_crypto_hdlen(hi, hi - lo);
++
++    attempts = 2 + chrome_rand_n(conn, 10 - 2 + 1);
++    for (j = 0; j < attempts; ++j) {
++      ngtcp2_chrome_item *p, *q;
++
++      if (budget < max_overhead) {
++        break;
++      }
++
++      i = chrome_rand_n(conn, (uint32_t)npieces);
++      p = &items[i];
++      datalen = ngtcp2_vec_len(p->data, p->datacnt);
++      if (datalen <= 1) {
++        continue;
++      }
++      if (npieces == NGTCP2_CHROME_MAX_CRYPTO) {
++        break;
++      }
++
++      cut = 1 + chrome_rand_n(conn, (uint32_t)(datalen - 1));
++      q = &items[npieces];
++      q->kind = 0;
++      q->offset = p->offset + cut;
++      q->datacnt = chrome_vec_slice(q->data, NGTCP2_CHROME_ITEM_DATACNT,
++                                    p->data, p->datacnt, cut, datalen);
++      t = *p;
++      p->datacnt = chrome_vec_slice(p->data, NGTCP2_CHROME_ITEM_DATACNT,
++                                    t.data, t.datacnt, 0, cut);
++
++      budget += chrome_crypto_hdlen(t.offset, datalen);
++      budget -= chrome_crypto_hdlen(p->offset, cut);
++      budget -= chrome_crypto_hdlen(q->offset, datalen - cut);
++      ++npieces;
++    }
++    nitems = npieces;
++
++    /* PINGs: one byte each, as many as the budget allows of two to ten
++       (packet_packer_chaos.go:130-139). */
++    npings = ngtcp2_min((uint64_t)(2 + chrome_rand_n(conn, 10 - 2 + 1)),
++                        budget);
++    for (j = 0; j < npings; ++j) {
++      items[nitems++].kind = 1;
++    }
++    budget -= npings;
++
++    /* spreadPadding over the items so far (:246-274). */
++    if (budget > 0) {
++      size_t nruns_over = nitems;
++
++      for (j = 0; j < nruns_over && budget > 0; ++j) {
++        uint64_t n = chrome_rand_n(conn, (uint32_t)(budget + 1));
++
++        if (n == 0) {
++          continue;
++        }
++        items[nitems].kind = 2;
++        items[nitems++].padlen = (size_t)n;
++        budget -= n;
++      }
++      if (budget > 0) {
++        items[nitems].kind = 2;
++        items[nitems++].padlen = (size_t)budget;
++      }
++    }
++  }
++
++  /* p.rand.Shuffle, which the chaos path and appendPacketPayload both
++     do: j over [0, i] for i from the last down to 1. */
++  for (i = nitems; i > 1; --i) {
++    j = chrome_rand_n(conn, (uint32_t)i);
++    t = items[i - 1];
++    items[i - 1] = items[j];
++    items[j] = t;
++  }
++
++  for (i = 0; i < nitems; ++i) {
++    switch (items[i].kind) {
++    case 0:
++      fr.stream = (ngtcp2_stream){
++        .type = NGTCP2_FRAME_CRYPTO,
++        .offset = items[i].offset,
++        .datacnt = items[i].datacnt,
++        .data = items[i].data,
++      };
++      break;
++    case 1:
++      fr.ping.type = NGTCP2_FRAME_PING;
++      break;
++    default:
++      fr.padding.type = NGTCP2_FRAME_PADDING;
++      fr.padding.len = items[i].padlen;
++      break;
++    }
++
++    rv = conn_ppe_write_frame_hd_log(conn, ppe, phd_logged, hd, &fr);
++    if (rv != 0) {
++      ngtcp2_unreachable();
++    }
++  }
++
++done:
++  conn->frame_counts.crypto += nframes;
++
++  pnext = pfrc;
++  for (i = 0; i < nframes; ++i) {
++    datalen = frames[i]->fr.stream.offset +
++              ngtcp2_vec_len(frames[i]->fr.stream.data,
++                             frames[i]->fr.stream.datacnt);
++    if (datalen > pktns->crypto.tx.chrome_sent_end) {
++      pktns->crypto.tx.chrome_sent_end = datalen;
++    }
++    *pnext = frames[i];
++    pnext = &frames[i]->next;
++  }
++  *pnext = NULL;
++
++  return (ngtcp2_ssize)nframes;
++
++fail:
++  for (i = 0; i < nframes; ++i) {
++    ngtcp2_frame_chain_objalloc_del(frames[i], &conn->frc_objalloc, conn->mem);
++  }
++  return rv;
++}
++
+ /*
+  * conn_write_handshake_pkt writes handshake packet in the buffer
+  * pointed by |dest| whose length is |destlen|.  |dgram_offset| is the
+@@ -2645,6 +3190,9 @@ conn_write_handshake_pkt(ngtcp2_conn *conn, ngtcp2_pkt_info *pi, uint8_t *dest,
+   uint64_t crypto_offset;
+   ngtcp2_ssize num_reclaimed;
+   uint32_t version;
++  int split_ack = 0;
++  int chrome_done = 0;
++  size_t chrome_padding = (size_t)-1;
+ 
+   switch (type) {
+   case NGTCP2_PKT_INITIAL:
+@@ -2715,10 +3263,25 @@ conn_write_handshake_pkt(ngtcp2_conn *conn, ngtcp2_pkt_info *pi, uint8_t *dest,
+     }
+   }
+ 
++  /* The ACK of the server's Handshake flight goes alone under the
++     parrot, and the CRYPTO it would have carried — our Finished — goes
++     in the next datagram, unless what is queued is a retransmission
++     (splitAckFromCrypto, vendor/quic-go/packet_packer.go:193-199,
++     :603-610). */
++  split_ack =
++    !conn->server && conn->local.settings.chrome_parrot &&
++    type == NGTCP2_PKT_HANDSHAKE && !pkt_empty &&
++    !ngtcp2_strm_streamfrq_empty(&pktns->crypto.strm) &&
++    (crypto_offset =
++       ngtcp2_strm_streamfrq_unacked_offset(&pktns->crypto.strm)) !=
++      (uint64_t)-1 &&
++    crypto_offset >= pktns->crypto.tx.chrome_sent_end;
++
+   /* Server requires at least NGTCP2_MAX_UDP_PAYLOAD_SIZE bytes in
+      order to send ack-eliciting Initial packet. */
+-  if (!conn->server || type != NGTCP2_PKT_INITIAL ||
+-      destlen >= NGTCP2_MAX_UDP_PAYLOAD_SIZE) {
++  if ((!conn->server || type != NGTCP2_PKT_INITIAL ||
++       destlen >= NGTCP2_MAX_UDP_PAYLOAD_SIZE) &&
++      !split_ack) {
+   build_pkt:
+     for (; !ngtcp2_strm_streamfrq_empty(&pktns->crypto.strm);) {
+       crypto_offset = ngtcp2_strm_streamfrq_unacked_offset(&pktns->crypto.strm);
+@@ -2736,6 +3299,23 @@ conn_write_handshake_pkt(ngtcp2_conn *conn, ngtcp2_pkt_info *pi, uint8_t *dest,
+         break;
+       }
+ 
++      if (type == NGTCP2_PKT_INITIAL && !conn->server &&
++          conn->local.settings.chrome_parrot) {
++        ngtcp2_ssize framecnt = conn_chrome_initial_crypto(
++          conn, &ppe, &hd, &hd_logged, pktns, &nfrc, &chrome_padding);
++
++        if (framecnt < 0) {
++          ngtcp2_frame_chain_list_objalloc_del(frq, &conn->frc_objalloc,
++                                               conn->mem);
++          return framecnt;
++        }
++
++        if (framecnt == 0) {
++          break;
++        }
++
++        chrome_done = 1;
++      } else
+       if (type == NGTCP2_PKT_INITIAL &&
+           (conn->flags & NGTCP2_CONN_FLAG_SCRAMBLE_INITIAL_CRYPTO)) {
+         ngtcp2_frame_chain *frames[NGTCP2_MAX_INITIAL_CRYPTO_FRAMES];
+@@ -2794,7 +3374,16 @@ conn_write_handshake_pkt(ngtcp2_conn *conn, ngtcp2_pkt_info *pi, uint8_t *dest,
+ 
+       *pfrc = nfrc;
+ 
+-      for (; nfrc->next;) {
++      for (;;) {
++        uint64_t end = nfrc->fr.stream.offset +
++                       ngtcp2_vec_len(nfrc->fr.stream.data,
++                                      nfrc->fr.stream.datacnt);
++        if (end > pktns->crypto.tx.chrome_sent_end) {
++          pktns->crypto.tx.chrome_sent_end = end;
++        }
++        if (!nfrc->next) {
++          break;
++        }
+         nfrc = nfrc->next;
+       }
+ 
+@@ -2804,6 +3393,11 @@ conn_write_handshake_pkt(ngtcp2_conn *conn, ngtcp2_pkt_info *pi, uint8_t *dest,
+       rtb_entry_flags |= NGTCP2_RTB_ENTRY_FLAG_ACK_ELICITING |
+                          NGTCP2_RTB_ENTRY_FLAG_PTO_ELICITING |
+                          NGTCP2_RTB_ENTRY_FLAG_RETRANSMITTABLE;
++
++      /* The parrot's layout packs and writes a whole packet at once. */
++      if (chrome_done) {
++        break;
++      }
+     }
+ 
+     if (!(rtb_entry_flags & NGTCP2_RTB_ENTRY_FLAG_ACK_ELICITING) &&
+@@ -2875,6 +3469,15 @@ conn_write_handshake_pkt(ngtcp2_conn *conn, ngtcp2_pkt_info *pi, uint8_t *dest,
+     min_padded = 1;
+   }
+ 
++  if (type == NGTCP2_PKT_INITIAL && !conn->server &&
++      conn->local.settings.chrome_parrot) {
++    /* What this Initial was padded by, for the next packet number's
++       length: see chrome_last_dgram_padding. */
++    conn->tx.chrome_dgram_padding =
++      chrome_padding != (size_t)-1 ? chrome_padding
++                                   : (min_padded ? 0 : lfr.padding.len);
++  }
++
+   if (lfr.padding.len) {
+     if (!min_padded ||
+         (rtb_entry_flags & NGTCP2_RTB_ENTRY_FLAG_ACK_ELICITING)) {
+@@ -3301,6 +3904,14 @@ static ngtcp2_ssize conn_write_handshake_pkts(ngtcp2_conn *conn,
+       dest += nwrite;
+       destlen -= (size_t)nwrite;
+ 
++      /* A client parroting Chrome never coalesces: an Initial packet goes
++         out in a datagram of its own, and a Handshake packet waits for the
++         next one (noCoalescing, vendor/quic-go/packet_packer.go:185-191,
++         :391-393). */
++      if (!conn->server && conn->local.settings.chrome_parrot) {
++        return res;
++      }
++
+       if (conn->server) {
+         it = ngtcp2_rtb_head(&conn->in_pktns->rtb);
+         if (!ngtcp2_ksl_it_end(&it)) {
+@@ -11303,6 +11914,10 @@ int ngtcp2_conn_install_rx_handshake_key(
+ 
+   pktns->crypto.rx.hp_ctx = *hp_ctx;
+ 
++  /* New read keys: quic-go measures the next packet number against the
++     full datagram again (vendor/quic-go/connection.go:2054-2067). */
++  conn->tx.chrome_last_dgram_padding = 0;
++
+   rv = conn_call_recv_rx_key(conn, NGTCP2_ENCRYPTION_LEVEL_HANDSHAKE);
+   if (rv != 0) {
+     ngtcp2_crypto_km_del(pktns->crypto.rx.ckm, conn->mem);
+@@ -11430,6 +12045,9 @@ int ngtcp2_conn_install_rx_key(ngtcp2_conn *conn, const uint8_t *secret,
+     }
+   }
+ 
++  /* As for the Handshake keys. */
++  conn->tx.chrome_last_dgram_padding = 0;
++
+   rv = conn_call_recv_rx_key(conn, NGTCP2_ENCRYPTION_LEVEL_1RTT);
+   if (rv != 0) {
+     ngtcp2_crypto_km_del(pktns->crypto.rx.ckm, conn->mem);
+@@ -12414,6 +13032,15 @@ conn_write_vmsg_wrapper(ngtcp2_conn *conn, ngtcp2_path *path,
+   int defer = !conn->server && conn->in_pktns &&
+               conn->state != NGTCP2_CS_CLIENT_INITIAL &&
+               dgramlen > NGTCP2_COALESCED_INITIAL_RESERVE;
++  /* A client parroting Chrome writes one packet per datagram during
++     the handshake, so its Initial never leads anything and is never
++     deferred. */
++  int chrome = !conn->server && conn->local.settings.chrome_parrot;
++
++  if (chrome) {
++    defer = 0;
++    conn->tx.chrome_dgram_padding = 0;
++  }
+ 
+   if (defer) {
+     conn->flags |= NGTCP2_CONN_FLAG_DEFER_INITIAL_PKT;
+@@ -12439,6 +13066,14 @@ conn_write_vmsg_wrapper(ngtcp2_conn *conn, ngtcp2_path *path,
+     }
+   }
+ 
++  /* quic-go records the padding of every datagram it packs until the
++     handshake is confirmed, 0 for one without an Initial packet
++     (vendor/quic-go/packet_packer.go:470-479, :846-857). */
++  if (chrome && nwrite > 0 &&
++      !(conn->flags & NGTCP2_CONN_FLAG_HANDSHAKE_CONFIRMED)) {
++    conn->tx.chrome_last_dgram_padding = conn->tx.chrome_dgram_padding;
++  }
++
+   assert((size_t)nwrite <= destlen);
+ 
+   if (cstat->bytes_in_flight >= cstat->cwnd) {
+@@ -12667,6 +13302,11 @@ ngtcp2_ssize ngtcp2_conn_write_vmsg(ngtcp2_conn *conn, ngtcp2_path *path,
+       dest += nwrite;
+       destlen -= (size_t)nwrite;
+     }
++    /* Not under the parrot: one level per datagram (packet_packer.go:
++       427-429). */
++    if (nwrite && conn->local.settings.chrome_parrot) {
++      return nwrite;
++    }
+     /* Break here so that we can coalesces 1RTT packet. */
+     break;
+   case NGTCP2_CS_SERVER_INITIAL:
+@@ -12879,6 +13519,11 @@ ngtcp2_ssize ngtcp2_conn_write_vmsg(ngtcp2_conn *conn, ngtcp2_path *path,
+         dest += nwrite;
+         destlen -= (size_t)nwrite;
+ 
++        /* A Handshake packet goes alone under the parrot, as above. */
++        if (conn->local.settings.chrome_parrot) {
++          return res;
++        }
++
+         /* We only exceed CWND to avoid deadlock.  Do no write 1RTT
+            packet if CWND is depleted. */
+         if (conn_cwnd_is_zero(conn) && conn->pktns.rtb.probe_pkt_left == 0) {
+diff --git a/lib/ngtcp2_conn.h b/lib/ngtcp2_conn.h
+index 5be0da7..7a3e639 100644
+--- a/lib/ngtcp2_conn.h
++++ b/lib/ngtcp2_conn.h
+@@ -333,6 +333,10 @@ typedef struct ngtcp2_pktns {
+       ngtcp2_crypto_cipher_ctx hp_ctx;
+       /* data is the submitted crypto data. */
+       ngtcp2_buf_chain *data;
++      /* chrome_sent_end is one past the highest CRYPTO byte ever
++         written in this space: data queued below it is a
++         retransmission.  Read only by a client parroting Chrome. */
++      uint64_t chrome_sent_end;
+     } tx;
+ 
+     struct {
+@@ -454,6 +458,15 @@ struct ngtcp2_conn {
+     /* last_max_data_ts is the timestamp when last MAX_DATA frame is
+        sent. */
+     ngtcp2_tstamp last_max_data_ts;
++    /* chrome_last_dgram_padding is, for a client parroting Chrome, the
++       padding the Initial packet of the last datagram written before
++       the handshake was confirmed carried, 0 when it had none; it is
++       cleared when new read keys arrive.  quic-go's
++       lastDatagramPadding, which its packet number length is measured
++       against.  chrome_dgram_padding collects it for the datagram
++       being written. */
++    size_t chrome_last_dgram_padding;
++    size_t chrome_dgram_padding;
+ 
+     struct {
+       /* validation_start_ts is the timestamp when ECN validation is
+diff --git a/lib/ngtcp2_hybbr.c b/lib/ngtcp2_hybbr.c
+index 85ae4c3..0a30629 100644
+--- a/lib/ngtcp2_hybbr.c
++++ b/lib/ngtcp2_hybbr.c
+@@ -1903,22 +1903,36 @@ void ngtcp2_cc_hybbr_reset(ngtcp2_cc *cc, ngtcp2_conn_stat *cstat,
+   ngtcp2_log *log = hybbr->log;
+   ngtcp2_pcg32 *pcg = hybbr->pcg;
+   const ngtcp2_mem *mem = hybbr->mem;
++  uint64_t initial_packet_size = hybbr->initial_packet_size;
+ 
+   ngtcp2_hybbr_free(hybbr);
+-  ngtcp2_hybbr_init(hybbr, log, cstat, ts, pcg, mem);
++  ngtcp2_hybbr_init(hybbr, log, cstat, ts, pcg, mem, initial_packet_size);
+ }
+ 
+ /* ---- construction ---------------------------------------------------------------- */
+ 
+ void ngtcp2_hybbr_init(ngtcp2_hybbr *hybbr, ngtcp2_log *log,
+                        ngtcp2_conn_stat *cstat, ngtcp2_tstamp initial_ts,
+-                       ngtcp2_pcg32 *pcg, const ngtcp2_mem *mem) {
+-  uint64_t max_datagram_size = HYBBR_INITIAL_PACKET_SIZE;
++                       ngtcp2_pcg32 *pcg, const ngtcp2_mem *mem,
++                       uint64_t initial_packet_size) {
++  /* The seed is the smaller of the size QUIC itself starts at and the
++     guess from the address, which for a UDP address is 1280: see
++     seedPacketSize,
++     vendor/hysteria/core/internal/congestion/utils.go:45-59, and
++     GetInitialPacketSize,
++     vendor/hysteria/core/internal/congestion/bbr/bbr_sender.go:1069-1077.
++     1280 as before, and 1250 for a client parroting Chrome.  The pacer
++     is not seeded: it starts at congestion.InitialPacketSize whatever
++     the sender is given,
++     vendor/hysteria/core/internal/congestion/common/pacer.go:23-30. */
++  uint64_t max_datagram_size =
++    ngtcp2_min(initial_packet_size, (uint64_t)HYBBR_INITIAL_PACKET_SIZE);
+   uint64_t initial_cwnd, max_cwnd;
+ 
+   memset(hybbr, 0, sizeof(*hybbr));
+ 
+   hybbr->log = log;
++  hybbr->initial_packet_size = initial_packet_size;
+   hybbr->cstat = cstat;
+   hybbr->pcg = pcg;
+   hybbr->mem = mem;
+diff --git a/lib/ngtcp2_hybbr.h b/lib/ngtcp2_hybbr.h
+index 9d9d179..79befcf 100644
+--- a/lib/ngtcp2_hybbr.h
++++ b/lib/ngtcp2_hybbr.h
+@@ -187,6 +187,8 @@ struct ngtcp2_hybbr {
+   ngtcp2_conn_stat *cstat;
+   ngtcp2_pcg32 *pcg;
+   const ngtcp2_mem *mem;
++  /* The datagram size the sender was seeded with, kept for a reset. */
++  uint64_t initial_packet_size;
+ 
+   ngtcp2_hybbr_sampler sampler;
+   ngtcp2_hybbr_pacer pacer;
+@@ -272,7 +274,8 @@ struct ngtcp2_hybbr {
+  */
+ void ngtcp2_hybbr_init(ngtcp2_hybbr *hybbr, ngtcp2_log *log,
+                        ngtcp2_conn_stat *cstat, ngtcp2_tstamp initial_ts,
+-                       ngtcp2_pcg32 *pcg, const ngtcp2_mem *mem);
++                       ngtcp2_pcg32 *pcg, const ngtcp2_mem *mem,
++                       uint64_t initial_packet_size);
+ 
+ void ngtcp2_hybbr_free(ngtcp2_hybbr *hybbr);
+ 

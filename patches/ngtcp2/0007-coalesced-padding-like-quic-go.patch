@@ -1,0 +1,303 @@
+The padding of a client's coalesced datagram put where quic-go puts it (hysteria client).
+
+A client's handshake datagram carries an Initial packet and, behind it, a Handshake packet and a
+1RTT one. quic-go packs the payloads of all three first, then writes them: the Initial packet gets
+maxPacketSize minus the size of all of them as PADDING, and the two behind it get none
+(vendor/quic-go/packet_packer.go:347-356, :373-441, :470-472).
+
+Upstream ngtcp2 writes and seals each packet as it goes, so the leading Initial packet cannot know
+what will follow it. Its padding therefore travels the other way: conn_should_pad_pkt leaves the
+Initial packet unpadded when there is something to send at a later level, the REQUIRE_PADDING flag
+is handed down the datagram, and the LAST packet pads it to size.
+
+Both datagrams are 1280 bytes, and the difference is in the open. The Length field of a long header
+is not encrypted, so the third datagram of the handshake reads, through a quic-go server's own qlog:
+
+    reference   Initial 1080 · Handshake 79 · 1RTT 103
+    ours        Initial   22 · Handshake 80 · 1RTT 1158
+
+This patch composes that datagram the way round quic-go composes it. While a client writes a
+datagram an Initial packet is going to lead, NGTCP2_CONN_FLAG_DEFER_INITIAL_PKT holds that packet
+back; conn_write_deferred_initial then writes it into what the others left and moves it in front of
+them, and conn_should_pad_pkt pads it because it leads the datagram rather than because nothing
+follows. NGTCP2_COALESCED_INITIAL_RESERVE is what this costs and quic-go does not pay: the packets
+written first are kept out of the room the Initial packet may need, because in quic-go's order the
+Initial packet takes its room first. Anything it does not use it pads with, so the datagram is the
+same size either way.
+
+The padding is asked for with a flag of its own rather than with REQUIRE_PADDING, and that is not
+tidiness. REQUIRE_PADDING also suppresses the check that drops an empty packet
+(`if (pkt_empty && !require_padding)`), so an Initial packet with nothing to say became a packet of
+padding — and since writing it neither emptied a queue nor discarded the packet number space, the
+client wrote another, and another. Measured before the flag existed: 854 510 Initial packets into a
+quic-go server that had answered the first one. NGTCP2_WRITE_PKT_FLAG_PAD_LEADING_INITIAL says only
+"you lead the datagram", and an Initial packet with nothing to carry is still not written.
+
+What this patch does NOT change is where the PADDING sits inside the Initial packet: quic-go writes
+it between the ACK and the frames (packet_packer.go:1064-1066), ngtcp2 writes it after the frames, and
+the whole payload is inside the AEAD — nothing outside the connection can tell the two apart.
+Matching it would mean measuring the packet's own frames before serialising them, which is the
+two-phase packing quic-go has and ngtcp2 does not.
+
+The CONNECTION_CLOSE path composes its own coalesced datagram (conn_write_connection_close) and is
+left alone: this client only closes after the handshake, where the Initial packet number space is
+long discarded and the datagram holds a single 1RTT packet.
+
+Applies on top of 0006.
+
+--- a/lib/ngtcp2_conn.c
++++ b/lib/ngtcp2_conn.c
+@@ -2146,6 +2146,17 @@
+         return 1;
+       }
+     } else {
++      if (require_padding) {
++        /* A client's Initial packet leads the datagram and carries the
++           padding of all of it, so it is padded whatever else is being
++           written: quic-go pads its leading Initial packet up to
++           maxPacketSize and gives the packets behind it none
++           (vendor/quic-go/packet_packer.go:347-356, :470-472).  This is
++           the Initial packet conn_write_deferred_initial writes, once
++           the rest of the datagram is already in the buffer. */
++        return 1;
++      }
++
+       if (conn->hs_pktns->crypto.tx.ckm &&
+           (conn->hs_pktns->rtb.probe_pkt_left ||
+            !ngtcp2_strm_streamfrq_empty(&conn->hs_pktns->crypto.strm) ||
+@@ -2588,6 +2599,8 @@
+   size_t left;
+   uint16_t rtb_entry_flags = NGTCP2_RTB_ENTRY_FLAG_NONE;
+   int require_padding = (flags & NGTCP2_WRITE_PKT_FLAG_REQUIRE_PADDING) != 0;
++  int pad_leading =
++    (flags & NGTCP2_WRITE_PKT_FLAG_PAD_LEADING_INITIAL) != 0;
+   int pkt_empty = 1;
+   int min_padded = 0;
+   int padded = 0;
+@@ -2814,7 +2827,7 @@
+   if (conn_should_pad_pkt(
+         conn, type, ngtcp2_ppe_left(&ppe), write_datalen,
+         (rtb_entry_flags & NGTCP2_RTB_ENTRY_FLAG_ACK_ELICITING) != 0,
+-        require_padding)) {
++        require_padding || pad_leading)) {
+     lfr.padding.type = NGTCP2_FRAME_PADDING;
+     lfr.padding.len = conn_dgram_padding(conn, &ppe);
+   } else if (pkt_empty) {
+@@ -3194,7 +3207,8 @@
+     /* Discard Initial state here so that Handshake packet is not
+        padded. */
+     ngtcp2_conn_discard_initial_state(conn, ts);
+-  } else if (conn->in_pktns) {
++  } else if (conn->in_pktns &&
++             !(conn->flags & NGTCP2_CONN_FLAG_DEFER_INITIAL_PKT)) {
+     nwrite =
+       conn_write_handshake_pkt(conn, pi, dest, destlen, 0, NGTCP2_PKT_INITIAL,
+                                NGTCP2_WRITE_PKT_FLAG_NONE, write_datalen, ts);
+@@ -3247,10 +3261,13 @@
+ 
+   res += nwrite;
+ 
+-  if (!conn->server && conn->hs_pktns->crypto.tx.ckm && nwrite) {
++  if (!conn->server && conn->hs_pktns->crypto.tx.ckm && nwrite &&
++      !(conn->flags & NGTCP2_CONN_FLAG_DEFER_INITIAL_PKT)) {
+     /* We don't need to send further Initial packet if we have
+        Handshake key and sent something with it.  So discard initial
+-       state here. */
++       state here.  When the Initial packet of this datagram is still
++       to be written, conn_write_deferred_initial discards the space
++       after writing it instead. */
+     ngtcp2_conn_discard_initial_state(conn, ts);
+   }
+ 
+@@ -12184,6 +12201,98 @@
+   return counts->crypto == 0 && counts->stream == 0;
+ }
+ 
++/*
++ * conn_reverse_bytes reverses the |len| bytes starting at |p|.
++ */
++static void conn_reverse_bytes(uint8_t *p, size_t len) {
++  uint8_t *q = p + len;
++  uint8_t c;
++
++  for (; p < --q; ++p) {
++    c = *p;
++    *p = *q;
++    *q = c;
++  }
++}
++
++/*
++ * conn_write_deferred_initial writes the Initial packet of a datagram
++ * whose other packets are already written in |dest| and occupy
++ * |taillen| bytes, and then moves it in front of them.  |destlen| is
++ * the length of the datagram this endpoint may write.
++ *
++ * The Initial packet is written last because it carries the padding of
++ * the whole datagram, and how much padding that is only becomes known
++ * once everything behind it has been written.  quic-go composes the
++ * datagram the same way round: it packs the payloads of all the
++ * packets first, and the Initial packet it writes in front of them is
++ * given maxPacketSize minus the size of all of them
++ * (vendor/quic-go/packet_packer.go:347-356, :373-441, :470-472).
++ *
++ * This function returns the length of the datagram, or one of the
++ * following negative error codes:
++ *
++ * NGTCP2_ERR_NOMEM
++ *     Out of memory.
++ * NGTCP2_ERR_CALLBACK_FAILURE
++ *     User-defined callback function failed.
++ */
++static ngtcp2_ssize conn_write_deferred_initial(ngtcp2_conn *conn,
++                                                ngtcp2_pkt_info *pi,
++                                                uint8_t *dest, size_t destlen,
++                                                size_t taillen,
++                                                ngtcp2_tstamp ts) {
++  ngtcp2_ssize nwrite;
++  int handshake_written;
++
++  assert(!conn->server);
++
++  /* A Path MTU Discovery probe is written past the size the path is
++     known to take, so what is already in the buffer can be longer than
++     this datagram; there is then no room to lead it with anything. */
++  if (conn->in_pktns == NULL || taillen >= destlen) {
++    return (ngtcp2_ssize)taillen;
++  }
++
++  /* Read before the Initial packet is written, while the packet behind
++     it still begins the buffer. */
++  handshake_written =
++    taillen && (dest[0] & NGTCP2_HEADER_FORM_BIT) &&
++    ngtcp2_pkt_get_type_long(conn->negotiated_version
++                               ? conn->negotiated_version
++                               : conn->client_chosen_version,
++                             dest[0]) == NGTCP2_PKT_HANDSHAKE;
++
++  nwrite = conn_write_handshake_pkt(conn, pi, dest + taillen, destlen - taillen,
++                                    taillen, NGTCP2_PKT_INITIAL,
++                                    NGTCP2_WRITE_PKT_FLAG_PAD_LEADING_INITIAL,
++                                    /* write_datalen = */ 0, ts);
++  if (nwrite < 0) {
++    assert(nwrite != NGTCP2_ERR_NOBUF);
++
++    return nwrite;
++  }
++
++  if (nwrite == 0) {
++    return (ngtcp2_ssize)taillen;
++  }
++
++  /* Coalesced packets go in increasing order of encryption level (RFC
++     9000, Section 12.2), so the Initial packet leads the datagram. */
++  conn_reverse_bytes(dest, taillen);
++  conn_reverse_bytes(dest + taillen, (size_t)nwrite);
++  conn_reverse_bytes(dest, taillen + (size_t)nwrite);
++
++  if (handshake_written && conn->hs_pktns->crypto.tx.ckm) {
++    /* The discard that conn_write_handshake_pkts left to this
++       function: a Handshake packet went out in this datagram, so no
++       further Initial packet is needed. */
++    ngtcp2_conn_discard_initial_state(conn, ts);
++  }
++
++  return (ngtcp2_ssize)(taillen + (size_t)nwrite);
++}
++
+ static ngtcp2_ssize
+ conn_write_vmsg_wrapper(ngtcp2_conn *conn, ngtcp2_path *path,
+                         int pkt_info_version, ngtcp2_pkt_info *pi,
+@@ -12191,13 +12300,41 @@
+                         ngtcp2_vmsg *vmsg, ngtcp2_tstamp ts) {
+   ngtcp2_conn_stat *cstat = &conn->cstat;
+   ngtcp2_ssize nwrite;
++  size_t dgramlen = conn_shape_udp_payload(conn, &conn->dcid.current, destlen);
++  size_t taillen = destlen;
++  /* A client writes the Initial packet of a datagram after the packets
++     that follow it, because it carries the padding of all of it; see
++     conn_write_deferred_initial.  The room it needs is kept back from
++     those packets, because it leads the datagram and they cannot take
++     it from it. */
++  int defer = !conn->server && conn->in_pktns &&
++              conn->state != NGTCP2_CS_CLIENT_INITIAL &&
++              dgramlen > NGTCP2_COALESCED_INITIAL_RESERVE;
++
++  if (defer) {
++    conn->flags |= NGTCP2_CONN_FLAG_DEFER_INITIAL_PKT;
++    taillen = dgramlen - NGTCP2_COALESCED_INITIAL_RESERVE;
++  }
+ 
+   nwrite = ngtcp2_conn_write_vmsg(conn, path, pkt_info_version, pi, dest,
+-                                  destlen, wflags, vmsg, ts);
++                                  taillen, wflags, vmsg, ts);
++
++  conn->flags &= (uint32_t)~NGTCP2_CONN_FLAG_DEFER_INITIAL_PKT;
++
+   if (nwrite < 0) {
++    /* NGTCP2_ERR_WRITE_MORE: the datagram is not finished, and the
++       Initial packet waits for the call that finishes it. */
+     return nwrite;
+   }
+ 
++  if (defer) {
++    nwrite = conn_write_deferred_initial(conn, pi, dest, dgramlen,
++                                         (size_t)nwrite, ts);
++    if (nwrite < 0) {
++      return nwrite;
++    }
++  }
++
+   assert((size_t)nwrite <= destlen);
+ 
+   if (cstat->bytes_in_flight >= cstat->cwnd) {
+--- a/lib/ngtcp2_conn.h
++++ b/lib/ngtcp2_conn.h
+@@ -111,6 +111,13 @@
+ /* NGTCP2_WRITE_PKT_FLAG_PADDING_IF_NOT_EMPTY adds padding to the QUIC
+    packet as much as possible if the packet is not empty. */
+ #define NGTCP2_WRITE_PKT_FLAG_PADDING_IF_NOT_EMPTY 0x08U
++/* NGTCP2_WRITE_PKT_FLAG_PAD_LEADING_INITIAL indicates that this
++   Initial packet leads the datagram and carries the padding of all of
++   it, and so is padded whatever else the datagram holds.  Unlike
++   NGTCP2_WRITE_PKT_FLAG_REQUIRE_PADDING it does not turn an empty
++   packet into a packet of padding: an Initial packet with nothing to
++   say is still not written. */
++#define NGTCP2_WRITE_PKT_FLAG_PAD_LEADING_INITIAL 0x10U
+ 
+ typedef struct ngtcp2_path_challenge_entry {
+   ngtcp2_path_storage ps;
+@@ -207,6 +214,14 @@
+    queue, which the scrambling never touches
+    (vendor/quic-go/packet_packer.go:611-625). */
+ #define NGTCP2_CONN_FLAG_INITIAL_CRYPTO_CUT 0x100000U
++/* NGTCP2_CONN_FLAG_DEFER_INITIAL_PKT is set while a client is writing
++   the rest of a datagram that an Initial packet is going to lead.  The
++   Initial packet is written last, once the length of everything behind
++   it is known, because it carries the padding of the whole datagram:
++   quic-go packs the payloads first and gives the leading Initial packet
++   maxPacketSize minus the size of all of them
++   (vendor/quic-go/packet_packer.go:347-356, :470-472). */
++#define NGTCP2_CONN_FLAG_DEFER_INITIAL_PKT 0x200000U
+ 
+ /* NGTCP2_MAX_INITIAL_CRYPTO_FRAMES is the number of CRYPTO frames
+    that conn_scramble_initial_crypto writes into one Initial packet at
+@@ -217,6 +232,18 @@
+    fragmented. */
+ #define NGTCP2_MAX_INITIAL_CRYPTO_FRAMES 16
+ 
++/* NGTCP2_COALESCED_INITIAL_RESERVE is the number of bytes kept free
++   for the Initial packet that leads a coalesced datagram, so that the
++   packets written before it cannot take the room it needs.  An Initial
++   packet a client coalesces carries an ACK and, at worst, a CRYPTO
++   frame it is retransmitting; this is more than the header, the ACK
++   and the AEAD tag together can come to, and whatever it does not use
++   becomes the padding that this packet carries anyway.  quic-go needs
++   no such number: it packs the Initial payload first and gives the
++   later packets maxSize minus what it took
++   (vendor/quic-go/packet_packer.go:373-441). */
++#define NGTCP2_COALESCED_INITIAL_RESERVE 256
++
+ /* NGTCP2_MAX_NON_ACK_ELICITING_ACKS is quic-go's
+    MaxNonAckElicitingAcks (vendor/quic-go/internal/protocol/params.go:
+    75-77). */

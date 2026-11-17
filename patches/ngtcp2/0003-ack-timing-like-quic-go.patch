@@ -1,0 +1,165 @@
+Acknowledgement timing as quic-go decides it (hysteria client).
+
+quic-go, in the application data space (vendor/quic-go/internal/ackhandler/
+received_packet_tracker.go:78-228, packet_packer.go:724-730):
+  - the delayed-ACK alarm is a flat MaxAckDelay, 25 ms, whatever the RTT;
+  - an ACK is queued at once only when the packet was reported missing by the last ACK sent, when
+    two ack-eliciting packets have arrived since it, when a packet is missing at or above that
+    ACK's largest acknowledged (reorderingThreshold 1), or on ECN-CE;
+  - a pending ACK rides in every packet that carries stream or control data, timer or not.
+
+Upstream ngtcp2 uses min(max_ack_delay, smoothed_rtt/8) for the timer, answers every out-of-order
+packet and every new gap at once, and puts an ACK into a data packet only when its timer has run
+out or an immediate ACK is due.
+
+This patch: conn_compute_ack_delay returns NGTCP2_DEFAULT_MAX_ACK_DELAY; ngtcp2_acktr records
+the largest packet number of the last ACK sent, and pktns_commit_recv_pkt_num applies quic-go's
+two reordering rules against it; conn_write_pkt asks for the ACK with no delay when the packet will
+carry data. ngtcp2_conn_set_app_stream_data_pending lets the application say that stream data is
+coming in a later call for the same packet, since the first call may be a DATAGRAM.
+Applies on top of 0002.
+
+--- a/lib/ngtcp2_acktr.c
++++ b/lib/ngtcp2_acktr.c
+@@ -53,6 +53,7 @@
+   acktr->rx_npkt = 0;
+   acktr->max_pkt_num = -1;
+   acktr->max_pkt_ts = UINT64_MAX;
++  acktr->last_sent_largest_ack = -1;
+   memset(&acktr->ecn, 0, sizeof(acktr->ecn));
+ }
+ 
+@@ -189,6 +190,8 @@
+                                              int64_t largest_ack) {
+   ngtcp2_acktr_ack_entry *ent = ngtcp2_ringbuf_push_front(&acktr->acks.rb);
+ 
++  acktr->last_sent_largest_ack = largest_ack;
++
+   *ent = (ngtcp2_acktr_ack_entry){
+     .largest_ack = largest_ack,
+     .pkt_num = pkt_num,
+--- a/lib/ngtcp2_acktr.h
++++ b/lib/ngtcp2_acktr.h
+@@ -88,6 +88,12 @@
+   /* max_pkt_ts is the timestamp when max_pkt_num packet is
+      received. */
+   ngtcp2_tstamp max_pkt_ts;
++  /* last_sent_largest_ack is the largest packet number acknowledged
++     by the last ACK frame sent, or -1 before one has been.  quic-go
++     reads the same number off lastAck when it decides whether to
++     acknowledge at once (vendor/quic-go/internal/ackhandler/
++     received_packet_tracker.go:150-173). */
++  int64_t last_sent_largest_ack;
+ 
+   struct {
+     /* ect0, ect1, and ce are the number of QUIC packets received
+--- a/lib/ngtcp2_conn.c
++++ b/lib/ngtcp2_conn.c
+@@ -1849,9 +1849,17 @@
+  * ACK.
+  */
+ static ngtcp2_duration conn_compute_ack_delay(const ngtcp2_conn *conn) {
+-  return ngtcp2_min(
+-    conn->local.transport_params.max_ack_delay,
+-    ngtcp2_max(conn->cstat.smoothed_rtt / 8, NGTCP2_NANOSECONDS));
++  /* quic-go's delayed-ACK alarm is a flat MaxAckDelay, 25 ms
++     (vendor/quic-go/internal/ackhandler/received_packet_tracker.go:103,
++     :128; internal/protocol/params.go:144), whatever it advertises as
++     max_ack_delay and whatever the RTT. */
++  (void)conn;
++  return NGTCP2_DEFAULT_MAX_ACK_DELAY;
++}
++
++void ngtcp2_conn_set_app_stream_data_pending(ngtcp2_conn *conn,
++                                             int pending) {
++  conn->app_stream_data_pending = pending;
+ }
+ 
+ /*
+@@ -3735,8 +3743,19 @@
+     }
+ 
+     lfr.ack.ranges = ack_ranges;
++    /* A pending acknowledgement rides in any packet that carries data,
++       timer or not: quic-go asks for its ACK frame with onlyIfQueued
++       false whenever the framer or the retransmission queue has
++       something (vendor/quic-go/packet_packer.go:724-730,
++       received_packet_tracker.go:209-216).  A DATAGRAM alone is not
++       data in that sense. */
+     if (ngtcp2_acktr_create_ack_frame(
+-          &pktns->acktr, &lfr.ack, type, ts, conn_compute_ack_delay(conn),
++          &pktns->acktr, &lfr.ack, type, ts,
++          ((vmsg && vmsg->type == NGTCP2_VMSG_TYPE_STREAM) ||
++           conn->app_stream_data_pending || pktns->tx.frq ||
++           !ngtcp2_pq_empty(&conn->tx.strmq))
++            ? 0
++            : conn_compute_ack_delay(conn),
+           conn->local.transport_params.ack_delay_exponent) == 0) {
+       rv = conn_ppe_write_frame_hd_log(conn, ppe, &hd_logged, hd, &lfr);
+       if (rv != 0) {
+@@ -6320,14 +6339,26 @@
+   }
+ 
+   if (require_ack) {
+-    if (pktns->rx.max_ack_eliciting_pkt_num != -1) {
+-      if (pkt_num < pktns->rx.max_ack_eliciting_pkt_num) {
++    /* Out-of-order arrival is answered at once only in the two cases
++       quic-go answers it at once
++       (vendor/quic-go/internal/ackhandler/received_packet_tracker.go:
++       150-206): the packet was reported missing by the last ACK sent
++       — it lies below that ACK's largest acknowledged — or there is a
++       packet missing at or above that largest, below the largest
++       received (hasNewMissingPackets with reorderingThreshold 1).
++       Before any ACK has been sent, neither.  Initial and Handshake
++       packets are acknowledged without delay whatever this says. */
++    if (pktns->acktr.last_sent_largest_ack != -1) {
++      int64_t last_largest = pktns->acktr.last_sent_largest_ack;
++      int64_t largest = ngtcp2_max(pktns->acktr.max_pkt_num, pkt_num);
++
++      if (pkt_num < last_largest) {
+         ngtcp2_acktr_immediate_ack(&pktns->acktr);
+-      } else if (pkt_num != pktns->rx.max_ack_eliciting_pkt_num + 1) {
+-        r = ngtcp2_gaptr_get_first_gap_after(
+-          &pktns->rx.pngap, (uint64_t)pktns->rx.max_ack_eliciting_pkt_num);
++      } else {
++        r = ngtcp2_gaptr_get_first_gap_after(&pktns->rx.pngap,
++                                             (uint64_t)last_largest);
+ 
+-        if (r.begin < (uint64_t)pkt_num) {
++        if (ngtcp2_max(r.begin, (uint64_t)last_largest) < (uint64_t)largest) {
+           ngtcp2_acktr_immediate_ack(&pktns->acktr);
+         }
+       }
+--- a/lib/ngtcp2_conn.h
++++ b/lib/ngtcp2_conn.h
+@@ -599,6 +599,15 @@
+     ngtcp2_duration timeout;
+   } keep_alive;
+ 
++  /* app_stream_data_pending is nonzero when the application has stream
++     data it is about to hand over for the packet being built.  quic-go
++     decides whether a pending ACK rides in a packet from whether the
++     packet will carry data (vendor/quic-go/packet_packer.go:724-730),
++     and the first write of a packet here may be a DATAGRAM while the
++     stream data comes in a later call of the same packet.  Set by
++     ngtcp2_conn_set_app_stream_data_pending. */
++  int app_stream_data_pending;
++
+   struct {
+     /* Initial keys for negotiated version.  If original version ==
+        negotiated version, these fields are not used. */
+@@ -924,6 +933,14 @@
+ ngtcp2_tstamp ngtcp2_conn_get_idle_expiry(const ngtcp2_conn *conn);
+ 
+ /*
++ * `ngtcp2_conn_set_app_stream_data_pending` tells |conn| whether the
++ * application is about to write stream data into the packet being
++ * built.  See app_stream_data_pending.
++ */
++void ngtcp2_conn_set_app_stream_data_pending(ngtcp2_conn *conn,
++                                             int pending);
++
++/*
+  * ngtcp2_conn_compute_pto computes the current PTO.
+  */
+ ngtcp2_duration ngtcp2_conn_compute_pto(const ngtcp2_conn *conn,

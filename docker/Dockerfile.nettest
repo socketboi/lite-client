@@ -1,0 +1,5 @@
+# Local kernel-rule qualification in a private Docker network namespace.
+ARG BUILD_IMAGE=lc-build:local
+FROM ${BUILD_IMAGE}
+RUN apt-get update && apt-get install -y --no-install-recommends iproute2 nftables \
+    && rm -rf /var/lib/apt/lists/*

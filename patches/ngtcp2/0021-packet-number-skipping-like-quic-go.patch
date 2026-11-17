@@ -1,0 +1,86 @@
+The 1-RTT packet numbers a client leaves out, on quic-go's schedule.
+
+Both stacks skip a packet number now and then, so that a peer acknowledging a packet it never got
+gives itself away. quic-go's skippingPacketNumberGenerator
+(vendor/quic-go/internal/ackhandler/packet_number_generator.go:36-84) leaves out the next number
+to be used plus 3 plus a draw below twice a period, and the period starts at 256 and doubles after
+each draw up to 128 Ki (SkipPacketInitialPeriod, SkipPacketMaxPeriod,
+vendor/quic-go/internal/protocol/params.go:45-50); the draw is four bytes of crypto/rand, masked
+(vendor/quic-go/internal/utils/rand.go:13-29). Upstream ngtcp2 put the next skip (r + 1) * 2^k + 3
+on, for one random byte r and a k growing from 0 without a ceiling: its first skip fell in
+3..258 where quic-go's falls in 3..514, and its gaps kept doubling past quic-go's 256 Ki.
+
+Only the node sees packet numbers — they are inside header protection — but it sees all of them.
+A client now runs conn_qgo_update_skip_pkt; the server keeps upstream's schedule.
+
+Checked against quic-go's own generator, run by tools/qgovec on the same random bytes: test/ngpatch.
+
+diff --git a/lib/ngtcp2_conn.c b/lib/ngtcp2_conn.c
+index 1218505..66fcd01 100644
+--- a/lib/ngtcp2_conn.c
++++ b/lib/ngtcp2_conn.c
+@@ -1148,6 +1148,51 @@ conn_set_local_transport_params(ngtcp2_conn *conn,
+   p->version_info_present = 1;
+ }
+ 
++/* SkipPacketInitialPeriod (vendor/quic-go/internal/protocol/params.go:47). */
++#define NGTCP2_QGO_SKIP_INITIAL_PERIOD 256
++
++/*
++ * conn_qgo_update_skip_pkt is quic-go's skippingPacketNumberGenerator
++ * for a client's 1-RTT packets (vendor/quic-go/internal/ackhandler/
++ * packet_number_generator.go:36-84, started at 0 by newPacketNumberSpace,
++ * vendor/quic-go/internal/ackhandler/sent_packet_handler.go:54-66, :169).
++ * The next number left out is the next one to be used, plus 3, plus a
++ * draw below twice the period; the period starts at
++ * SkipPacketInitialPeriod, 256, and doubles after each draw up to
++ * SkipPacketMaxPeriod, 128 Ki (vendor/quic-go/internal/protocol/
++ * params.go:45-50).  The draw is utils.Rand's Int31n, which for a power
++ * of two is four bytes from crypto/rand, big-endian, masked
++ * (vendor/quic-go/internal/utils/rand.go:13-29), and the rand callback
++ * is this client's crypto/rand.  The next number to be used is 0 at the
++ * start, and after a skip the one after the packet that takes the
++ * skipped number's place.  Upstream put the next skip (r + 1) * 2^k + 3
++ * on, for one random byte r and a k growing from 0 without a ceiling.
++ * |exponent| counts the doublings here.
++ */
++static void conn_qgo_update_skip_pkt(ngtcp2_conn *conn, ngtcp2_pktns *pktns) {
++  int64_t period = (int64_t)NGTCP2_QGO_SKIP_INITIAL_PERIOD
++                   << ngtcp2_min(pktns->tx.skip_pkt.exponent, 9);
++  int64_t next =
++    pktns->tx.last_pkt_num + (pktns->tx.skip_pkt.exponent ? 2 : 1);
++  uint8_t b[4];
++  uint32_t v;
++
++  conn->callbacks.rand(b, sizeof(b), &conn->local.settings.rand_ctx);
++  ngtcp2_get_uint32be(&v, b);
++  v &= (uint32_t)(2 * period - 1);
++  ++pktns->tx.skip_pkt.exponent;
++
++  if (next > NGTCP2_MAX_PKT_NUM - 3 - (int64_t)v) {
++    pktns->tx.skip_pkt.next_pkt_num = INT64_MAX;
++    return;
++  }
++
++  pktns->tx.skip_pkt.next_pkt_num = next + 3 + (int64_t)v;
++
++  ngtcp2_log_infof(&conn->log, NGTCP2_LOG_EVENT_CON,
++                   "next skip pkn=", pktns->tx.skip_pkt.next_pkt_num);
++}
++
+ static void conn_update_skip_pkt(ngtcp2_conn *conn, ngtcp2_pktns *pktns) {
+   const int64_t min_gap = 3;
+   uint8_t r;
+@@ -1155,6 +1200,12 @@ static void conn_update_skip_pkt(ngtcp2_conn *conn, ngtcp2_pktns *pktns) {
+ 
+   assert(INT64_MAX != pktns->tx.skip_pkt.next_pkt_num);
+ 
++  /* A client skips as quic-go does: see conn_qgo_update_skip_pkt. */
++  if (!conn->server) {
++    conn_qgo_update_skip_pkt(conn, pktns);
++    return;
++  }
++
+   conn->callbacks.rand(&r, 1, &conn->local.settings.rand_ctx);
+ 
+   if (1LL << pktns->tx.skip_pkt.exponent >

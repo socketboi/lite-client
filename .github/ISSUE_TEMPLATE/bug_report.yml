@@ -1,0 +1,103 @@
+name: Bug report
+description: The client crashes, stops passing traffic, fails to start, or does something it should not.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        If the client behaves differently on the wire from Xray-core or hysteria, use the
+        "Wire difference" form instead. If the problem is a security issue, or lets someone
+        identify users of this client, report it privately through the Security tab.
+
+        Remove every secret before you paste anything: UUIDs, REALITY private or public keys,
+        short IDs, Hysteria2 passwords and obfuscation keys, node addresses.
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `lc-tunnel --version` on the router.
+      placeholder: v0.1.0 or 1a2b3c4d-dirty
+    validations:
+      required: true
+
+  - type: dropdown
+    id: package
+    attributes:
+      label: Package
+      options:
+        - lite-client (REALITY only)
+        - lite-client-hysteria (both planes)
+        - built from source, not packaged
+    validations:
+      required: true
+
+  - type: dropdown
+    id: plane
+    attributes:
+      label: Plane
+      options:
+        - VLESS + XTLS-Vision over REALITY
+        - Hysteria2
+        - not specific to a plane
+    validations:
+      required: true
+
+  - type: input
+    id: device
+    attributes:
+      label: Device and OpenWrt version
+      description: Model, OpenWrt target and release. `cat /etc/openwrt_release` has the last two.
+      placeholder: Xiaomi Mi Router 4A Gigabit, ramips/mt7621, OpenWrt 25.12.5
+    validations:
+      required: true
+
+  - type: input
+    id: server
+    attributes:
+      label: Server side
+      description: What the node runs, with its version, if you know it.
+      placeholder: Xray-core v26.9.9, or hysteria app/v2.12.3
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you saw, and what you expected to see instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: How to reproduce
+      description: Steps, from a started service to the failure. Say how often it happens.
+    validations:
+      required: true
+
+  - type: textarea
+    id: config
+    attributes:
+      label: Configuration
+      description: "`uci show lite-client` with secrets replaced by `REDACTED`."
+      render: text
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: |
+        `logread | grep -E 'lite-client|lc-tunnel'` around the failure. If it is about throughput or stalls, add the
+        statistics block (`kill -USR1 $(pidof lc-tunnel)` and read the log again). For Hysteria2
+        handshake problems, `LC_QUIC_LOG` output helps, but it is long; attach it as a file.
+      render: text
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I removed credentials and node addresses from everything above.
+          required: true
+        - label: I searched the existing issues and DIVERGENCES.md for this behaviour.
+          required: true

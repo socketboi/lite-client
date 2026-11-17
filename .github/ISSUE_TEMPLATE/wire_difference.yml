@@ -1,0 +1,114 @@
+name: Wire difference
+description: This client puts something on the wire that the reference client does not, or reacts to the server differently.
+labels: ["wire-difference"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Any behaviour that differs from the reference is a defect unless DIVERGENCES.md lists it,
+        so these reports matter more than most. Check that list first: a difference already
+        registered there is known and has its reason written down.
+
+        **If the difference lets someone identify users of this client** (a fingerprint, a size
+        or timing pattern, an answer to a probe that the reference would not give), do not file it
+        here. Report it privately from the Security tab.
+
+        A report needs captures from both clients against the same server, with the same
+        settings, ideally from the same machine. A capture of our client alone cannot show a
+        difference. CONTRIBUTING.md, "Reporting a wire difference", explains how to take them.
+
+  - type: dropdown
+    id: plane
+    attributes:
+      label: Plane
+      options:
+        - VLESS + XTLS-Vision over REALITY
+        - Hysteria2 (QUIC)
+        - REALITY fallback (the spider, when the node did not authenticate us)
+    validations:
+      required: true
+
+  - type: input
+    id: ours
+    attributes:
+      label: Our version
+      description: "`lc-tunnel --version`, or the commit you built."
+    validations:
+      required: true
+
+  - type: input
+    id: reference
+    attributes:
+      label: Reference client and version
+      description: The client you compared against, and its exact version.
+      placeholder: Xray-core v26.9.9, or hysteria app/v2.12.3
+    validations:
+      required: true
+
+  - type: input
+    id: server
+    attributes:
+      label: Server and version
+      placeholder: Xray-core v26.9.9 with REALITY, or hysteria app/v2.12.3 server
+    validations:
+      required: true
+
+  - type: textarea
+    id: settings
+    attributes:
+      label: Settings used on both sides
+      description: |
+        Fingerprint (`firefox`, `chrome`, ...), flow, SNI, Chrome parrot on or off, Salamander
+        obfuscation, port hopping, receive rate. Both clients must use the same ones. Replace
+        secrets with `REDACTED`.
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: difference
+    attributes:
+      label: The difference
+      description: |
+        What differs, and where in the captures: packet or record numbers, offsets, sizes,
+        timings. For a ClientHello, paste the output of `fp diff reference.bin ours.bin`.
+    validations:
+      required: true
+
+  - type: textarea
+    id: capture
+    attributes:
+      label: How you captured
+      description: The capture commands, the interface, and anything filtered out.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: files
+    attributes:
+      label: Captures
+      description: |
+        Attach both captures (zip them; GitHub does not accept .pcap directly). If a TLS key log
+        or a qlog from the reference helps, attach it too, but only from a test setup with
+        throwaway credentials.
+    validations:
+      required: true
+
+  - type: input
+    id: source
+    attributes:
+      label: Where the reference decides this (if known)
+      description: File and lines in the reference source, for example `quic-go/connection.go:887-892`.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: The difference is not listed in DIVERGENCES.md.
+          required: true
+        - label: Both captures were taken against the same server with the same settings.
+          required: true
+        - label: The captures contain only throwaway credentials, or none.
+          required: true

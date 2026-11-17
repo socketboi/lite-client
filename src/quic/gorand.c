@@ -1,0 +1,299 @@
+#include "quic/gorand.h"
+
+#define TAP 273 /* rngTap */
+#define MASK 0x7fffffffffffffffULL /* rngMask */
+#define INT32MAX 2147483647 /* int32max */
+
+/* rngCooked: the state of the generator after 780e10 iterations, which Seed XORs into what it
+ * derives from the seed. Copied by program from GOROOT/src/math/rand/rng.go, each int64 written as
+ * its two's-complement bits — the table holds values C has no signed literal for. */
+static const uint64_t cooked[LC_GORAND_LEN] = {
+    0xc5f74a33eb98ffeaULL, 0xc07b4a41ba965f5bULL, 0x135ec513cb81af0fULL,
+    0x4a04fb5ca74395ebULL, 0xa7e8831c7710cf8eULL, 0x7d5de4e88f37c1c3ULL,
+    0x6321cf7743ff85a9ULL, 0x42cb06556a9ff961ULL, 0x6e26c8d140e8d7d2ULL,
+    0x49a7511f3411faa0ULL, 0x71ed774922a65055ULL, 0x9d5c9fc65fea2d5cULL,
+    0x3fbdab394a014368ULL, 0x70fa33596992340bULL, 0xae10fb4ecea66a02ULL,
+    0xf79fbca98bbcd18aULL, 0x97f7ccb12ea380acULL, 0x0191d794caf32b1bULL,
+    0x3f6a323424e32cafULL, 0xc642cc921f01142bULL, 0xa122869f4ff38068ULL,
+    0xa5b1a31127af3920ULL, 0x5b07a4f9bdc29d96ULL, 0x6a2a973c29812586ULL,
+    0x6aa433dbf77a52e1ULL, 0x8394216e3b8ac99eULL, 0xdb80a9c5515b997cULL,
+    0x03c3f2eff3cbf769ULL, 0xa6b5e431eeff210cULL, 0x0ec85334992953f5ULL,
+    0x2e6a1432df10d1e9ULL, 0xbde4629959d1b149ULL, 0x67994c3876387951ULL,
+    0x0e15d461559bae63ULL, 0xbdbf96c4e9d2a077ULL, 0xb04f62866ada20f3ULL,
+    0x2190da1646db97bfULL, 0x5071873c1832957aULL, 0x3e3b503a19da904bULL,
+    0x33e388a5f2c78528ULL, 0xbec70bac19d0e877ULL, 0x00256970f81bf072ULL,
+    0xf7d18a14f64fa886ULL, 0xa46ef978b4d4734cULL, 0x782ff1573127a78eULL,
+    0x00241b0ad59beba6ULL, 0xdac549591fe95b2fULL, 0x6195faf2884c2d39ULL,
+    0x569c2bbdb0ef345dULL, 0x0b8b6039508ce21eULL, 0xef1576705435d2bbULL,
+    0x1d5e900af5f1d8f7ULL, 0x1e902d187d7fd437ULL, 0x7f227b7c8fe0eb79ULL,
+    0x38790e6201ebbb98ULL, 0x44818eac7922e171ULL, 0x0658d6c550dad340ULL,
+    0x84bfb894cc72969aULL, 0xa7855141e3b329bdULL, 0x9cb31556b1bae746ULL,
+    0x3ca09004f9686f49ULL, 0x0c50146d7e508769ULL, 0xcd35d8ff935ac970ULL,
+    0xde9818b4aa1554d8ULL, 0x4df37efd6433daa0ULL, 0xf591e9ad05b2e056ULL,
+    0x1767eb0bdbf83e29ULL, 0xb8247292535299f2ULL, 0xbae645975a5e4cebULL,
+    0xecea78155c3bc32bULL, 0x4e295e5357ace86eULL, 0x8b906a9a4fadbb08ULL,
+    0xfd50086af64463c9ULL, 0xad0385acfd19d6fcULL, 0xbbe6d4a5e1d13a9fULL,
+    0xfc099f33b79b039cULL, 0xd9782224840c5a35ULL, 0x174e38bc45d51acfULL,
+    0x53f82f9f54de4e3eULL, 0xe10dfa0a87b3ef0eULL, 0xea09d9ec7b439769ULL,
+    0x519ec3c7cc4c5011ULL, 0x0b47990fc413e3d5ULL, 0x3f07e07ecfce5be2ULL,
+    0xa5d2d0b8b71922beULL, 0x451eea1fc87cc761ULL, 0xc8505edef7f1d6ddULL,
+    0xfb6ed78e001ce905ULL, 0xd7cc0a3644f468baULL, 0x14c231db2e4429d0ULL,
+    0xe21ccd9a90943dd3ULL, 0x664869f5288fc2d1ULL, 0xddc56f604e168fb5ULL,
+    0x4151e4abb0b1faf6ULL, 0xec9647e8cea7b927ULL, 0x76a742187dbe61deULL,
+    0x80778d4049780e3cULL, 0x92714446c26ce413ULL, 0x65475bc019e7700bULL,
+    0x0e08781d60d86d17ULL, 0x9f0f0fe9d5f571e0ULL, 0x476e62bf33886e57ULL,
+    0x8c710cff524eb4e6ULL, 0x24e856a59e3899a5ULL, 0x549f7c8b5783189aULL,
+    0x9808539c06020014ULL, 0xb8fc59eeb2515467ULL, 0xf38fff8b8499a614ULL,
+    0xf5a62be73a3d5222ULL, 0x508b82832b4c4838ULL, 0xf5109fc7682ff8deULL,
+    0xd31cadf15cc53f0cULL, 0xc1720509406b5826ULL, 0xe900715210bc96faULL,
+    0x0704fe3536d393fbULL, 0xc65c9b6eccaefb4aULL, 0x8bafc73092be4019ULL,
+    0x07f0b599d77889eaULL, 0x18de0a49b8fa589bULL, 0x2f174e71c9830ff0ULL,
+    0xb470b780a26785ddULL, 0x20a6b76123b162beULL, 0x91efbd24cdc58322ULL,
+    0xfb7bb75026b32623ULL, 0xd03d1caf9a1f04d0ULL, 0xa5f0f909bcaee921ULL,
+    0x46aa7ced9d1c8e0bULL, 0xfcd8a79e7a62b6f9ULL, 0x3ac4cf05bce83f14ULL,
+    0x45c579a008a037c4ULL, 0x4053888e527912d0ULL, 0xf88fa0b2289f7b17ULL,
+    0x51fbaf5d2002bddaULL, 0x8ae403a812ca4784ULL, 0x0d7ea237329fa450ULL,
+    0xcb3f04bf02b6f208ULL, 0xc796643e8a39ed33ULL, 0xfd92d79ed75b6419ULL,
+    0x216821c8b258e8acULL, 0xe93d3aff7b46e931ULL, 0x36b0858cfcb72b6aULL,
+    0xae5e3c9fe7ff1167ULL, 0x2af4c395391cc2a5ULL, 0xe6c4fd076feb7676ULL,
+    0x50efb5fb31ede773ULL, 0x6d7f243359dbfcaeULL, 0x7193e740340e0fdbULL,
+    0x8ff51f73a4c6dd92ULL, 0x94534b6efa1ca966ULL, 0xc06a724520d70d41ULL,
+    0x30cd16bd19120592ULL, 0x8d456b580c2cd6dcULL, 0x5c62bc0d6a8429efULL,
+    0x48744ea9b8e9395eULL, 0x18ef14825c84aee1ULL, 0x4a1e32b73a71e234ULL,
+    0x0fee6f27c45228c0ULL, 0x464e2e3be0d2e4a1ULL, 0x23bb67f482e16008ULL,
+    0x0f11b541e8247327ULL, 0xae7df90c7d2aafd7ULL, 0x54e1f496142c391aULL,
+    0x1d400ef625fa4274ULL, 0x9906966610ce9e13ULL, 0x22455934d7c1ccdaULL,
+    0xe6414239b7da9220ULL, 0xb49f9091f6275556ULL, 0x82916b3d64288abdULL,
+    0x9f52d0a1c7066fa0ULL, 0x642a666cfb8cf0a1ULL, 0x8c9d981db063ad83ULL,
+    0x63dfa26158b67e4aULL, 0xce3cfe36ebecc2dfULL, 0xb6e4eb2ba55364ffULL,
+    0x6fd2179e0d7717d1ULL, 0xb971a2b7362247dbULL, 0xdbe5cf25d510c53bULL,
+    0x930f28ad73735261ULL, 0x5a95dd01047feb8bULL, 0x30adb1407358b45aULL,
+    0x7fb44776784c1083ULL, 0x1b20e8f4eb075406ULL, 0xdc275f40b6c7c0d9ULL,
+    0x732df8dda67b0f27ULL, 0xb62637afc484c885ULL, 0x61c98649838bf631ULL,
+    0xdf061fee30277f58ULL, 0x95d322052dac1455ULL, 0x7ad30486e478aee9ULL,
+    0x3267221f4aced145ULL, 0x479807052c3566b8ULL, 0xa8025350a77ea0b9ULL,
+    0x421a7ec2fc169cd3ULL, 0x57273ab05129a700ULL, 0xbae4f7fb719f43f2ULL,
+    0x1c5bd857e8b8bf48ULL, 0xdad594186971f359ULL, 0x3f518aad9c427014ULL,
+    0x4c43c3b8cc8e8218ULL, 0x981fba566f92dfb7ULL, 0x07acaac55435c0acULL,
+    0x5fb0881038cbbc8fULL, 0xf243b5556cbeba73ULL, 0x63149f303be79fd4ULL,
+    0xf6aade431f712475ULL, 0x4cd2a557b6cbc24bULL, 0x21bc6975c169de72ULL,
+    0xcaf78cf40c768134ULL, 0xf13cdd624a12159fULL, 0xd573d0041b390d3eULL,
+    0x69ea8bd93bade806ULL, 0x578baf3d78cd61f2ULL, 0x3318a93a7f689dc9ULL,
+    0x2da7501cbdbe5235ULL, 0x5b6d448c9bb11200ULL, 0x036566ca66f231b4ULL,
+    0xb89e51e9e2b737e4ULL, 0x704687541c9b68cfULL, 0x28df28a35d2937c9ULL,
+    0x8bfeb2756944b0b5ULL, 0x29c24143c2234e9cULL, 0xf4fd794f8d02068fULL,
+    0x0590f068df15e57dULL, 0xe4ad98adab8dc009ULL, 0x4155b1828194a406ULL,
+    0xce463027d4ff743fULL, 0xd306231168ec0845ULL, 0xae01984986c0c339ULL,
+    0xcc61983656980e5aULL, 0xb6b4b212af3d051aULL, 0x70aaf14a706ce17aULL,
+    0x3547cbc995de3a40ULL, 0x6202b8d9e9e8565fULL, 0x8a49ea181ddbac34ULL,
+    0x53a7bcb92853ce41ULL, 0xa2aa132546a16f3aULL, 0xd6c166634bc92862ULL,
+    0x92ff6acebc93a071ULL, 0x7a403280a96cea51ULL, 0x5a183b8f81665a24ULL,
+    0x222b4c80d2c0e464ULL, 0x859e3d4d58ba3aa6ULL, 0xb9a28389cb2fe563ULL,
+    0x83a20cb89512fee4ULL, 0xcbd691b061b30cbdULL, 0x8839baf8f3ac9f09ULL,
+    0x5ddf03b3edd1c4b8ULL, 0xf62694c4cb82ed09ULL, 0xd0c603b9879bd360ULL,
+    0x8558daf780426657ULL, 0xc87fdb1b629e32abULL, 0xd77938d516862fe1ULL,
+    0xe33a56962759ec00ULL, 0x051bc82f174b90d9ULL, 0xab3b5debcad25c86ULL,
+    0xa8766bd0dd9b35dbULL, 0x425f26b683ca1487ULL, 0x5d3c2b40a076f653ULL,
+    0x7464e98a72f8d634ULL, 0x2f02dd3eea4e7841ULL, 0x40977fe842527877ULL,
+    0xfbf01ad4922b1d62ULL, 0xca959c2a8b4eea29ULL, 0x69ca7ca110533802ULL,
+    0x6b36496357247bd9ULL, 0x7f7c07645ca7b232ULL, 0xb8c63fa50ae3677bULL,
+    0xa0b7fd74703947d8ULL, 0x231fb1a0dc8ce079ULL, 0x16b63342b7c96e77ULL,
+    0xcd39a909d7e68027ULL, 0x1427685b19caecddULL, 0x9c9c6cd28e91b74dULL,
+    0x91c1fb790e0d3a54ULL, 0x7e67d3bdb81bb611ULL, 0xd396fc0d89f6e211ULL,
+    0x457eacfbb049eb22ULL, 0x1de1979bf5654dd5ULL, 0x5d436ca7585d28caULL,
+    0xd3d7e2863218d979ULL, 0x2fa7be3ccf9d1645ULL, 0x1fb7a7e17b9eccb0ULL,
+    0x2b2b1fced929c282ULL, 0xd85a90375e64310dULL, 0xcb336a1611227dbdULL,
+    0x636925f5baf870cdULL, 0x43e0d0254b84715eULL, 0x080ec57577219247ULL,
+    0x175ee40f58fbd971ULL, 0x3d78cc365badbce1ULL, 0x8495a07683903295ULL,
+    0x8f89c0d3396a3b53ULL, 0x639ba81c88d888a6ULL, 0x3faf8d9c775ca781ULL,
+    0xeac40d3f519d2893ULL, 0x01fe31d8c7df7dc4ULL, 0x036d8003387dd6dbULL,
+    0x8c0621f768220a97ULL, 0x59d6a8cc7a082707ULL, 0x2aea572af8467560ULL,
+    0x1c910136c9fdf9c3ULL, 0xc73eddfe111385e2ULL, 0x79edb9a2a6a387dfULL,
+    0xd556d17adcc5f6fbULL, 0xf72709f96b28a3c7ULL, 0x552d69f0428dce6aULL,
+    0x9cbbb4be9a92c216ULL, 0x4f37aef6caf41c5dULL, 0xd3431110cdd7a998ULL,
+    0x3c7c1de5b3cc1dcaULL, 0x048311a7625eabd9ULL, 0x5ee41cb40ca81e2cULL,
+    0x43385b68e51dbffcULL, 0xd36a1f70d4f9a2ffULL, 0xcaeaccb927b0cb5cULL,
+    0x3fddae4163e010e4ULL, 0x0e7f5452a8c91ee0ULL, 0x7e61315458970ccbULL,
+    0x8b821c0b10054c75ULL, 0xc444cf11f9840608ULL, 0x2536b7a7602f6b4dULL,
+    0x331786d5a126f97fULL, 0xc9a9cd708372db93ULL, 0xd7e75a07542451daULL,
+    0xa4e5a10d28659104ULL, 0x9024ebcbf8b8e6afULL, 0x08137c3380f32523ULL,
+    0x32a31118a95e425fULL, 0xbd640b6140802b1eULL, 0x967e3cd0f12b1c5fULL,
+    0x031089e87fbab9a7ULL, 0xf11bfbb3ba3e0841ULL, 0x3b7fc3ad0d1cd36bULL,
+    0xbfb2f4d968b759c3ULL, 0x4c8475564905d202ULL, 0xe0a80b2a6236fa83ULL,
+    0x86a5b8671a833ae3ULL, 0x79608828eb8fe58dULL, 0x032bcb9f5721e717ULL,
+    0x12d224e5dc7e16deULL, 0x29e68b8251e0d495ULL, 0x2bc04a7508cb08a3ULL,
+    0x85f835a648329d25ULL, 0x4d2799f797ec19a8ULL, 0x443aadc076f2ed10ULL,
+    0x89357de277e46717ULL, 0xaf7907aeb63c9d6cULL, 0x27ce6be004db5b35ULL,
+    0x9bbf0228d95bf1d8ULL, 0xae31e17b25e1b363ULL, 0x23e9429e957db925ULL,
+    0x950e5fab3c7e6825ULL, 0x2aea3671bf9f5933ULL, 0xb2d2ef433932102cULL,
+    0x0d7ed21ec77fc8c1ULL, 0xea5f1280f48e6247ULL, 0x17b747cdf311ae42ULL,
+    0xe001060ea9fa838eULL, 0xaca7508c5bccfc84ULL, 0xa3aaa0843f04f963ULL,
+    0xf949f7a4e8ebd3a5ULL, 0x22876bdefd41df6cULL, 0xc124724f07e69e7cULL,
+    0xbf470df23d5aa6b4ULL, 0x2998352099f590b8ULL, 0x11cc90f45895653dULL,
+    0x03550da1ab28f8d1ULL, 0x7842cc5c2b1b34dbULL, 0x08b79b3694ac8400ULL,
+    0xbf72d50b84f96e2cULL, 0x947079f8eb08f590ULL, 0x696cb72182050872ULL,
+    0xd4885bc9ac36d5a7ULL, 0x6cb888b579fe97e1ULL, 0x629482105204e4fdULL,
+    0x3cef790816b93701ULL, 0xbda77a26be136556ULL, 0xfb8f861314dda828ULL,
+    0x08a2b7b803ae5bcfULL, 0xd3c8a91ed0323140ULL, 0x870001a0b867ec3eULL,
+    0xe4f6c1f9b093dde5ULL, 0x8e086becbc0b8378ULL, 0x9e755197c06ffcc7ULL,
+    0x246705ee34f204f8ULL, 0xc7927582d516264cULL, 0xb3e17ba47546133cULL,
+    0xa33f111b5caab4e2ULL, 0xa23d8e161443255eULL, 0x48f128b344d0819cULL,
+    0x6cd122fb39ab204dULL, 0x5c2910bf238f36aaULL, 0x90aeac10e05f9bbaULL,
+    0x9d54b6b00fe42acaULL, 0xe88f64387a0fcdcbULL, 0xc45a205f01473609ULL,
+    0xc768ed8eb6b8c82dULL, 0xf225920d43fd23acULL, 0x25bdad5a8a817964ULL,
+    0x7ebc9cefb9015aabULL, 0x3c1ee78fa4ea733dULL, 0xe30e85d1757922a4ULL,
+    0x61123dc5e081fe21ULL, 0xdc86c11079674e66ULL, 0x8918973fb91ab9fbULL,
+    0x00d4ee55ca6d8c2aULL, 0xd500476d5215b5b5ULL, 0xfc5068b3e2ea6d2aULL,
+    0x205da910dd23cb85ULL, 0x979b5e11369f775bULL, 0x2bc872747d65ead7ULL,
+    0x96ba83aa2ac19de7ULL, 0xa2258710d3a06bd5ULL, 0x02bcfbd9169343e7ULL,
+    0x88eecd99246b6273ULL, 0x234b301b2d3c0302ULL, 0x3c61095d0931ecbfULL,
+    0xc1fbeae253e44498ULL, 0x9bf8d56e39d28810ULL, 0xef025e3275852770ULL,
+    0x3b81d83bc6a5b26dULL, 0x740e3af17358a76bULL, 0x5a0491610c217837ULL,
+    0xb234c04ee9707bbaULL, 0xe8d67481cf12c324ULL, 0x3dc1a80712de14dfULL,
+    0x9646cd056265e405ULL, 0xc9ed5b85fe5de223ULL, 0xc034e6309514ca00ULL,
+    0xa55cb1a9ea35e9bdULL, 0x83585dac1418cf4cULL, 0xc6bfe6b67ae71dfaULL,
+    0xedde6a8095841598ULL, 0x8c478074a66108d3ULL, 0x49f4fb28492601c4ULL,
+    0x6c1f1e9a65e7acb8ULL, 0x44c3f220e0a3a35fULL, 0xc4422797ac160d7eULL,
+    0xa9bed55a11ad2c15ULL, 0x29bdbe2cde52ac8dULL, 0xa2486ed01638fb0cULL,
+    0x7be91fdd8fa25058ULL, 0x6d06c94a2118cf50ULL, 0xbe19f2b9fcb649e5ULL,
+    0x6da310d0ddefe702ULL, 0x9db4d6197fe76870ULL, 0xa1a8e96dd484eb63ULL,
+    0xa2803dfd82f85916ULL, 0x3a1a0a44d7644c46ULL, 0x1a25188bb552aa62ULL,
+    0xfa3eab18c620bd11ULL, 0x33d24f4edd10ea99ULL, 0x386d39256536cc6cULL,
+    0x607e759efb2ba1e8ULL, 0x921ebb3d7c6c6071ULL, 0x96ba6b088f86692fULL,
+    0xb2bd2aeaeafed279ULL, 0xb70cc2def3ab10acULL, 0x2b1c1284b0b6db2bULL,
+    0xd7d4c4db5bbdff92ULL, 0x3f5b8190a0a0241eULL, 0x1b79f6457e60cfaeULL,
+    0xa05c318c94181e91ULL, 0x3480a671b033e3d5ULL, 0x7579955efbbaa755ULL,
+    0x2777c9f6d0c6b0d7ULL, 0x2a0f21c2f6662c43ULL, 0xc286b4bc45869bbcULL,
+    0x3de266b1c86ed249ULL, 0x0596478ee80942c5ULL, 0x6fd3618b2ee6ae1bULL,
+    0x3f08073a3e5dea77ULL, 0x0e7847d01d6e71afULL, 0xcd1f81afc4fbaafeULL,
+    0x24be71c60778c940ULL, 0x1dc2b6df046a9621ULL, 0xd0944e93950f6ccfULL,
+    0xe2c767041ea34007ULL, 0x521bf9c9206576c6ULL, 0x866b7a2bd7715e51ULL,
+    0x7a97753c8c793641ULL, 0x52daac19784a65e4ULL, 0x07d3110b7c73f7ebULL,
+    0xa66b273fbcc429b7ULL, 0x16302dc85a75540aULL, 0xc840d3700a56e4deULL,
+    0xd6875303fcd05bffULL, 0xabbeed06a5e32588ULL, 0x758a6526f8636a3aULL,
+    0x01be7adae8e62038ULL, 0xc9b4bec75bc4f40aULL, 0xdc7a69ce0a9fc1c3ULL,
+    0xf93f853c0adbaa64ULL, 0xbe48b8658e39d5b6ULL, 0x5233cc88f307cb85ULL,
+    0x81f48c566746e404ULL, 0xe6e72b2f3e111192ULL, 0x6ee3ad5d7b4333d5ULL,
+    0x3bebf80abf44e35eULL, 0x324f3dfa2996372cULL, 0xa60900d584d3294fULL,
+    0xcfb39707d3e017c8ULL, 0xd33cd1090a56f237ULL, 0xfae17ac7e5605d43ULL,
+    0xc8c0106f0ead4419ULL, 0x89bba8037b2a60beULL, 0x6999983c12a6557dULL,
+    0x29ecb289d4fc6351ULL, 0xdc4e3ec308888d22ULL, 0x2492188c7c1156a7ULL,
+    0x476502781cf85a10ULL, 0x8e5d5db3b1c10b44ULL, 0x15bff6623ba91eb7ULL,
+    0x716a28bba3f09c65ULL, 0xd7f47607c92f30f1ULL, 0x9e04907834879dadULL,
+    0xa611c59795db7099ULL, 0x9a74c74315758aa3ULL, 0x536d4c40116f3239ULL,
+    0x52539ac587ad97d0ULL, 0x1f1a1675f28959c3ULL, 0x8c6d78f5619e8324ULL,
+    0x2af1cfe563eff7adULL, 0x3f9d2212e5c94b1dULL, 0x7e023d467b37b61fULL,
+    0xfaab76adabeee96bULL, 0xcff95dd9926b62d1ULL, 0x3aa278a62172db76ULL,
+    0x9982abe519c8c867ULL, 0x34c2118df1f5857eULL, 0xfa7376b640136c80ULL,
+    0x98a7d04ca29ade2fULL, 0x6d9f14b04d77e77eULL, 0x4b3dad048bed47a1ULL,
+    0x4c9ee5e4931d3231ULL, 0xbaf4eba543f33d0aULL, 0x793aafa07373d926ULL,
+    0x986ea60fe6b39a32ULL, 0xe31f344f666361e6ULL, 0xf21cbedc44c049cbULL,
+    0xc4f752a0eb5e5403ULL, 0xaf1b99e27d410520ULL, 0x592740a0e5b8c3ddULL,
+    0x04fc4ea5fb446c97ULL, 0xad6e587f47afe7a6ULL, 0xde542c137b8384a4ULL,
+    0x2a0ffc0f7b301e5cULL, 0x820547300a5d8af4ULL, 0xd3c639c2087dc079ULL,
+    0x0a467ca8709a2bb6ULL, 0xe242bb6bb4da36deULL, 0x6079b0531ec90376ULL,
+    0x058ccf98dc1843f7ULL, 0x8417b417b011aec1ULL, 0xecdedd4ff0dd641bULL,
+    0x8c3787282349e832ULL, 0xd5f0bb8816e7e8fbULL, 0x85b650480fd8c2f4ULL,
+    0x7d45aa734f760b6dULL, 0x5962428553d20814ULL, 0x400e2ba01968e7c4ULL,
+    0x077e19b9a3f76000ULL, 0x1d17558f6164030cULL, 0x79753148c0e6c59fULL,
+    0x9a77d2f2ef3bd843ULL, 0x666eb88d8701e16fULL, 0x5572e7ce34288668ULL,
+    0xeb8d82b15491d607ULL, 0x77c265a71aebbe54ULL, 0x4947dddd6f3e9e07ULL,
+    0x628dfe635c795586ULL, 0x22673e39d43ff99bULL, 0x637e086dc78cf522ULL,
+    0xee37e3669f7e9c66ULL, 0x92d7bb47a4afe838ULL, 0x1f9eabdfdbe2b7bdULL,
+    0x324fca6af2b5c1d1ULL, 0x59e4a152525b1b29ULL, 0x7c91d10a8d75740eULL,
+    0xcc7c533a7fca95d8ULL, 0x1266fbf77386b1dbULL, 0x689a66ba46d1c3bdULL,
+    0x4bd671b124b5701aULL, 0x2c43fd0a9eaec04dULL, 0x58143117e4e16555ULL,
+    0x8358c5bb1248ac23ULL, 0xaaf677bd80e30ac5ULL, 0xfc997227a4f07f8fULL,
+    0xa848cc5d9cb0e150ULL, 0x640a711eb0e49b41ULL, 0x64fcbfa01dca3978ULL,
+    0x980aab2fff6bc784ULL, 0x395c6750aa42e65eULL, 0x287fea4c9695f3f4ULL,
+    0x9516361749f6428aULL, 0xc977d592999f2194ULL, 0xc45166d9f6935ff8ULL,
+    0xa7f503a28f431ca9ULL, 0x51d3a3c351be10ecULL, 0xf579e080162896e9ULL,
+    0xe5b5e9385b202824ULL, 0xfbba1e4a59b0c60cULL, 0xa8de655829aab207ULL,
+    0xe1de048dc78b382eULL, 0x74535a96cc7adfd7ULL, 0x7e57a19b735ef03bULL,
+    0x39a00a3a31c025c6ULL,
+};
+
+/* seedrand: x[n+1] = 48271 * x[n] mod (2**31 - 1), by Schrage's method so that nothing overflows
+ * 32 bits — which is also why this one can stay signed. */
+static int32_t seedrand(int32_t x)
+{
+    const int32_t a = 48271, q = 44488, r = 3399;
+    int32_t       hi = x / q;
+    int32_t       lo = x % q;
+    x = a * lo - r * hi;
+    if (x < 0)
+        x += INT32MAX;
+    return x;
+}
+
+void lc_gorand_seed(lc_gorand *r, int64_t seed)
+{
+    r->tap = 0;
+    r->feed = LC_GORAND_LEN - TAP;
+
+    /* Truncating division in both languages, so a negative seed lands where Go puts it. */
+    seed = seed % INT32MAX;
+    if (seed < 0)
+        seed += INT32MAX;
+    if (seed == 0)
+        seed = 89482311;
+
+    int32_t x = (int32_t)seed;
+    for (int i = -20; i < LC_GORAND_LEN; i++) {
+        x = seedrand(x);
+        if (i >= 0) {
+            uint64_t u = (uint64_t)x << 40;
+            x = seedrand(x);
+            u ^= (uint64_t)x << 20;
+            x = seedrand(x);
+            u ^= (uint64_t)x;
+            u ^= cooked[i];
+            r->vec[i] = u;
+        }
+    }
+
+    /* A fresh Rand: nothing left over from a previous Int63. */
+    r->read_val = 0;
+    r->read_pos = 0;
+}
+
+/* Int63: Uint64 with the top bit cleared. */
+static uint64_t int63(lc_gorand *r)
+{
+    if (--r->tap < 0)
+        r->tap += LC_GORAND_LEN;
+    if (--r->feed < 0)
+        r->feed += LC_GORAND_LEN;
+    uint64_t x = r->vec[r->feed] + r->vec[r->tap];
+    r->vec[r->feed] = x;
+    return x & MASK;
+}
+
+void lc_gorand_read(lc_gorand *r, uint8_t *p, size_t n)
+{
+    int      pos = r->read_pos;
+    uint64_t val = r->read_val;
+    for (size_t i = 0; i < n; i++) {
+        if (pos == 0) {
+            val = int63(r);
+            pos = 7;
+        }
+        p[i] = (uint8_t)val;
+        val >>= 8;
+        pos--;
+    }
+    r->read_pos = pos;
+    r->read_val = val;
+}
+
+double lc_gorand_float64(lc_gorand *r)
+{
+    /* (*Rand).Float64, GOROOT/src/math/rand/rand.go: Int63 over 2^63, drawn again on the one value
+     * that rounds up to 1. The division is by a power of two and so exact; the rounding is in the
+     * conversion, round to nearest even in both languages. */
+    for (;;) {
+        double f = (double)int63(r) / 9223372036854775808.0;
+        if (f != 1.0)
+            return f;
+    }
+}

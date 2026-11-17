@@ -1,0 +1,67 @@
+name: Prepare the build machine
+description: >
+  Reference trees in vendor/, the lc-build:local image, the OpenWrt cross toolchains in dl/ and the
+  link stubs. Everything `make check-spider-behavior` needs and a fresh clone does not have. Expects the repository
+  to be checked out in the workspace.
+
+runs:
+  using: composite
+  steps:
+    # vendor/ is never committed. tools/vendor/fetch.sh clones every reference tree at its pinned
+    # revision; the pins live in the script, so the key follows it and a moved pin is a cache miss.
+    # Only an exact hit is restored: fetch.sh skips a tree that already has a .git and only warns
+    # when it sits at another revision, so a stale cache would reach check-vendor and fail there.
+    - name: Cache vendor/
+      uses: actions/cache@v4
+      with:
+        path: vendor
+        key: vendor-${{ hashFiles('tools/vendor/fetch.sh') }}
+
+    - name: Fetch the reference trees
+      shell: bash
+      run: sh tools/vendor/fetch.sh
+
+    # The image has to be built after vendor/ is there: docker/Dockerfile copies the go.mod files of
+    # three vendored modules to resolve the Go tools' dependencies at build time. The build context
+    # uses .dockerignore to exclude downloads, build output and Git metadata. The
+    # vendor module files remain available to the build.
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Build lc-build:local
+      uses: docker/build-push-action@v6
+      with:
+        context: .
+        file: docker/Dockerfile
+        tags: lc-build:local
+        load: true
+        cache-from: type=gha,scope=lc-build
+        cache-to: type=gha,scope=lc-build,mode=max
+
+    # Only the unpacked toolchains are cached. The Makefile targets are the directories, so a
+    # restored directory makes `make tc-fetch` a no-op and the tarballs are never needed again.
+    # The key is the pinned checksums, not the whole Makefile, which changes with every commit.
+    - name: Key for the toolchains
+      id: tc
+      shell: bash
+      run: echo "key=openwrt-tc-$(grep -E '^(OPENWRT_RELEASE|TC_SHA256|TC_A64_SHA256) ' Makefile | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+
+    - name: Cache dl/tc and dl/tc-a64
+      uses: actions/cache@v4
+      with:
+        path: |
+          dl/tc
+          dl/tc-a64
+        key: ${{ steps.tc.outputs.key }}
+
+    # The only step after the image that needs the network: downloads.openwrt.org, checked against
+    # the sha256 pinned in the Makefile.
+    - name: Fetch the cross toolchains
+      shell: bash
+      run: docker run --rm -v "$PWD:/w" -w /w lc-build:local make tc-fetch
+
+    # Not cached: the stubs carry the names the sources call, so they are made fresh from this
+    # commit's objects every time. See the script's header.
+    - name: Make the link stubs
+      shell: bash
+      run: docker run --rm --network none -v "$PWD:/w" -w /w lc-build:local sh .github/scripts/link-stubs.sh

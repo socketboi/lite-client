@@ -1,0 +1,59 @@
+{
+  "_comment": [
+    "A local REALITY server, built from vendor/Xray-core, for testing the client end to end.",
+    "",
+    "It exists because the alternative is testing against production: the live node proved the",
+    "REALITY layer once, but every later change — VLESS framing, Vision, the data path — needs a",
+    "server that can be broken, restarted and instrumented without anyone noticing. The keys here",
+    "are generated for this file and are not secret; the uuid is a test identity and nothing else.",
+    "",
+    "dest points at a real site because REALITY needs a real one: a client that fails to",
+    "authenticate must receive genuine content, and that is also how a wrong client is diagnosed —",
+    "it gets avito, not an error.",
+    "",
+    "minClientVer IS LOAD-BEARING ON AN XRAY OLDER THAN v26.9.9 — see the same paragraph in",
+    "test/rig/server.json. Omitted, Xray up to v26.7.28 substitutes 26.3.27 (the branch v26.9.9 keeps",
+    "commented out, infra/conf/transport_security.go:117-119) and turns away every client reporting",
+    "less, which reads as a broken client rather than as a server setting."
+  ],
+  "log": { "loglevel": "debug" },
+  "inbounds": [
+    {
+      "tag": "reality-in",
+      "listen": "0.0.0.0",
+      "port": 8443,
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "3f2a6e51-7c4d-4a8b-9f10-2b7e5c8d1a63",
+            "email": "lite-client-plain"
+          },
+          {
+            "id": "c40253ba-8b09-424c-a26e-e95808c4c4f9",
+            "flow": "xtls-rprx-vision",
+            "email": "lite-client-test"
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "show": true,
+          "dest": "127.0.0.1:8444",
+          "xver": 0,
+          "serverNames": ["www.avito.ru"],
+          "privateKey": "PUT-YOUR-OWN-HERE-see-README",
+          "shortIds": ["15652ef0"],
+          "minClientVer": "0.0.0"
+        }
+      }
+    }
+  ],
+  "outbounds": [
+    { "tag": "direct", "protocol": "freedom" },
+    { "tag": "block", "protocol": "blackhole" }
+  ]
+}

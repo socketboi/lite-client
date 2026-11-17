@@ -1,0 +1,307 @@
+Receive windows that grow when, and as far as, quic-go's do.
+
+quic-go auto-tunes a receive window by epochs (maybeAdjustWindowSize,
+vendor/quic-go/flow_controller_base.go:55-75): an epoch begins with the first stream data and again
+after every adjustment; when a window update is written and more than half the window has been read
+in the epoch, in less than four times that fraction of the smoothed RTT, the window doubles up to
+its ceiling. A stream whose window grew raises the connection's to one and a half times its own
+(EnsureMinimumWindowSize, vendor/quic-go/flow_controller_connection.go:150-165). And the update
+itself is due once what is left of the advertised window has fallen to three quarters of it
+(hasWindowUpdate, :35-39).
+
+Upstream ngtcp2 grows a window when two updates come within two RTTs of each other, and sends an
+update only once MORE than a quarter has been read. This patch puts quic-go's rules in both places,
+with max_window and max_stream_window as quic-go's MaxConnectionReceiveWindow and
+MaxStreamReceiveWindow.
+
+For a client that does not parrot Chrome the ceilings are hysteria's defaults, 8 and 20 MB, the
+same as the windows it starts with (vendor/hysteria/core/client/config.go:51-53, :61-63), so
+nothing grows, as nothing grows in the reference. A client parroting Chrome starts at Chrome's 6 and
+15 MB (vendor/quic-go/config.go:109-125) under the same ceilings, and there the windows do grow:
+the stream's once to 8 MB, the connection's to 20 MB.
+
+diff --git a/lib/ngtcp2_conn.c b/lib/ngtcp2_conn.c
+index 462d0ff..fbb39d7 100644
+--- a/lib/ngtcp2_conn.c
++++ b/lib/ngtcp2_conn.c
+@@ -3970,16 +3970,39 @@ static uint64_t conn_initial_stream_rx_offset(ngtcp2_conn *conn,
+   return conn->local.transport_params.initial_max_stream_data_uni;
+ }
+ 
++/*
++ * conn_qgo_has_window_update is quic-go's hasWindowUpdate
++ * (vendor/quic-go/flow_controller_base.go:35-39): an update is due once
++ * what is left of the advertised window has fallen to three quarters
++ * of the window's size, WindowUpdateThreshold being 0.25
++ * (vendor/quic-go/internal/protocol/params.go:31).  |inc| is what was
++ * read since the last advertisement, which leaves |window| - |inc|.
++ * Upstream waited for more than a quarter to be read, one byte longer.
++ */
++static int conn_qgo_has_window_update(uint64_t window, uint64_t inc) {
++  /* Nothing read, nothing to announce; this also keeps a stream that
++     cannot receive, whose window is 0, from announcing one. */
++  if (inc == 0) {
++    return 0;
++  }
++
++  if (inc >= window) {
++    return 1;
++  }
++
++  return window - inc <= (uint64_t)((double)window * (1 - 0.25));
++}
++
+ /*
+  * conn_should_send_max_stream_data returns nonzero if MAX_STREAM_DATA
+  * frame should be send for |strm|.
+  */
+ static int conn_should_send_max_stream_data(const ngtcp2_conn *conn,
+                                             const ngtcp2_strm *strm) {
+-  uint64_t inc = strm->rx.unsent_max_offset - strm->rx.max_offset;
+   (void)conn;
+ 
+-  return strm->rx.window < 4 * inc;
++  return conn_qgo_has_window_update(
++    strm->rx.window, strm->rx.unsent_max_offset - strm->rx.max_offset);
+ }
+ 
+ /*
+@@ -3987,9 +4010,96 @@ static int conn_should_send_max_stream_data(const ngtcp2_conn *conn,
+  * be sent.
+  */
+ static int conn_should_send_max_data(const ngtcp2_conn *conn) {
+-  uint64_t inc = conn->rx.unsent_max_offset - conn->rx.max_offset;
++  return conn_qgo_has_window_update(
++    conn->rx.window, conn->rx.unsent_max_offset - conn->rx.max_offset);
++}
++
++/*
++ * conn_qgo_adjust_window is quic-go's maybeAdjustWindowSize
++ * (vendor/quic-go/flow_controller_base.go:55-75), run where quic-go
++ * runs it, as the window update is written (:43-51): when more than
++ * half of the window was read in the current epoch, and in less than
++ * four times that fraction of the smoothed RTT, the window doubles up
++ * to |max_window|; either way a new epoch begins.  Less than half read
++ * leaves the epoch running, and so does a smoothed RTT of zero — which
++ * is not the state before the first sample: quic-go's NewRTTStats
++ * starts it at DefaultInitialRTT, 100 ms
++ * (vendor/quic-go/internal/utils/rtt_stats.go:32-38), and ngtcp2 at the
++ * initial_rtt the client sets to the same.  This said otherwise until
++ * the reference's code was run (tools/qgovec).  |bytes_read| is what
++ * the application has read, which ngtcp2 keeps as the offset it
++ * would advertise next less the window.  It returns the window's new
++ * size.
++ */
++static uint64_t conn_qgo_adjust_window(const ngtcp2_conn *conn,
++                                       uint64_t window, uint64_t bytes_read,
++                                       ngtcp2_tstamp *epoch_ts,
++                                       uint64_t *epoch_offset,
++                                       uint64_t max_window, ngtcp2_tstamp ts) {
++  uint64_t in_epoch = bytes_read - *epoch_offset;
++  double fraction;
++
++  if (in_epoch <= window / 2 || conn->cstat.smoothed_rtt == 0) {
++    return window;
++  }
++
++  fraction = (double)in_epoch / (double)window;
++  if (ts - *epoch_ts < (ngtcp2_duration)(4 * fraction *
++                                         (double)conn->cstat.smoothed_rtt) &&
++      max_window > window) {
++    window = ngtcp2_min(2 * window, max_window);
++  }
++
++  *epoch_ts = ts;
++  *epoch_offset = bytes_read;
++
++  return window;
++}
++
++/*
++ * conn_qgo_ensure_min_window is quic-go's EnsureMinimumWindowSize
++ * (vendor/quic-go/flow_controller_connection.go:150-165), which a
++ * stream whose window has just grown calls
++ * (vendor/quic-go/flow_controller_stream.go:186-195): the connection's
++ * window is raised to ConnectionFlowControlMultiplier (1.5,
++ * vendor/quic-go/internal/protocol/params.go:16) times the stream's,
++ * as far as its own ceiling allows, and its epoch starts over — unless
++ * it was that large already.  What may be advertised next moves with
++ * the window, so that it stays what was read plus the window.
++ */
++static void conn_qgo_ensure_min_window(ngtcp2_conn *conn,
++                                       uint64_t strm_window,
++                                       ngtcp2_tstamp ts) {
++  uint64_t inc = (uint64_t)((double)strm_window * 1.5);
++  uint64_t size;
+ 
+-  return conn->rx.window < 4 * inc;
++  if (inc <= conn->rx.window) {
++    return;
++  }
++
++  size = ngtcp2_min(inc, conn->local.settings.max_window);
++  if (size > conn->rx.window) {
++    conn->rx.unsent_max_offset += size - conn->rx.window;
++    conn->rx.window = size;
++  }
++
++  conn->rx.epoch_ts = ts;
++  conn->rx.epoch_offset = conn->rx.unsent_max_offset - conn->rx.window;
++}
++
++/*
++ * conn_qgo_start_epoch is startNewAutoTuningEpoch
++ * (vendor/quic-go/flow_controller_base.go:77-80) for the first stream
++ * data a stream or the connection receives
++ * (vendor/quic-go/flow_controller_stream.go:87-90,
++ * vendor/quic-go/flow_controller_connection.go:49-52).
++ */
++static void conn_qgo_start_epoch(ngtcp2_tstamp *epoch_ts,
++                                 uint64_t *epoch_offset,
++                                 uint64_t unsent_max_offset, uint64_t window,
++                                 ngtcp2_tstamp ts) {
++  *epoch_ts = ts;
++  *epoch_offset = unsent_max_offset - window;
+ }
+ 
+ /*
+@@ -4387,26 +4497,21 @@ static ngtcp2_ssize conn_write_pkt(ngtcp2_conn *conn, ngtcp2_pkt_info *pi,
+         return rv;
+       }
+ 
+-      if (conn->local.settings.max_window &&
+-          conn->tx.last_max_data_ts != UINT64_MAX &&
+-          ts - conn->tx.last_max_data_ts <
+-            NGTCP2_FLOW_WINDOW_RTT_FACTOR * cstat->smoothed_rtt &&
+-          conn->local.settings.max_window > conn->rx.window) {
+-        target_max_data = NGTCP2_FLOW_WINDOW_SCALING_FACTOR * conn->rx.window;
+-        if (target_max_data > conn->local.settings.max_window) {
+-          target_max_data = conn->local.settings.max_window;
+-        }
+-
+-        delta = target_max_data - conn->rx.window;
+-        if (conn->rx.unsent_max_offset + delta > NGTCP2_MAX_VARINT) {
+-          delta = NGTCP2_MAX_VARINT - conn->rx.unsent_max_offset;
+-        }
++      /* Auto-tuned as quic-go does it (conn_qgo_adjust_window), not
++         by upstream's rule of doubling when two updates come within
++         two RTTs. */
++      target_max_data = conn_qgo_adjust_window(
++        conn, conn->rx.window, conn->rx.unsent_max_offset - conn->rx.window,
++        &conn->rx.epoch_ts, &conn->rx.epoch_offset,
++        conn->local.settings.max_window, ts);
+ 
+-        conn->rx.window = target_max_data;
+-      } else {
+-        delta = 0;
++      delta = target_max_data - conn->rx.window;
++      if (conn->rx.unsent_max_offset + delta > NGTCP2_MAX_VARINT) {
++        delta = NGTCP2_MAX_VARINT - conn->rx.unsent_max_offset;
+       }
+ 
++      conn->rx.window = target_max_data;
++
+       conn->tx.last_max_data_ts = ts;
+ 
+       nfrc->fr.max_data = (ngtcp2_max_data){
+@@ -4773,25 +4878,22 @@ static ngtcp2_ssize conn_write_pkt(ngtcp2_conn *conn, ngtcp2_pkt_info *pi,
+             return rv;
+           }
+ 
+-          if (conn->local.settings.max_stream_window &&
+-              strm->tx.last_max_stream_data_ts != UINT64_MAX &&
+-              ts - strm->tx.last_max_stream_data_ts <
+-                NGTCP2_FLOW_WINDOW_RTT_FACTOR * cstat->smoothed_rtt &&
+-              conn->local.settings.max_stream_window > strm->rx.window) {
+-            target_max_data =
+-              NGTCP2_FLOW_WINDOW_SCALING_FACTOR * strm->rx.window;
+-            if (target_max_data > conn->local.settings.max_stream_window) {
+-              target_max_data = conn->local.settings.max_stream_window;
+-            }
+-
+-            delta = target_max_data - strm->rx.window;
+-            if (strm->rx.unsent_max_offset + delta > NGTCP2_MAX_VARINT) {
+-              delta = NGTCP2_MAX_VARINT - strm->rx.unsent_max_offset;
+-            }
++          /* As for MAX_DATA; and a stream window that grew raises the
++             connection's with it (conn_qgo_ensure_min_window). */
++          target_max_data = conn_qgo_adjust_window(
++            conn, strm->rx.window,
++            strm->rx.unsent_max_offset - strm->rx.window, &strm->rx.epoch_ts,
++            &strm->rx.epoch_offset, conn->local.settings.max_stream_window,
++            ts);
++
++          delta = target_max_data - strm->rx.window;
++          if (strm->rx.unsent_max_offset + delta > NGTCP2_MAX_VARINT) {
++            delta = NGTCP2_MAX_VARINT - strm->rx.unsent_max_offset;
++          }
+ 
++          if (target_max_data > strm->rx.window) {
+             strm->rx.window = target_max_data;
+-          } else {
+-            delta = 0;
++            conn_qgo_ensure_min_window(conn, strm->rx.window, ts);
+           }
+ 
+           strm->tx.last_max_stream_data_ts = ts;
+@@ -8342,6 +8444,15 @@ static int conn_recv_stream(ngtcp2_conn *conn, const ngtcp2_stream *fr,
+       return NGTCP2_ERR_FLOW_CONTROL;
+     }
+ 
++    if (strm->rx.last_offset == 0) {
++      conn_qgo_start_epoch(&strm->rx.epoch_ts, &strm->rx.epoch_offset,
++                           strm->rx.unsent_max_offset, strm->rx.window, ts);
++    }
++    if (conn->rx.offset == 0) {
++      conn_qgo_start_epoch(&conn->rx.epoch_ts, &conn->rx.epoch_offset,
++                           conn->rx.unsent_max_offset, conn->rx.window, ts);
++    }
++
+     conn->rx.offset += len;
+   }
+ 
+@@ -8657,6 +8768,11 @@ static int conn_recv_reset_stream(ngtcp2_conn *conn,
+     return rv;
+   }
+ 
++  if (datalen && conn->rx.offset == 0) {
++    conn_qgo_start_epoch(&conn->rx.epoch_ts, &conn->rx.epoch_offset,
++                         conn->rx.unsent_max_offset, conn->rx.window, ts);
++  }
++
+   conn->rx.offset += datalen;
+ 
+   /* Extend connection flow control window for the amount of data
+diff --git a/lib/ngtcp2_conn.h b/lib/ngtcp2_conn.h
+index c0a2fb1..42a9951 100644
+--- a/lib/ngtcp2_conn.h
++++ b/lib/ngtcp2_conn.h
+@@ -520,6 +520,10 @@ struct ngtcp2_conn {
+     uint64_t max_offset;
+     /* window is the connection-level flow control window size. */
+     uint64_t window;
++    /* epoch_ts and epoch_offset are the connection's auto-tuning
++       epoch, as the stream's are (ngtcp2_strm.rx). */
++    ngtcp2_tstamp epoch_ts;
++    uint64_t epoch_offset;
+     /* path_challenge stores received PATH_CHALLENGE data. */
+     ngtcp2_static_ringbuf_path_challenge path_challenge;
+     /* ccerr is the received connection close error. */
+diff --git a/lib/ngtcp2_strm.h b/lib/ngtcp2_strm.h
+index 0c47873..b8b0a87 100644
+--- a/lib/ngtcp2_strm.h
++++ b/lib/ngtcp2_strm.h
+@@ -186,6 +186,13 @@ struct ngtcp2_strm {
+         uint64_t unsent_max_offset;
+         /* window is the stream-level flow control window size. */
+         uint64_t window;
++        /* epoch_ts and epoch_offset are quic-go's epochStartTime and
++           epochStartOffset (vendor/quic-go/flow_controller_base.go:
++           23-24): when the current auto-tuning epoch began, and how
++           much the application had read by then.  See
++           conn_qgo_adjust_window. */
++        ngtcp2_tstamp epoch_ts;
++        uint64_t epoch_offset;
+         /* app_error_code is the application error code that is
+            received in RESET_STREAM frame.  If this field is set,
+            NGTCP2_STRM_FLAG_RX_APP_ERROR_CODE_SET is set.  This field

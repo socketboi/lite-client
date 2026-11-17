@@ -1,0 +1,24 @@
+A load test of the session lifetime. NOT part of `make check`: it needs a live REALITY server, and
+the checks are required to run offline.
+
+    docker start xhttp-test
+    make BUILD=build-asan \
+      CFLAGS="-std=c11 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -Wall \
+              -Isrc -Ibuild-asan/gen -D_GNU_SOURCE -DLC_HYSTERIA=1 -MMD -MP" \
+      LDFLAGS="-fsanitize=address,undefined" build-asan/lc-tunnel
+    python3 test/storm/storm.py
+
+What is checked, and why in this shape. The real use-after-free in this loop happened when both
+descriptors of one session landed in the same epoll batch — so the storm opens connections in
+batches and tears them down mixed: half of them politely, half through SO_LINGER=0, which is a RST
+with unread data still queued. The sanitiser IS the assertion here: touching a freed session, a
+double free and a write past a buffer are things it names by itself.
+
+Two settings give different coverage, and both are needed. A short pause before the teardown hits
+the early lifetime (connecting and the handshake); a pause of about a third of a second lets the
+handshake finish, and then what is torn down are WORKING sessions. The first run without the second
+exercises the wrong path, and that is measured rather than assumed: tearing down immediately, 5
+sessions out of 32448 ever reached ST_OPEN.
+
+Runs on record: 32448 connections down the early path and 680 down the working one (480 of them in
+ST_OPEN) — zero ASan/UBSan reports, zero leaks, the process alive at the end.

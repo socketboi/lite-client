@@ -1,0 +1,158 @@
+The RTT estimate as quic-go makes it, for a client, and a Retry as quic-go takes it.
+
+quic-go's estimator (UpdateRTT, vendor/quic-go/internal/utils/rtt_stats.go:80-116) and upstream
+ngtcp2's (ngtcp2_conn_update_rtt) agree on the formula and differ on the rest:
+
+  - quic-go keeps latestRTT after the ACK Delay is taken off, ngtcp2 kept it before — and loss
+    detection waits 9/8 of the larger of latest and smoothed;
+  - quic-go caps the delay at max_ack_delay on every 1-RTT ACK
+    (vendor/quic-go/internal/ackhandler/sent_packet_handler.go:436-439) and never drops a sample
+    for it; ngtcp2 capped it only once the handshake was confirmed and until then dropped a sample
+    the delay would take below min_rtt;
+  - quic-go smooths in whole microseconds through float32, ngtcp2 in nanoseconds: after samples of
+    20, 22 and 21 ms quic-go's smoothed RTT is 20.343 ms, ngtcp2's was 20.34375.
+
+A client now runs conn_update_rtt_qgo; the server keeps upstream's estimator.
+
+A Retry: quic-go keeps its congestion controller, clears the bytes in flight, the probe count and
+the loss timer, and takes the Retry for an RTT sample of at least minRTTAfterRetry, 5 ms, when no
+Initial was probed again (ResetForRetry,
+vendor/quic-go/internal/ackhandler/sent_packet_handler.go:1153-1198). Upstream reset the controller
+and took no sample; for this client the reset put a connection that runs quic-go's NewReno until
+its authentication (patch 0018) on hysteria's BBR at once. A hysteria server does not send Retry,
+so this was never seen — which is why it is written down.
+
+Checked against quic-go's own sentPacketHandler and RTTStats, run by tools/qgovec: test/ngpatch.
+
+diff --git a/lib/ngtcp2_conn.c b/lib/ngtcp2_conn.c
+index 10a254a..1218505 100644
+--- a/lib/ngtcp2_conn.c
++++ b/lib/ngtcp2_conn.c
+@@ -6399,6 +6399,9 @@ static int conn_on_retry(ngtcp2_conn *conn, const ngtcp2_pkt_hd *hd,
+   ngtcp2_rtb *rtb = &conn->pktns.rtb;
+   ngtcp2_rtb *in_rtb;
+   uint8_t *token;
++  size_t pto_count = conn->cstat.pto_count;
++  ngtcp2_tstamp first_ts = UINT64_MAX;
++  ngtcp2_ksl_it it;
+ 
+   if (!in_pktns || (conn->flags & NGTCP2_CONN_FLAG_RECV_RETRY)) {
+     return NGTCP2_ERR_DISCARD_PKT;
+@@ -6446,6 +6449,12 @@ static int conn_on_retry(ngtcp2_conn *conn, const ngtcp2_pkt_hd *hd,
+     return rv;
+   }
+ 
++  /* The oldest Initial still out, for the RTT sample below. */
++  for (it = ngtcp2_ksl_begin(&in_rtb->ents); !ngtcp2_ksl_it_end(&it);
++       ngtcp2_ksl_it_next(&it)) {
++    first_ts = ((ngtcp2_rtb_entry *)ngtcp2_ksl_it_get(&it))->ts;
++  }
++
+   conn->state = NGTCP2_CS_CLIENT_INITIAL;
+ 
+   /* Just freeing memory is dangerous because we might free twice. */
+@@ -6475,7 +6484,20 @@ static int conn_on_retry(ngtcp2_conn *conn, const ngtcp2_pkt_hd *hd,
+   conn->local.settings.tokenlen = retry.tokenlen;
+ 
+   reset_conn_stat_recovery(&conn->cstat);
+-  conn_reset_congestion_state(conn, ts);
++  /* quic-go keeps its controller across a Retry: ResetForRetry clears
++     the bytes in flight, the probe count and the loss timer and nothing
++     more, and takes the Retry for an RTT sample, of at least
++     minRTTAfterRetry, 5 ms, when no Initial was probed again
++     (vendor/quic-go/internal/ackhandler/sent_packet_handler.go:1153-1198).
++     Upstream reset the controller, which put a client that runs quic-go's
++     NewReno until its authentication (patch 0018) on hysteria's BBR at
++     once, and took no sample. */
++  conn->cstat.pto_count = 0;
++  conn->cstat.loss_detection_timer = UINT64_MAX;
++  if (pto_count == 0 && first_ts != UINT64_MAX && ts > first_ts) {
++    ngtcp2_conn_update_rtt(
++      conn, ngtcp2_max(ts - first_ts, 5 * NGTCP2_MILLISECONDS), 0, ts);
++  }
+   conn_reset_ecn_validation_state(conn);
+ 
+   return 0;
+@@ -14491,12 +14513,82 @@ int ngtcp2_conn_get_tls_early_data_rejected2(const ngtcp2_conn *conn) {
+   return (conn->flags & NGTCP2_CONN_FLAG_EARLY_DATA_REJECTED) != 0;
+ }
+ 
++/*
++ * conn_update_rtt_qgo is quic-go's RTT estimate, for a client (UpdateRTT,
++ * vendor/quic-go/internal/utils/rtt_stats.go:80-116; the cap on the ACK
++ * Delay, vendor/quic-go/internal/ackhandler/sent_packet_handler.go:
++ * 436-439).  The delay is capped at max_ack_delay, 0 until the server's
++ * transport parameters are in, and taken off the sample only when that
++ * leaves it at or above min_rtt; latest_rtt is the sample after that;
++ * the mean deviation and the smoothed RTT move in whole microseconds
++ * through float32.  Upstream kept latest_rtt before the delay, capped
++ * the delay only once the handshake was confirmed and until then
++ * dropped a sample the delay would take below min_rtt, and smoothed in
++ * nanoseconds.  latest_rtt matters beyond the log: loss detection
++ * waits 9/8 of the larger of it and the smoothed RTT.
++ *
++ * Each float32 product is stored through a volatile before the sum, so
++ * that no compiler fuses one into the add: quic-go as built for amd64
++ * rounds every step.  Below about two seconds every step is exact in
++ * float32 anyway, fused or not.
++ */
++static void conn_update_rtt_qgo(ngtcp2_conn *conn, ngtcp2_duration rtt,
++                                ngtcp2_duration ack_delay, ngtcp2_tstamp ts) {
++  ngtcp2_conn_stat *cstat = &conn->cstat;
++  ngtcp2_duration sample = rtt, diff, rttvar;
++  volatile float a, b;
++
++  ack_delay =
++    conn->remote.transport_params
++      ? ngtcp2_min(ack_delay, conn->remote.transport_params->max_ack_delay)
++      : 0;
++
++  if (cstat->first_rtt_sample_ts == UINT64_MAX || cstat->min_rtt > rtt) {
++    cstat->min_rtt = rtt;
++  }
++
++  if (sample - cstat->min_rtt >= ack_delay) {
++    sample -= ack_delay;
++  }
++
++  cstat->latest_rtt = sample;
++
++  if (cstat->first_rtt_sample_ts == UINT64_MAX) {
++    cstat->smoothed_rtt = sample;
++    cstat->rttvar = sample / 2;
++    cstat->first_rtt_sample_ts = ts;
++  } else {
++    diff = cstat->smoothed_rtt < sample ? sample - cstat->smoothed_rtt
++                                        : cstat->smoothed_rtt - sample;
++    a = 0.75f * (float)(cstat->rttvar / NGTCP2_MICROSECONDS);
++    b = 0.25f * (float)(diff / NGTCP2_MICROSECONDS);
++    rttvar = (ngtcp2_duration)(a + b) * NGTCP2_MICROSECONDS;
++    a = (float)(cstat->smoothed_rtt / NGTCP2_MICROSECONDS) * 0.875f;
++    b = (float)(sample / NGTCP2_MICROSECONDS) * 0.125f;
++    cstat->smoothed_rtt = (ngtcp2_duration)(a + b) * NGTCP2_MICROSECONDS;
++    cstat->rttvar = rttvar;
++  }
++
++  ngtcp2_log_infof(&conn->log, NGTCP2_LOG_EVENT_LDC,
++                   "latest_rtt=", cstat->latest_rtt / NGTCP2_MILLISECONDS,
++                   " min_rtt=", cstat->min_rtt / NGTCP2_MILLISECONDS,
++                   " smoothed_rtt=", cstat->smoothed_rtt / NGTCP2_MILLISECONDS,
++                   " rttvar=", cstat->rttvar / NGTCP2_MILLISECONDS,
++                   " ack_delay=", ack_delay / NGTCP2_MILLISECONDS);
++}
++
+ void ngtcp2_conn_update_rtt(ngtcp2_conn *conn, ngtcp2_duration rtt,
+                             ngtcp2_duration ack_delay, ngtcp2_tstamp ts) {
+   ngtcp2_conn_stat *cstat = &conn->cstat;
+ 
+   assert(rtt > 0);
+ 
++  /* A client estimates as quic-go does: see conn_update_rtt_qgo. */
++  if (!conn->server) {
++    conn_update_rtt_qgo(conn, rtt, ack_delay, ts);
++    return;
++  }
++
+   if (cstat->min_rtt == UINT64_MAX) {
+     cstat->latest_rtt = rtt;
+     cstat->min_rtt = rtt;

@@ -1,0 +1,95 @@
+The packet number encoded the way quic-go encodes it (hysteria client).
+
+quic-go never writes a one-byte packet number — "it never chooses a PacketNumberLen of 1 byte, since
+this is too short under certain circumstances" — and picks two, three or four bytes by the number of
+unacknowledged packets (PacketNumberLengthForHeader,
+vendor/quic-go/internal/protocol/packet_number.go:41-57).
+
+Upstream ngtcp2 picks the shortest encoding that fits, and for a connection whose packets are being
+acknowledged that is one byte for nearly every packet: pktns_select_pkt_numlen returns 1 while the
+distance to the largest acknowledged packet number stays at 128 or below. So every packet this
+client sends carries a header one byte shorter than the reference's, and the two switch points are
+off by one from quic-go's besides.
+
+This patch gives a client quic-go's rule and leaves the server paths as upstream wrote them. The
+count of unacknowledged packets is the same quantity on both sides: ngtcp2's
+largest_acked_tx_pkt_num starts at -1 (vendor/ngtcp2/lib/ngtcp2_rtb.c:100), so before the first
+acknowledgement the difference is pn + 1, which is exactly what quic-go counts when its largestAcked
+is invalid.
+
+Applies on top of 0005.
+
+--- a/lib/ngtcp2_conn.c
++++ b/lib/ngtcp2_conn.c
+@@ -1956,16 +1956,37 @@
+ }
+ 
+ /*
+- * pktns_select_pkt_numlen selects shortest packet number encoding for
+- * the next packet number based on the largest acknowledged packet
+- * number.  It returns the number of bytes to encode the packet
+- * number.
++ * pktns_select_pkt_numlen selects the packet number encoding for the
++ * next packet number based on the largest acknowledged packet number.
++ * It returns the number of bytes to encode the packet number.
+  */
+-static size_t pktns_select_pkt_numlen(const ngtcp2_pktns *pktns) {
++static size_t pktns_select_pkt_numlen(const ngtcp2_conn *conn,
++                                      const ngtcp2_pktns *pktns) {
+   int64_t pkt_num = pktns->tx.last_pkt_num + 1;
+   const ngtcp2_rtb *rtb = &pktns->rtb;
+   int64_t n = pkt_num - rtb->largest_acked_tx_pkt_num;
+ 
++  if (!conn->server) {
++    /* quic-go never encodes a packet number in one byte — "it never
++       chooses a PacketNumberLen of 1 byte, since this is too short
++       under certain circumstances" — and switches at the same two
++       points (PacketNumberLengthForHeader,
++       vendor/quic-go/internal/protocol/packet_number.go:41-57).  Its
++       count of unacknowledged packets is this same difference: with
++       nothing acknowledged yet its largestAcked is invalid and it
++       counts pn + 1, which is what largest_acked_tx_pkt_num of -1
++       gives here. */
++    if (n < (1 << 15)) {
++      return 2;
++    }
++
++    if (n < (1 << 23)) {
++      return 3;
++    }
++
++    return 4;
++  }
++
+   if (NGTCP2_MAX_PKT_NUM / 2 < n) {
+     return 4;
+   }
+@@ -2614,7 +2635,7 @@
+ 
+   ngtcp2_pkt_hd_init(
+     &hd, conn_pkt_flags_long(conn), type, &conn->dcid.current.cid, &conn->oscid,
+-    pktns->tx.last_pkt_num + 1, pktns_select_pkt_numlen(pktns), version);
++    pktns->tx.last_pkt_num + 1, pktns_select_pkt_numlen(conn, pktns), version);
+ 
+   if (!conn->server && type == NGTCP2_PKT_INITIAL &&
+       conn->local.settings.tokenlen) {
+@@ -3714,7 +3735,7 @@
+ 
+     ngtcp2_pkt_hd_init(hd, hd_flags, type, &conn->dcid.current.cid, scid,
+                        pktns->tx.last_pkt_num + 1,
+-                       pktns_select_pkt_numlen(pktns), version);
++                       pktns_select_pkt_numlen(conn, pktns), version);
+ 
+     ngtcp2_ppe_init(ppe, dest, destlen, dgram_offset, cc);
+ 
+@@ -4728,8 +4749,8 @@
+   cc.hp_mask = conn->callbacks.hp_mask;
+ 
+   ngtcp2_pkt_hd_init(&hd, hd_flags, type, dcid, scid,
+-                     pktns->tx.last_pkt_num + 1, pktns_select_pkt_numlen(pktns),
+-                     version);
++                     pktns->tx.last_pkt_num + 1,
++                     pktns_select_pkt_numlen(conn, pktns), version);
+ 
+   ngtcp2_ppe_init(&ppe, dest, destlen, 0, &cc);
+ 

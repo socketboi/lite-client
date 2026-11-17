@@ -1,0 +1,46 @@
+Up to 64 ACK ranges, and ACK-of-ACK pruning in the application data space only, as quic-go.
+
+quic-go's received packet history keeps MaxNumAckRanges = 64 ranges and its ACK frames carry all of
+them (vendor/quic-go/internal/protocol/params.go:115,
+vendor/quic-go/internal/ackhandler/received_packet_history.go:41-43); ngtcp2 kept 33 and wrote at
+most 33. And quic-go forgets the ranges an ACK it sent covered, once that ACK is acknowledged, only
+for 1-RTT packets (ignorePacketsBelow, vendor/quic-go/internal/ackhandler/sent_packet_handler.go:
+636-638); ngtcp2 did it in every space, so its Initial and Handshake ACKs could leave out ranges
+quic-go's still carry.
+
+diff --git a/lib/ngtcp2_pkt.h b/lib/ngtcp2_pkt.h
+--- a/lib/ngtcp2_pkt.h
++++ b/lib/ngtcp2_pkt.h
+@@ -96,8 +96,11 @@
+ #define NGTCP2_MAX_CLIENT_STREAM_ID_UNI ((int64_t)0x3FFFFFFFFFFFFFFELL)
+ 
+ /* NGTCP2_MAX_NUM_ACK_RANGES is the maximum number of Additional ACK
+-   ranges which this library can create, or decode. */
+-#define NGTCP2_MAX_ACK_RANGES 32
++   ranges which this library can create, or decode.  63, so that an
++   ACK carries up to 64 ranges and the tracker keeps as many, which is
++   quic-go's MaxNumAckRanges (vendor/quic-go/internal/protocol/
++   params.go:115, received_packet_history.go:41-43); upstream kept 33. */
++#define NGTCP2_MAX_ACK_RANGES 63
+ 
+ /* NGTCP2_MAX_PKT_NUM is the maximum packet number. */
+ #define NGTCP2_MAX_PKT_NUM ((int64_t)((1LL << 62) - 1))
+diff --git a/lib/ngtcp2_conn.c b/lib/ngtcp2_conn.c
+--- a/lib/ngtcp2_conn.c
++++ b/lib/ngtcp2_conn.c
+@@ -6880,7 +6880,14 @@
+     return NGTCP2_ERR_PROTO;
+   }
+ 
+-  ngtcp2_acktr_recv_ack(&pktns->acktr, fr);
++  /* The ranges an acknowledged ACK covered are dropped from the tracker
++     only in the application data space, where quic-go does it
++     (ignorePacketsBelow, vendor/quic-go/internal/ackhandler/
++     sent_packet_handler.go:636-638); its Initial and Handshake ACKs keep
++     every range. */
++  if (pktns == &conn->pktns) {
++    ngtcp2_acktr_recv_ack(&pktns->acktr, fr);
++  }
+ 
+   num_acked =
+     ngtcp2_rtb_recv_ack(&pktns->rtb, fr, &conn->cstat, conn, pktns, pkt_ts, ts);

@@ -1,0 +1,227 @@
+The time a datagram ARRIVED, handed to the acknowledgement machinery where quic-go hands it.
+
+WHAT THE REFERENCE DOES. quic-go reads the socket in a goroutine of its own that does nothing else
+(Transport.listen, vendor/quic-go/transport.go:547-549) and stamps each datagram the moment the
+read returns — `rcvTime: monotime.Now()` (sys_conn_oob.go:169 on the OOB path, sys_conn.go:107 on
+the plain one hysteria takes under Salamander). That stamp, not the time the connection gets round
+to the packet, is what every acknowledgement is processed with:
+
+    handleErr = c.handleAckFrame(ackFrame, encLevel, rcvTime)  (vendor/quic-go/connection.go:1864)
+    func (h *sentPacketHandler) ReceivedAck(..., rcvTime)
+                                  (vendor/quic-go/internal/ackhandler/sent_packet_handler.go:403)
+        h.detectLostPackets(rcvTime, encLevel)                         (:462)
+        cc.OnPacketAcked(p.PacketNumber, p.Length, priorInFlight, rcvTime)   (:470)
+        cex.OnCongestionEventEx(priorInFlight, rcvTime, ...)          (:487)
+
+So hysteria's BBR — ported here as patch 0009 — measures delivery with arrival times.
+
+WHAT NGTCP2 DOES. It already tells the two apart inside: conn_recv_pkt, conn_recv_ack and
+ngtcp2_rtb_recv_ack all take a `pkt_ts` beside `ts`, and the comments on them say that for a
+buffered packet pkt_ts is earlier. But the public ngtcp2_conn_read_pkt has one timestamp and passes
+it as both (conn_recv_cpkt: `conn_recv_pkt(..., ts, ts)`), and inside ngtcp2_rtb_recv_ack only the
+RTT sample reads pkt_ts — the controller (on_pkt_acked, on_ack_recv), the rate sampler and loss
+detection all read `ts`.
+
+WHAT IT COST, measured 2026-09-21 with kernel receive timestamps (SO_TIMESTAMPNS) on the one-way
+stand: an acknowledgement sat 118 us on average between arriving and being processed, a third of
+them over 50 us and 86 of 4 591 over a millisecond — the time this client's single loop spends
+packing before it reads again. The controller saw every one of those as a later ack: longer
+rounds, compressed delivery intervals, a lower bandwidth estimate (457 against the reference's 660
+Mbit/s in PROBE_BW on the same stand).
+
+WHAT THIS PATCH DOES.
+  - ngtcp2_conn_read_pkt_rx: ngtcp2_conn_read_pkt plus the arrival time, 0 meaning unknown.
+  - conn_recv_cpkt hands that time down as pkt_ts, never later than ts and never earlier than the
+    last one it handed down: arrival times are monotonic on the wire, and the floor keeps them so
+    across the handshake, whose packets are still read with ts.
+  - ngtcp2_rtb_recv_ack gives pkt_ts to on_pkt_acked, on_ack_recv, on_spurious_congestion and loss
+    detection — the four places quic-go passes rcvTime. The RTT sample already used it. Timers,
+    logging and everything that must stay monotonic keep ts.
+
+WHAT IT BOUGHT, measured the day it went in, and it is honest to say little. One-way stand,
+reference on plain Go: back to back 93 and 91 % against 90-92 before and the reference's 97;
+holes of 1-5 ms in the acknowledgements from the node 451 and 716 against 548-1073 before and
+the reference's 248-290. Xiaomi 4A against the live node, one binary at a time, 4 x 5 MB up:
+2.75 · 2.75 MB/s before, 2.77 · 2.84 · 2.79 after, CPU per 20 MB 917 · 904 against
+890 · 849 · 896. All inside the spread. It is here because it is what the reference does.
+
+Applies on top of 0010.
+diff -ruN a/lib/includes/ngtcp2/ngtcp2.h b/lib/includes/ngtcp2/ngtcp2.h
+--- a/lib/includes/ngtcp2/ngtcp2.h
++++ b/lib/includes/ngtcp2/ngtcp2.h
+@@ -4308,6 +4308,22 @@
+ /**
+  * @function
+  *
++ * `ngtcp2_conn_read_pkt_rx` is `ngtcp2_conn_read_pkt` told when the
++ * datagram ARRIVED: |pkt_ts| is used where quic-go uses the time its
++ * socket read returned — acknowledgement processing, the congestion
++ * controller and loss detection — and |ts| everywhere else.  0 means
++ * unknown.  Added by patches/ngtcp2/0011.
++ */
++NGTCP2_EXTERN int ngtcp2_conn_read_pkt_rx(ngtcp2_conn *conn,
++                                          const ngtcp2_path *path,
++                                          const ngtcp2_pkt_info *pi,
++                                          const uint8_t *pkt, size_t pktlen,
++                                          ngtcp2_tstamp pkt_ts,
++                                          ngtcp2_tstamp ts);
++
++/**
++ * @function
++ *
+  * `ngtcp2_conn_write_pkt` is equivalent to calling
+  * `ngtcp2_conn_writev_stream` with -1 as |stream_id|, no stream data,
+  * and :macro:`NGTCP2_WRITE_STREAM_FLAG_NONE` as flags.
+diff -ruN a/lib/ngtcp2_conn.c b/lib/ngtcp2_conn.c
+--- a/lib/ngtcp2_conn.c
++++ b/lib/ngtcp2_conn.c
+@@ -10202,6 +10202,28 @@
+  * This function returns 0 if it succeeds, or the same negative error
+  * codes from conn_recv_pkt except for NGTCP2_ERR_DISCARD_PKT.
+  */
++/*
++ * conn_rx_pkt_ts returns the time the datagram being read arrived:
++ * what ngtcp2_conn_read_pkt_rx was told, never later than |ts| and
++ * never earlier than the last one returned, or |ts| itself when the
++ * caller did not say.  quic-go processes every packet with the time
++ * its socket read returned (receivedPacket.rcvTime); see
++ * patches/ngtcp2/0011.
++ */
++static ngtcp2_tstamp conn_rx_pkt_ts(ngtcp2_conn *conn, ngtcp2_tstamp ts) {
++  ngtcp2_tstamp pkt_ts = conn->rx_pkt_ts;
++
++  if (pkt_ts == 0 || pkt_ts > ts) {
++    pkt_ts = ts;
++  }
++  if (pkt_ts < conn->rx_pkt_ts_floor) {
++    pkt_ts = conn->rx_pkt_ts_floor;
++  }
++  conn->rx_pkt_ts_floor = pkt_ts;
++
++  return pkt_ts;
++}
++
+ static int conn_recv_cpkt(ngtcp2_conn *conn, const ngtcp2_path *path,
+                           const ngtcp2_pkt_info *pi, const uint8_t *pkt,
+                           size_t pktlen, ngtcp2_tstamp ts) {
+@@ -10209,6 +10231,7 @@
+   int rv;
+   const uint8_t *origpkt = pkt;
+   size_t dgramlen = pktlen;
++  ngtcp2_tstamp pkt_ts = conn_rx_pkt_ts(conn, ts);
+ 
+   if (ngtcp2_path_eq(&conn->dcid.current.ps.path, path)) {
+     conn->dcid.current.bytes_recv += dgramlen;
+@@ -10224,7 +10247,7 @@
+   }
+ 
+   while (pktlen) {
+-    nread = conn_recv_pkt(conn, path, pi, pkt, pktlen, dgramlen, ts, ts);
++    nread = conn_recv_pkt(conn, path, pi, pkt, pktlen, dgramlen, pkt_ts, ts);
+     if (nread < 0) {
+       if (ngtcp2_err_is_fatal((int)nread)) {
+         return (int)nread;
+@@ -10493,6 +10516,20 @@
+   }
+ }
+ 
++int ngtcp2_conn_read_pkt_rx(ngtcp2_conn *conn, const ngtcp2_path *path,
++                            const ngtcp2_pkt_info *pi, const uint8_t *pkt,
++                            size_t pktlen, ngtcp2_tstamp pkt_ts,
++                            ngtcp2_tstamp ts) {
++  int rv;
++
++  conn->rx_pkt_ts = pkt_ts;
++  rv = ngtcp2_conn_read_pkt_versioned(conn, path, NGTCP2_PKT_INFO_VERSION, pi,
++                                      pkt, pktlen, ts);
++  conn->rx_pkt_ts = 0;
++
++  return rv;
++}
++
+ int ngtcp2_conn_read_pkt_versioned(ngtcp2_conn *conn, const ngtcp2_path *path,
+                                    int pkt_info_version,
+                                    const ngtcp2_pkt_info *pi,
+@@ -10507,6 +10544,10 @@
+ 
+   conn_update_timestamp(conn, ts);
+ 
++  if (conn->state != NGTCP2_CS_POST_HANDSHAKE && conn->rx_pkt_ts_floor < ts) {
++    conn->rx_pkt_ts_floor = ts;
++  }
++
+   ngtcp2_log_infof(&conn->log, NGTCP2_LOG_EVENT_CON,
+                    "recv packet len=", pktlen);
+ 
+diff -ruN a/lib/ngtcp2_conn.h b/lib/ngtcp2_conn.h
+--- a/lib/ngtcp2_conn.h
++++ b/lib/ngtcp2_conn.h
+@@ -722,6 +722,12 @@
+   /* handshake_confirmed_ts is the time instant when handshake is
+      confirmed.  For server, it is confirmed when completed. */
+   ngtcp2_tstamp handshake_confirmed_ts;
++  /* rx_pkt_ts is the time the datagram being read ARRIVED, as told
++     by ngtcp2_conn_read_pkt_rx, or 0 when the caller did not say.
++     rx_pkt_ts_floor keeps the arrival times handed to the ack
++     machinery from going backwards.  See patches/ngtcp2/0011. */
++  ngtcp2_tstamp rx_pkt_ts;
++  ngtcp2_tstamp rx_pkt_ts_floor;
+   /* initial_crypto_cut holds the piece cut out of the ClientHello
+      (the second half of SNI) until every other byte of Initial CRYPTO
+      data has been written.  NULL when nothing is held.  quic-go keeps
+diff -ruN a/lib/ngtcp2_rtb.c b/lib/ngtcp2_rtb.c
+--- a/lib/ngtcp2_rtb.c
++++ b/lib/ngtcp2_rtb.c
+@@ -845,7 +845,7 @@
+     }
+ 
+     if (cc->on_ack_recv) {
+-      cc->on_ack_recv(cc, cstat, &cc_ack, ts);
++      cc->on_ack_recv(cc, cstat, &cc_ack, pkt_ts);
+     }
+ 
+     return 0;
+@@ -935,7 +935,7 @@
+         cc_ack.bytes_delivered += ent->pktlen;
+         cc_ack.pkt_delivered = ent->rst.delivered;
+ 
+-        rtb_on_pkt_acked(rtb, ent, cstat, pktns, ts);
++        rtb_on_pkt_acked(rtb, ent, cstat, pktns, pkt_ts);
+ 
+         ++num_acked;
+       }
+@@ -947,7 +947,7 @@
+   } else {
+     /* For unit tests */
+     for (ent = acked_ent; ent; ent = acked_ent) {
+-      rtb_on_pkt_acked(rtb, ent, cstat, pktns, ts);
++      rtb_on_pkt_acked(rtb, ent, cstat, pktns, pkt_ts);
+       acked_ent = ent->next;
+       ++num_acked;
+       ngtcp2_rtb_entry_objalloc_del(ent, rtb->rtb_entry_objalloc,
+@@ -957,14 +957,14 @@
+ 
+   if (rtb->cc->on_spurious_congestion && num_lost_pkts &&
+       rtb->num_lost_pkts == rtb->num_lost_ignore_pkts) {
+-    rtb->cc->on_spurious_congestion(cc, cstat, ts);
++    rtb->cc->on_spurious_congestion(cc, cstat, pkt_ts);
+   }
+ 
+   if (num_acked) {
+     ngtcp2_rst_on_ack_recv(rtb->rst, cstat);
+ 
+     if (conn) {
+-      rv = rtb_detect_lost_pkt(rtb, &cc_ack, conn, pktns, cstat, ts);
++      rv = rtb_detect_lost_pkt(rtb, &cc_ack, conn, pktns, cstat, pkt_ts);
+       if (rv != 0) {
+         return rv;
+       }
+@@ -976,7 +976,7 @@
+   }
+ 
+   if (cc->on_ack_recv) {
+-    cc->on_ack_recv(cc, cstat, &cc_ack, ts);
++    cc->on_ack_recv(cc, cstat, &cc_ack, pkt_ts);
+   }
+ 
+   return (ngtcp2_ssize)num_acked;

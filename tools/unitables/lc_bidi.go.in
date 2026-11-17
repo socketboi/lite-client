@@ -1,0 +1,8 @@
+// Copied into GOROOT's x/text/unicode/bidi by the Makefile (tools/.goroot-x) for tools/unitables,
+// which writes these tables out for C. Exports only: it changes nothing the package does.
+
+package bidi
+
+func LCTables() (values []uint8, index []uint16) { return bidiValues[:], bidiIndex[:] }
+
+func LCEntry(p Properties) (entry, last uint8) { return p.entry, p.last }

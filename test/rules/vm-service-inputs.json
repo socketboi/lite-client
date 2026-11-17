@@ -1,0 +1,8 @@
+{
+  "release": "25.12.5",
+  "sdk_name": "openwrt-sdk-25.12.5-x86-64_gcc-14.3.0_musl.Linux-x86_64.tar.zst",
+  "sdk_sha256": "0c8df0151a1e88feb7c03d694d61f6a18d51872815b7c811d76e2b77504d5e9c",
+  "files": [
+    {"name":"kmod-veth-6.12.94-r1.apk","location":"target","path":"kmods/6.12.94-1-a7bc15f451f9652701ba04af9cfb0b95/","role":"addon","sha256":"a35f63b18321495452bf75706ace4973d38f9d0cd7ddd43d245f4304f1c2c82b"}
+  ]
+}

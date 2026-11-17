@@ -1,0 +1,5 @@
+# Upstream sources are cloned here, never committed: they carry their own history and licences,
+# and vendoring them would put tens of thousands of foreign files into this repository.
+# Fetch them with ../tools/vendor/fetch.sh; the pinned revisions are in ../docs/BUILD.md.
+*
+!.gitignore

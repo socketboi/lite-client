@@ -1,0 +1,153 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # The whole gate, exactly as a contributor runs it. Nothing is left out for CI: check-device and
+  # check-arm64 need the OpenWrt toolchains and the link stubs, and the prepare action makes both
+  # (downloaded against the Makefile's pinned sha256, stubs generated from this commit). The run
+  # itself is --network none, as in CONTRIBUTING.md, so a test that quietly reaches the network
+  # fails here too.
+  #
+  # Green is the exit status of `make check-spider-behavior`: the full check gate followed by
+  # the controlled Go/C close oracle. Docker run passes every failure through.
+  #
+  # NOT covered here, on purpose: test/hystand (the live Hysteria2 stand needs its own docker
+  # network and a module cache for the reference server), docker/Dockerfile.net (tproxy needs a
+  # privileged container on a kernel with nft_tproxy), and `make package` (needs the 219 MB SDK
+  # and the OpenWrt base feed). See docs/TESTING.md.
+  gate:
+    # Keep the check name stable for existing branch protection rules.
+    name: make check
+    runs-on: ubuntu-24.04
+    # A cold run compiles mbedTLS, mlkem-native, brotli, zstd and the QUIC stack for the host,
+    # mipsel and aarch64. Expected well under an hour; the limit only stops a hung run.
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # LC_VERSION is `git describe --tags`, and check-builds reads it back from a binary.
+          fetch-depth: 0
+
+      - uses: ./.github/actions/prepare
+
+      - name: make check-spider-behavior
+        run: docker run --rm --network none -v "$PWD:/w" -w /w lc-build:local make check-spider-behavior
+
+      - name: Keep the logs of a failed run
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-logs-${{ github.run_id }}
+          path: |
+            build/*.log
+            build/stubs-*.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # The router builds on their own, in parallel with the gate. `make check-device` is the same
+  # target the gate ends with (every program, mipsel and aarch64, with and without the Hysteria2
+  # plane), so this adds no new check: it answers "does it build for the router" without waiting
+  # for the host suites, and keeps the binaries so a change can be tried on a device.
+  cross:
+    name: router builds
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - uses: ./.github/actions/prepare
+
+      - name: make check-device
+        run: docker run --rm --network none -v "$PWD:/w" -w /w lc-build:local make check-device
+
+      # Stripped copies, the way the package installs them. The directories are the ones
+      # check-device builds into; the binaries are linked against stub libraries and resolve the
+      # real libmbedcrypto, libmbedx509 and libz on the router, which every OpenWrt image with the
+      # package's dependencies has.
+      - name: Strip
+        run: |
+          docker run --rm --network none -v "$PWD:/w" -w /w lc-build:local sh -eu -c '
+            out=build/routers
+            rm -rf "$out"
+            for spec in mipsel:dl/tc:build/device-hy0:reality \
+                        mipsel:dl/tc:build/device-hy1:hysteria \
+                        aarch64:dl/tc-a64:build/device-a64-hy0:reality \
+                        aarch64:dl/tc-a64:build/device-a64-hy1:hysteria; do
+              arch=${spec%%:*}; rest=${spec#*:}
+              tc=${rest%%:*};  rest=${rest#*:}
+              dir=${rest%%:*}; variant=${rest#*:}
+              strip=$(ls "$tc"/*/toolchain-*/bin/"$arch"-openwrt-linux-strip | head -n 1)
+              mkdir -p "$out/$arch-$variant"
+              for b in lc-tunnel lc-hello lc-probe lc-fetch lc-xfetch lc-hy lc-hyfetch lc-hydns; do
+                if [ -f "$dir/$b" ]; then "$strip" -o "$out/$arch-$variant/$b" "$dir/$b"; fi
+              done
+            done
+            cp LICENSE "$out/LICENSE"
+            sh tools/public/notices.sh --device > "$out/THIRD_PARTY_NOTICES.md"
+            ls -l "$out"/*'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lite-client-${{ github.sha }}
+          path: build/routers
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Keep the logs of a failed run
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cross-logs-${{ github.run_id }}
+          path: |
+            build/device-*.log
+            build/stubs-*.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # Every commit in a pull request carries a Signed-off-by from its author (CONTRIBUTING.md,
+  # "Developer Certificate of Origin"). Merge commits are skipped, and so are Dependabot's pull
+  # requests, whose commits cannot be signed off.
+  dco:
+    name: sign-off
+    if: github.event_name == 'pull_request' && github.event.pull_request.user.login != 'dependabot[bot]'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Check Signed-off-by
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          bad=0
+          for c in $(git rev-list --no-merges "$BASE..$HEAD"); do
+            email=$(git show -s --format=%ae "$c")
+            if ! git show -s --format='%(trailers:key=Signed-off-by,valueonly)' "$c" \
+                | grep -qiF "<$email>"; then
+              echo "::error::$(git show -s --format='%h %s' "$c") has no Signed-off-by for $email"
+              bad=1
+            fi
+          done
+          if [ "$bad" -ne 0 ]; then
+            echo "Sign off with 'git commit -s'; fix existing commits with 'git rebase --signoff $BASE'."
+            exit 1
+          fi
+          echo "every commit is signed off"

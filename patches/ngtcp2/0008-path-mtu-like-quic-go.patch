@@ -1,0 +1,662 @@
+Path MTU Discovery as quic-go does it, and the packet size that comes out of it (hysteria client).
+
+quic-go keeps three numbers apart. It sends InitialPacketSize = 1280 until discovery has something
+larger (vendor/quic-go/internal/protocol/params.go:5-6, vendor/quic-go/connection.go:2900-2916);
+the largest it will ever send is min(MaxPacketBufferSize = 1452, the peer's advertised
+max_udp_payload_size) (internal/protocol/protocol.go:107-111, quic-go/connection.go:2474-2483); and between
+them it searches. The search halves the interval between the size known to work and the size not
+ruled out, sends one probe packet every five smoothed RTTs, keeps three failures before it lowers
+the ceiling, and stops when twenty bytes separate the two
+(vendor/quic-go/mtu_discoverer.go:14-23, :125-177, :186-241). The probe is a PING padded to size,
+sent on its own; a lost probe is reported by loss detection like any other packet, and there is no
+timer on it (quic-go/connection.go:2546-2563).
+
+Upstream ngtcp2 does none of that the same way:
+
+  - a path starts at NGTCP2_MAX_UDP_PAYLOAD_SIZE, the 1200 every path must carry, where quic-go's
+    client starts at 1280;
+  - the padding of a datagram goes to that same constant 1200 rather than to the size the path is
+    known to take, so PMTUD raising the path would not raise what the client pads to;
+  - discovery walks a fixed table of four sizes — 1406, 1342, 1232, 1444 — each tried up to three
+    times against a PTO timer, and it stops at whatever of them the path accepted;
+  - the ceiling it probes towards is the same setting as the padding target, so the two cannot be
+    chosen separately.
+
+This client therefore had discovery switched off and its ceiling pinned at 1280: with the numbers
+tied together the only probe ngtcp2 would have sent was 1232 bytes — below the 1280 we already send
+successfully, at a fixed place in every connection, and nothing the reference can produce.
+
+This patch unties them and replaces the search. lib/ngtcp2_pmtud.c is quic-go's mtuFinder:
+max_udp_payload_size is its min, fail_udp_payload_sizes its lost array, and probelen the midpoint.
+NGTCP2_INITIAL_UDP_PAYLOAD_SIZE (1280) is where a client's path starts, conn_dgram_padding pads to
+the size the path is known to take, the probe timer is gone — a lost probe reaches the search
+through rtb_on_pkt_lost, as it reaches quic-go's through the frame handler of its PING — and
+conn_start_pmtud begins the clock at the instant discovery starts, so the first probe is one delay
+later rather than at once.
+
+Measured through a quic-go server's own qlog, against the same server minutes apart: the reference
+client's largest packet is 1441 bytes and ours was 100 — it never probed, and every datagram it sent
+for the life of the connection was 1280 where the reference's were 1366 and up. With this patch the
+first probe is 1366 bytes, which is the number the reference sends.
+
+The probe table in the settings (:member:`ngtcp2_settings.pmtud_probes`) is no longer read; the
+fields stay because lib/ngtcp2_settings.c computes the size of a NGTCP2_SETTINGS_V2 structure from
+the offset of the second one. Both are documented as unused in the public header.
+
+Applies on top of 0007, whose assertion on the length of a written datagram this patch also corrects:
+a probe packet is deliberately larger than the size the path is known to take, so the length to
+measure it against is the caller's buffer, not the shaped datagram.
+
+--- a/lib/ngtcp2_conn.c
++++ b/lib/ngtcp2_conn.c
+@@ -1285,11 +1285,6 @@
+          callbacks->get_path_challenge_data);
+   assert(!server || !ngtcp2_is_reserved_version(client_chosen_version));
+ 
+-  for (i = 0; i < settings->pmtud_probeslen; ++i) {
+-    assert(settings->pmtud_probes[i] > NGTCP2_MAX_UDP_PAYLOAD_SIZE);
+-    assert(settings->pmtud_probes[i] <= NGTCP2_MAX_TX_UDP_PAYLOAD_SIZE);
+-  }
+-
+   if (mem == NULL) {
+     mem = ngtcp2_mem_default();
+   }
+@@ -1300,11 +1295,6 @@
+     buflen += NGTCP2_QLOG_BUFLEN;
+   }
+ 
+-  if (settings->pmtud_probeslen) {
+-    buflen = buflen_align(buflen);
+-    buflen += sizeof(settings->pmtud_probes[0]) * settings->pmtud_probeslen;
+-  }
+-
+   if (settings->preferred_versionslen) {
+     buflen = buflen_align(buflen);
+     buflen +=
+@@ -1402,13 +1392,6 @@
+     (*pconn)->local.settings.token = NULL;
+   }
+ 
+-  if (settings->pmtud_probeslen) {
+-    (*pconn)->local.settings.pmtud_probes = buf_align(buf);
+-    buf = ngtcp2_cpymem(
+-      (uint16_t *)(*pconn)->local.settings.pmtud_probes, settings->pmtud_probes,
+-      sizeof(settings->pmtud_probes[0]) * settings->pmtud_probeslen);
+-  }
+-
+   if (!(*pconn)->local.settings.original_version) {
+     (*pconn)->local.settings.original_version = client_chosen_version;
+   }
+@@ -1416,6 +1399,17 @@
+   ngtcp2_dcid_init(&(*pconn)->dcid.current, 0, dcid, NULL);
+   ngtcp2_dcid_set_path(&(*pconn)->dcid.current, path);
+ 
++  if (!server) {
++    /* A client sends 1280-byte datagrams from its first flight, and
++       Path MTU Discovery only raises that.  quic-go's client packs to
++       InitialPacketSize until its discovery has a larger size to give
++       (vendor/quic-go/connection.go:2900-2916); upstream ngtcp2 starts
++       a path at NGTCP2_MAX_UDP_PAYLOAD_SIZE, the 1200 every path must
++       carry. */
++    (*pconn)->dcid.current.max_udp_payload_size =
++      NGTCP2_INITIAL_UDP_PAYLOAD_SIZE;
++  }
++
+   assert((size_t)path->local.addrlen <= sizeof((*pconn)->hs_local_addr));
+ 
+   memcpy(&(*pconn)->hs_local_addr, path->local.addr,
+@@ -2551,13 +2545,26 @@
+   return rv;
+ }
+ 
++/*
++ * conn_dgram_padding returns the number of PADDING bytes that fill the
++ * datagram being written up to the size this endpoint sends at.  That
++ * size is what quic-go pads to as well: its maxPacketSize is the
++ * current path MTU estimate, which starts at InitialPacketSize and is
++ * raised by Path MTU Discovery (vendor/quic-go/connection.go:
++ * 2900-2916, and every packing call that passes it, such as :2573).
++ * Upstream ngtcp2 padded to the constant NGTCP2_MAX_UDP_PAYLOAD_SIZE
++ * instead, which is the size every path must take rather than the
++ * size this one does.
++ */
+ static size_t conn_dgram_padding(const ngtcp2_conn *conn, ngtcp2_ppe *ppe) {
+   if (conn->local.settings.no_tx_udp_payload_size_shaping) {
+     return ngtcp2_ppe_dgram_padding_size(
+       ppe, conn->local.settings.max_tx_udp_payload_size);
+   }
+ 
+-  return ngtcp2_ppe_dgram_padding(ppe);
++  return ngtcp2_ppe_dgram_padding_size(
++    ppe, ngtcp2_min(conn->local.settings.max_tx_udp_payload_size,
++                    conn->dcid.current.max_udp_payload_size));
+ }
+ 
+ static size_t conn_min_pktlen(const ngtcp2_conn *conn);
+@@ -5080,11 +5087,16 @@
+     (size_t)ngtcp2_min(conn->remote.transport_params->max_udp_payload_size,
+                        (uint64_t)conn->local.settings.max_tx_udp_payload_size);
+ 
+-  rv =
+-    ngtcp2_pmtud_new(&conn->pmtud, conn->dcid.current.max_udp_payload_size,
+-                     hard_max_udp_payload_size, conn->pktns.tx.last_pkt_num + 1,
+-                     conn->local.settings.pmtud_probes,
+-                     conn->local.settings.pmtud_probeslen, conn->mem);
++  /* conn->log.last_ts is the time instant of the call that brought us
++     here, which is where quic-go starts its own discovery from:
++     Start(now) at handshake confirmation, so that the first probe goes
++     one probe delay later rather than at once
++     (vendor/quic-go/connection.go:1016-1018,
++     vendor/quic-go/mtu_discoverer.go:138-140). */
++  rv = ngtcp2_pmtud_new(&conn->pmtud, conn->dcid.current.max_udp_payload_size,
++                        hard_max_udp_payload_size,
++                        conn->pktns.tx.last_pkt_num + 1, conn->log.last_ts,
++                        conn->mem);
+   if (rv != 0) {
+     return rv;
+   }
+@@ -5120,7 +5132,7 @@
+   assert(conn->pmtud);
+   assert(!ngtcp2_pmtud_finished(conn->pmtud));
+ 
+-  if (!ngtcp2_pmtud_require_probe(conn->pmtud)) {
++  if (!ngtcp2_pmtud_require_probe(conn->pmtud, conn->cstat.smoothed_rtt, ts)) {
+     return 0;
+   }
+ 
+@@ -5146,8 +5158,7 @@
+ 
+   assert(nwrite);
+ 
+-  ngtcp2_pmtud_probe_sent(conn->pmtud,
+-                          ngtcp2_conn_compute_pto(conn, &conn->pktns), ts);
++  ngtcp2_pmtud_probe_sent(conn->pmtud, probelen, ts);
+ 
+   return nwrite;
+ }
+@@ -11416,10 +11427,12 @@
+     res = ngtcp2_pv_next_expiry(conn->pv);
+   }
+ 
+-  if (conn->pmtud) {
+-    res = ngtcp2_min(res, conn->pmtud->expiry);
+-  }
+-
++  /* The next probe packet needs no timer of its own: it goes out with
++     the next write once a probe delay has passed, which is how quic-go
++     sends it too (vendor/quic-go/connection.go:2546-2563).  Upstream
++     ngtcp2 woke the connection for it and gave up on a probe by
++     expiry; here a lost probe is a lost packet like any other, and
++     loss detection reports it. */
+   if (!ngtcp2_pq_empty(&conn->scid.used)) {
+     scid = ngtcp2_struct_of(ngtcp2_pq_top(&conn->scid.used), ngtcp2_scid, pe);
+     if (scid->retired_ts != UINT64_MAX) {
+@@ -11510,13 +11523,6 @@
+     ngtcp2_pv_cancel_expired_timer(conn->pv, ts);
+   }
+ 
+-  if (conn->pmtud) {
+-    ngtcp2_pmtud_handle_expiry(conn->pmtud, ts);
+-    if (ngtcp2_pmtud_finished(conn->pmtud)) {
+-      ngtcp2_conn_stop_pmtud(conn);
+-    }
+-  }
+-
+   if (ngtcp2_conn_loss_detection_expiry(conn) <= ts) {
+     rv = ngtcp2_conn_on_loss_detection_timer(conn, ts);
+     if (rv != 0) {
+--- a/lib/ngtcp2_pmtud.c
++++ b/lib/ngtcp2_pmtud.c
+@@ -25,57 +25,50 @@
+ #include "ngtcp2_pmtud.h"
+ 
+ #include <assert.h>
++#include <string.h>
+ 
+ #include "ngtcp2_mem.h"
+ #include "ngtcp2_macro.h"
+ 
+-/* NGTCP2_PMTUD_PROBE_NUM_MAX is the maximum number of packets sent
+-   for each probe. */
+-#define NGTCP2_PMTUD_PROBE_NUM_MAX 3
+-
+-static uint16_t pmtud_default_probes[] = {
+-  1454 - 48, /* The well known MTU used by a domestic optic fiber
+-                service in Japan. */
+-  1390 - 48, /* Typical Tunneled MTU */
+-  1280 - 48, /* IPv6 minimum MTU */
+-  1492 - 48, /* PPPoE */
+-};
++/*
++ * pmtud_max returns the upper end of the search interval: the largest
++ * size the search has not ruled out.  It only comes down once every
++ * slot of fail_udp_payload_sizes is taken and a further failure
++ * pushes the largest of them out, which is what lets the search
++ * survive NGTCP2_PMTUD_MAX_FAIL_PROBES - 1 probe packets lost for
++ * reasons that have nothing to do with their size
++ * (vendor/quic-go/mtu_discoverer.go:129-136).
++ */
++static size_t pmtud_max(const ngtcp2_pmtud *pmtud) {
++  size_t i;
++
++  for (i = 0; i < NGTCP2_PMTUD_MAX_FAIL_PROBES; ++i) {
++    if (pmtud->fail_udp_payload_sizes[i] == 0) {
++      assert(i);
++
++      return pmtud->fail_udp_payload_sizes[i - 1];
++    }
++  }
++
++  return pmtud->fail_udp_payload_sizes[NGTCP2_PMTUD_MAX_FAIL_PROBES - 1];
++}
+ 
+ int ngtcp2_pmtud_new(ngtcp2_pmtud **ppmtud, size_t max_udp_payload_size,
+                      size_t hard_max_udp_payload_size, int64_t tx_pkt_num,
+-                     const uint16_t *probes, size_t probeslen,
+-                     const ngtcp2_mem *mem) {
++                     ngtcp2_tstamp ts, const ngtcp2_mem *mem) {
+   ngtcp2_pmtud *pmtud = ngtcp2_mem_malloc(mem, sizeof(ngtcp2_pmtud));
+ 
+   if (pmtud == NULL) {
+     return NGTCP2_ERR_NOMEM;
+   }
+ 
++  memset(pmtud, 0, sizeof(*pmtud));
++
+   pmtud->mem = mem;
+-  pmtud->mtu_idx = 0;
+-  pmtud->num_pkts_sent = 0;
+-  pmtud->expiry = UINT64_MAX;
++  pmtud->last_probe_ts = ts;
+   pmtud->tx_pkt_num = tx_pkt_num;
+   pmtud->max_udp_payload_size = max_udp_payload_size;
+-  pmtud->hard_max_udp_payload_size = hard_max_udp_payload_size;
+-  pmtud->min_fail_udp_payload_size = SIZE_MAX;
+-
+-  if (probeslen) {
+-    pmtud->probes = probes;
+-    pmtud->probeslen = probeslen;
+-  } else {
+-    pmtud->probes = pmtud_default_probes;
+-    pmtud->probeslen = ngtcp2_arraylen(pmtud_default_probes);
+-  }
+-
+-  for (; pmtud->mtu_idx < pmtud->probeslen; ++pmtud->mtu_idx) {
+-    if (pmtud->probes[pmtud->mtu_idx] > pmtud->hard_max_udp_payload_size) {
+-      continue;
+-    }
+-    if (pmtud->probes[pmtud->mtu_idx] > pmtud->max_udp_payload_size) {
+-      break;
+-    }
+-  }
++  pmtud->fail_udp_payload_sizes[0] = hard_max_udp_payload_size;
+ 
+   *ppmtud = pmtud;
+ 
+@@ -91,77 +84,80 @@
+ }
+ 
+ size_t ngtcp2_pmtud_probelen(ngtcp2_pmtud *pmtud) {
+-  assert(pmtud->mtu_idx < pmtud->probeslen);
++  if (pmtud->last_probe_failed) {
++    return (pmtud->max_udp_payload_size + pmtud->fail_udp_payload_sizes[0]) / 2;
++  }
+ 
+-  return pmtud->probes[pmtud->mtu_idx];
++  return (pmtud->max_udp_payload_size + pmtud_max(pmtud)) / 2;
+ }
+ 
+-void ngtcp2_pmtud_probe_sent(ngtcp2_pmtud *pmtud, ngtcp2_duration pto,
++void ngtcp2_pmtud_probe_sent(ngtcp2_pmtud *pmtud, size_t payloadlen,
+                              ngtcp2_tstamp ts) {
+-  ngtcp2_tstamp timeout;
++  pmtud->probe_udp_payload_size = payloadlen;
++  pmtud->last_probe_ts = ts;
++}
+ 
+-  if (++pmtud->num_pkts_sent < NGTCP2_PMTUD_PROBE_NUM_MAX) {
+-    timeout = pto;
+-  } else {
+-    timeout = 3 * pto;
++int ngtcp2_pmtud_require_probe(ngtcp2_pmtud *pmtud,
++                               ngtcp2_duration smoothed_rtt, ngtcp2_tstamp ts) {
++  if (pmtud->probe_udp_payload_size || ngtcp2_pmtud_finished(pmtud)) {
++    return 0;
+   }
+ 
+-  pmtud->expiry = ts + timeout;
+-}
+-
+-int ngtcp2_pmtud_require_probe(ngtcp2_pmtud *pmtud) {
+-  return pmtud->expiry == UINT64_MAX;
++  return ts >= pmtud->last_probe_ts + NGTCP2_PMTUD_PROBE_DELAY * smoothed_rtt;
+ }
+ 
+-static void pmtud_next_probe(ngtcp2_pmtud *pmtud) {
+-  assert(pmtud->mtu_idx < pmtud->probeslen);
++void ngtcp2_pmtud_probe_success(ngtcp2_pmtud *pmtud, size_t payloadlen) {
++  size_t i, j = 0;
+ 
+-  ++pmtud->mtu_idx;
+-  pmtud->num_pkts_sent = 0;
+-  pmtud->expiry = UINT64_MAX;
++  pmtud->probe_udp_payload_size = 0;
++  pmtud->last_probe_failed = 0;
++  pmtud->max_udp_payload_size =
++    ngtcp2_max(pmtud->max_udp_payload_size, payloadlen);
+ 
+-  for (; pmtud->mtu_idx < pmtud->probeslen; ++pmtud->mtu_idx) {
+-    if (pmtud->probes[pmtud->mtu_idx] <= pmtud->max_udp_payload_size ||
+-        pmtud->probes[pmtud->mtu_idx] > pmtud->hard_max_udp_payload_size) {
+-      continue;
+-    }
++  /* A size that works takes every smaller failure with it: they were
++     lost for some other reason (vendor/quic-go/mtu_discoverer.go:
++     210-226). */
++  for (i = 0; i < NGTCP2_PMTUD_MAX_FAIL_PROBES; ++i) {
++    if (payloadlen < pmtud->fail_udp_payload_sizes[i]) {
++      j = i;
+ 
+-    if (pmtud->probes[pmtud->mtu_idx] < pmtud->min_fail_udp_payload_size) {
+       break;
+     }
+   }
+-}
+-
+-void ngtcp2_pmtud_probe_success(ngtcp2_pmtud *pmtud, size_t payloadlen) {
+-  pmtud->max_udp_payload_size =
+-    ngtcp2_max(pmtud->max_udp_payload_size, payloadlen);
+-
+-  assert(pmtud->mtu_idx < pmtud->probeslen);
+ 
+-  if (pmtud->probes[pmtud->mtu_idx] > pmtud->max_udp_payload_size) {
++  if (j == 0) {
+     return;
+   }
+ 
+-  pmtud_next_probe(pmtud);
++  for (i = 0; i < NGTCP2_PMTUD_MAX_FAIL_PROBES; ++i) {
++    if (i + j < NGTCP2_PMTUD_MAX_FAIL_PROBES) {
++      pmtud->fail_udp_payload_sizes[i] = pmtud->fail_udp_payload_sizes[i + j];
++    } else {
++      pmtud->fail_udp_payload_sizes[i] = 0;
++    }
++  }
+ }
+ 
+-void ngtcp2_pmtud_handle_expiry(ngtcp2_pmtud *pmtud, ngtcp2_tstamp ts) {
+-  if (ts < pmtud->expiry) {
+-    return;
+-  }
++void ngtcp2_pmtud_probe_lost(ngtcp2_pmtud *pmtud, size_t payloadlen) {
++  size_t i, j;
+ 
+-  pmtud->expiry = UINT64_MAX;
++  pmtud->probe_udp_payload_size = 0;
++  pmtud->last_probe_failed = 1;
+ 
+-  if (pmtud->num_pkts_sent < NGTCP2_PMTUD_PROBE_NUM_MAX) {
+-    return;
+-  }
++  for (i = 0; i < NGTCP2_PMTUD_MAX_FAIL_PROBES; ++i) {
++    if (payloadlen < pmtud->fail_udp_payload_sizes[i]) {
++      for (j = NGTCP2_PMTUD_MAX_FAIL_PROBES - 1; j > i; --j) {
++        pmtud->fail_udp_payload_sizes[j] = pmtud->fail_udp_payload_sizes[j - 1];
++      }
+ 
+-  pmtud->min_fail_udp_payload_size =
+-    ngtcp2_min(pmtud->min_fail_udp_payload_size, pmtud->probes[pmtud->mtu_idx]);
++      pmtud->fail_udp_payload_sizes[i] = payloadlen;
+ 
+-  pmtud_next_probe(pmtud);
++      break;
++    }
++  }
+ }
+ 
+ int ngtcp2_pmtud_finished(ngtcp2_pmtud *pmtud) {
+-  return pmtud->mtu_idx >= pmtud->probeslen;
++  return pmtud_max(pmtud) <=
++         pmtud->max_udp_payload_size + NGTCP2_PMTUD_MAX_DIFF + 1;
+ }
+--- a/lib/ngtcp2_pmtud.h
++++ b/lib/ngtcp2_pmtud.h
+@@ -31,52 +31,73 @@
+ 
+ #include <ngtcp2/ngtcp2.h>
+ 
++/* NGTCP2_PMTUD_MAX_FAIL_PROBES is the number of probe sizes that are
++   remembered as failures before the largest of them becomes the
++   ceiling of the search.  It is quic-go's maxLostMTUProbes, and it is
++   what makes the search survive the loss of a probe packet that had
++   nothing to do with its size (vendor/quic-go/mtu_discoverer.go:
++   29-32). */
++#define NGTCP2_PMTUD_MAX_FAIL_PROBES 3
++
++/* NGTCP2_PMTUD_PROBE_DELAY is the number of smoothed RTTs between
++   probe packets, quic-go's mtuProbeDelay
++   (vendor/quic-go/mtu_discoverer.go:17-18). */
++#define NGTCP2_PMTUD_PROBE_DELAY 5
++
++/* NGTCP2_PMTUD_MAX_DIFF is how close the search has to come to the
++   path MTU before it stops, quic-go's maxMTUDiff — "We're happy to
++   send a packet that's 10 bytes smaller than the actual MTU"
++   (vendor/quic-go/mtu_discoverer.go:14-16). */
++#define NGTCP2_PMTUD_MAX_DIFF 20
++
+ typedef struct ngtcp2_pmtud {
+   const ngtcp2_mem *mem;
+-  /* mtu_idx is the index of UDP payload size candidates to try
+-     out. */
+-  size_t mtu_idx;
+-  /* num_pkts_sent is the number of mtu_idx sized UDP datagram payload
+-     sent */
+-  size_t num_pkts_sent;
+-  /* expiry is the expired, if it is reached, send out the next UDP
+-     datagram.  UINT64_MAX means no expiry, or expiration is canceled.
+-     In either case, new probe packet should be sent unless we have
+-     done all attempts. */
+-  ngtcp2_tstamp expiry;
++  /* last_probe_ts is the time instant the last probe packet was sent,
++     or the time instant this discovery started.  The next probe
++     packet goes NGTCP2_PMTUD_PROBE_DELAY smoothed RTTs after it, so
++     that the first one is not sent immediately either
++     (vendor/quic-go/mtu_discoverer.go:138-150). */
++  ngtcp2_tstamp last_probe_ts;
+   /* tx_pkt_num is the smallest outgoing packet number where the
+      current discovery is performed.  In other words, acknowledging
+      packet whose packet number lower than that does not indicate the
+      success of Path MTU Discovery. */
+   int64_t tx_pkt_num;
+-  /* max_udp_payload_size is the maximum UDP payload size which is
+-     known to work. */
++  /* max_udp_payload_size is the largest UDP payload size which is
++     known to work.  It is quic-go's min: the lower end of the search
++     interval and the size the connection sends at. */
+   size_t max_udp_payload_size;
+-  /* hard_max_udp_payload_size is the maximum UDP payload size that is
+-     going to be probed. */
+-  size_t hard_max_udp_payload_size;
+-  /* min_fail_udp_payload_size is the minimum UDP payload size that is
+-     known to fail. */
+-  size_t min_fail_udp_payload_size;
+-  /* probes is the array of UDP datagram payload size to probe. */
+-  const uint16_t *probes;
+-  /* probeslen is the number of probes pointed by probes. */
+-  size_t probeslen;
++  /* fail_udp_payload_sizes are the probe sizes that were lost,
++     smallest first, with zero for the entries that are not used yet.
++     The first entry starts as the largest size that will ever be
++     probed, which is the upper end of the search interval until
++     enough probes are lost to push it down (quic-go's lost array,
++     vendor/quic-go/mtu_discoverer.go:88-90, :223-241). */
++  size_t fail_udp_payload_sizes[NGTCP2_PMTUD_MAX_FAIL_PROBES];
++  /* probe_udp_payload_size is the size of the probe packet that is in
++     flight, or zero if there is none.  Only one probe packet is in
++     flight at a time. */
++  size_t probe_udp_payload_size;
++  /* last_probe_failed is nonzero if the probe packet that was
++     resolved last was lost rather than acknowledged.  The next probe
++     is then a cautious one, halfway to the smallest size that failed
++     rather than halfway to the ceiling
++     (vendor/quic-go/mtu_discoverer.go:152-165). */
++  int last_probe_failed;
+ } ngtcp2_pmtud;
+ 
+ /*
+  * ngtcp2_pmtud_new creates new ngtcp2_pmtud object, and assigns its
+  * pointer to |*ppmtud|.  |max_udp_payload_size| is the maximum UDP
+- * payload size that is known to work for the current path.
+- * |tx_pkt_num| should be the next packet number to send, which is
+- * used to differentiate the PMTUD probe packet sent by the previous
+- * PMTUD.  PMTUD might finish immediately if |max_udp_payload_size| is
+- * larger than or equal to all UDP payload probe candidates.
+- * Therefore, call ngtcp2_pmtud_finished to check this situation.
+- *
+- * The array pointed by |pmtud_probes| of length |pmtud_probeslen|
+- * specifies UDP datagram payload size to probe.  If |pmtud_probeslen|
+- * is zero, the default probes are used.
++ * payload size that is known to work for the current path, and the
++ * search starts there.  |hard_max_udp_payload_size| is the largest
++ * size that will ever be probed.  |tx_pkt_num| should be the next
++ * packet number to send, which is used to differentiate the PMTUD
++ * probe packet sent by the previous PMTUD.  |ts| is the time instant
++ * the discovery starts; the first probe packet goes one probe delay
++ * after it.  PMTUD might finish immediately if the two sizes are
++ * already within NGTCP2_PMTUD_MAX_DIFF of each other.  Therefore,
++ * call ngtcp2_pmtud_finished to check this situation.
+  *
+  * This function returns 0 if it succeeds, or one of the following
+  * negative error codes:
+@@ -86,8 +107,7 @@
+  */
+ int ngtcp2_pmtud_new(ngtcp2_pmtud **ppmtud, size_t max_udp_payload_size,
+                      size_t hard_max_udp_payload_size, int64_t tx_pkt_num,
+-                     const uint16_t *pmtud_probes, size_t pmtud_probeslen,
+-                     const ngtcp2_mem *mem);
++                     ngtcp2_tstamp ts, const ngtcp2_mem *mem);
+ 
+ /*
+  * ngtcp2_pmtud_del deletes |pmtud|.
+@@ -96,22 +116,26 @@
+ 
+ /*
+  * ngtcp2_pmtud_probelen returns the length of UDP payload size for a
+- * PMTUD probe packet.
++ * PMTUD probe packet: halfway between what is known to work and what
++ * the search has not ruled out.
+  */
+ size_t ngtcp2_pmtud_probelen(ngtcp2_pmtud *pmtud);
+ 
+ /*
+- * ngtcp2_pmtud_probe_sent should be invoked when a PMTUD probe packet is
+- * sent.
++ * ngtcp2_pmtud_probe_sent should be invoked when a PMTUD probe packet
++ * of |payloadlen| UDP payload bytes is sent at |ts|.
+  */
+-void ngtcp2_pmtud_probe_sent(ngtcp2_pmtud *pmtud, ngtcp2_duration pto,
++void ngtcp2_pmtud_probe_sent(ngtcp2_pmtud *pmtud, size_t payloadlen,
+                              ngtcp2_tstamp ts);
+ 
+ /*
+  * ngtcp2_pmtud_require_probe returns nonzero if a PMTUD probe packet
+- * should be sent.
++ * should be sent at |ts|: no probe packet is in flight, the search is
++ * not finished, and NGTCP2_PMTUD_PROBE_DELAY |smoothed_rtt| have
++ * passed since the last one was sent.
+  */
+-int ngtcp2_pmtud_require_probe(ngtcp2_pmtud *pmtud);
++int ngtcp2_pmtud_require_probe(ngtcp2_pmtud *pmtud,
++                               ngtcp2_duration smoothed_rtt, ngtcp2_tstamp ts);
+ 
+ /*
+  * ngtcp2_pmtud_probe_success should be invoked when a PMTUD probe
+@@ -120,9 +144,10 @@
+ void ngtcp2_pmtud_probe_success(ngtcp2_pmtud *pmtud, size_t payloadlen);
+ 
+ /*
+- * ngtcp2_pmtud_handle_expiry handles expiry.
++ * ngtcp2_pmtud_probe_lost should be invoked when a PMTUD probe UDP
++ * datagram sized |payloadlen| is declared lost.
+  */
+-void ngtcp2_pmtud_handle_expiry(ngtcp2_pmtud *pmtud, ngtcp2_tstamp ts);
++void ngtcp2_pmtud_probe_lost(ngtcp2_pmtud *pmtud, size_t payloadlen);
+ 
+ /*
+  * ngtcp2_pmtud_finished returns nonzero if PMTUD has finished.
+--- a/lib/ngtcp2_rtb.c
++++ b/lib/ngtcp2_rtb.c
+@@ -460,6 +460,19 @@
+     }
+   }
+ 
++  if ((ent->flags & NGTCP2_RTB_ENTRY_FLAG_PMTUD_PROBE) && conn->pmtud &&
++      conn->pmtud->tx_pkt_num <= ent->hd.pkt_num) {
++    /* quic-go hears about a lost probe packet the same way, through the
++       frame handler of the PING it carried
++       (vendor/quic-go/mtu_discoverer.go:223-241), and that is the only
++       thing that ends a probe: there is no timer on it. */
++    ngtcp2_pmtud_probe_lost(conn->pmtud, ent->pktlen);
++
++    if (ngtcp2_pmtud_finished(conn->pmtud)) {
++      ngtcp2_conn_stop_pmtud(conn);
++    }
++  }
++
+   if (ent->flags &
+       (NGTCP2_RTB_ENTRY_FLAG_PMTUD_PROBE | NGTCP2_RTB_ENTRY_FLAG_SKIP)) {
+     ++rtb->num_lost_ignore_pkts;
+--- a/lib/includes/ngtcp2/ngtcp2.h
++++ b/lib/includes/ngtcp2/ngtcp2.h
+@@ -324,6 +324,18 @@
+ /**
+  * @macro
+  *
++ * :macro:`NGTCP2_INITIAL_UDP_PAYLOAD_SIZE` is the maximum UDP datagram
++ * payload size that a client transmits before Path MTU Discovery has
++ * raised it.  It is quic-go's InitialPacketSize
++ * (`vendor/quic-go/internal/protocol/params.go:5-6`), and 1280 is
++ * the IPv6 minimum link MTU, which needs no discovery to be
++ * deliverable.
++ */
++#define NGTCP2_INITIAL_UDP_PAYLOAD_SIZE 1280
++
++/**
++ * @macro
++ *
+  * :macro:`NGTCP2_MAX_TX_UDP_PAYLOAD_SIZE` is the maximum UDP datagram
+  * payload size that this library can output.
+  */
+@@ -2065,23 +2077,18 @@
+   uint32_t initial_pkt_num;
+   /* The following fields have been added since NGTCP2_SETTINGS_V2. */
+   /**
+-   * :member:`pmtud_probes` is the array of UDP datagram payload size
+-   * to probe during Path MTU Discovery.  The discovery is done in the
+-   * order appeared in this array.  The payload size must be strictly
+-   * larger than :macro:`NGTCP2_MAX_UDP_PAYLOAD_SIZE`, and less than
+-   * or equal to :macro:`NGTCP2_MAX_TX_UDP_PAYLOAD_SIZE`.  Otherwise
+-   * the behavior is undefined.  The maximum value in this array
+-   * should be set to :member:`max_tx_udp_payload_size`.  If this
+-   * field is not set, the predefined PMTUD probes are made.
+-   *
+-   * .. version-added:: 1.4.0
++   * :member:`pmtud_probes` is not read in this build.  Path MTU
++   * Discovery here follows quic-go, which searches for the size by
++   * halving the interval between what is known to work and what is
++   * not ruled out, rather than trying a list of sizes in order; see
++   * `lib/ngtcp2_pmtud.c`.  The field is kept so that the size of this
++   * structure at :macro:`NGTCP2_SETTINGS_V2`, which
++   * `lib/ngtcp2_settings.c` computes from its offset, does not move.
+    */
+   const uint16_t *pmtud_probes;
+   /**
+-   * :member:`pmtud_probeslen` is the number of elements that are
+-   * contained in the array pointed by :member:`pmtud_probes`.
+-   *
+-   * .. version-added:: 1.4.0
++   * :member:`pmtud_probeslen` is not read in this build; see
++   * :member:`pmtud_probes`.
+    */
+   size_t pmtud_probeslen;
+   /* The following fields have been added since NGTCP2_SETTINGS_V3. */

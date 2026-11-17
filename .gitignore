@@ -1,0 +1,30 @@
+# Everything the build produces lives in build/ and none of it belongs in the repository. The
+# suffixed ones are cross builds — `make BUILD=build-mips CC=mipsel-openwrt-linux-gcc` and its
+# aarch64 twin — kept apart so that measuring one target does not throw away the other.
+build/
+build-*/
+
+# Downloaded once and reused: cross toolchains, mostly. Deliberately NOT under build/, because
+# `make clean` empties that — and emptying it once cost a two-hundred-megabyte toolchain and every
+# generated fingerprint table on a slow connection. Things that are fetched and things that are
+# built have different lifetimes and belong in different places.
+dl/
+
+# The Go tooling is built on demand; the binary is not an artefact anyone should be pulling.
+tools/fp/fp
+tools/fp/fp.exe
+
+# Reports of the automated reference-citation audit, written into the tree by a tool that lives
+# outside it. Hundreds of kilobytes of machine output that go stale on the next run: what is worth
+# keeping from them ends up in code comments and in DIVERGENCES.md, not here. A report is appended
+# to until the run ends, so one without its acceptance section at the bottom may simply be unfinished.
+VENDOR.md
+VENDOR-REVERSE.md
+COVERAGE.md
+
+# The x/text Go ships, copied out of GOROOT for the URL tools by the Makefile.
+tools/.goroot-x/
+
+# Python tests and fixture generators leave only local bytecode caches.
+__pycache__/
+*.py[cod]

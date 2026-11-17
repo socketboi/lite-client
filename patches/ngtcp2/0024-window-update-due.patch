@@ -1,0 +1,63 @@
+Whether a window update is due, for an application that sends it at once as quic-go does.
+
+quic-go's Read queues a MAX_STREAM_DATA or MAX_DATA as soon as the bytes it hands over make one
+due, and wakes the sender (vendor/quic-go/receive_stream.go:113-135,
+vendor/quic-go/connection.go:3034, :3046-3049), whose loop runs beside the goroutine that reads.
+ngtcp2 queues the stream the same way when ngtcp2_conn_extend_max_stream_offset makes one due,
+but the frame waits for the application's next write — and lc-tunnel reads a whole burst before
+it writes again, so the updates a burst made due left as one, sometimes a whole window apart where
+the reference's came a quarter apart.
+
+ngtcp2_conn_lc_window_update_due says whether one is due now — the stream's, by the same rule
+conn_should_send_max_stream_data applies, or the connection's — and src/quic/conn.c,
+lc_qconn_tcp_read, writes when it says so.
+
+Measured on tools/vendorcap/qstand with QSTAND_SERVE, the server's qlog counting the client's
+updates (see the commit).
+
+diff --git a/lib/includes/ngtcp2/ngtcp2.h b/lib/includes/ngtcp2/ngtcp2.h
+index 88e1aea..ac57e73 100644
+--- a/lib/includes/ngtcp2/ngtcp2.h
++++ b/lib/includes/ngtcp2/ngtcp2.h
+@@ -5622,6 +5622,20 @@ NGTCP2_EXTERN int ngtcp2_conn_extend_max_stream_offset(ngtcp2_conn *conn,
+                                                        int64_t stream_id,
+                                                        uint64_t datalen);
+ 
++/**
++ * @function
++ *
++ * `ngtcp2_conn_lc_window_update_due` returns nonzero if a MAX_DATA,
++ * or a MAX_STREAM_DATA for the stream |stream_id|, is due to be sent
++ * now.  quic-go wakes its sender as soon as a Read makes either due
++ * (vendor/quic-go/receive_stream.go:113-135,
++ * vendor/quic-go/connection.go:3034, :3046-3049); an application that
++ * wants the same asks this after extending the windows, and writes
++ * when it says so.
++ */
++NGTCP2_EXTERN int ngtcp2_conn_lc_window_update_due(ngtcp2_conn *conn,
++                                                   int64_t stream_id);
++
+ /**
+  * @function
+  *
+diff --git a/lib/ngtcp2_conn.c b/lib/ngtcp2_conn.c
+index d785ddc..429ffe1 100644
+--- a/lib/ngtcp2_conn.c
++++ b/lib/ngtcp2_conn.c
+@@ -16205,3 +16205,16 @@ uint32_t ngtcp2_select_version(const uint32_t *preferred_versions,
+ 
+   return 0;
+ }
++
++int ngtcp2_conn_lc_window_update_due(ngtcp2_conn *conn, int64_t stream_id) {
++  ngtcp2_strm *strm = ngtcp2_conn_find_stream(conn, stream_id);
++
++  if (conn_should_send_max_data(conn)) {
++    return 1;
++  }
++
++  return strm != NULL &&
++         !(strm->flags &
++           (NGTCP2_STRM_FLAG_SHUT_RD | NGTCP2_STRM_FLAG_STOP_SENDING)) &&
++         conn_should_send_max_stream_data(conn, strm);
++}

@@ -1,0 +1,86 @@
+An acknowledgement while the pace forbids data, which ngtcp2 already writes and this client lost.
+
+WHAT THE REFERENCE DOES. quic-go, asked to send while pacing-limited, parks the deadline and still
+puts one packet on the wire — an acknowledgement on its own:
+
+    case ackhandler.SendPacingLimited:
+        ...
+        c.pacingDeadline = deadline
+        // Allow sending of an ACK if we're pacing limit.
+        ...
+        return c.maybeSendAckOnlyPacket(now)
+                             (vendor/quic-go/connection.go:2496-2505)
+
+WHAT NGTCP2 ALREADY DOES, and it is the same thing. In NGTCP2_CS_POST_HANDSHAKE, when its own
+pacing refuses a packet, it does not return empty-handed either:
+
+    if (!conn_pacing_pkt_tx_allowed(conn, ts)) {
+      ...
+      return conn_write_ack_pkt(conn, pi, dest, origlen, NGTCP2_PKT_1RTT, ts);
+    }
+                             (lib/ngtcp2_conn.c, ngtcp2_conn_writev_stream's switch)
+
+HOW THIS CLIENT LOST IT. Patch 0009 moved the pacing decision OUT of ngtcp2 and into the send loop,
+because the reference paces with hysteria's token bucket and ngtcp2's own pacer is a different
+mechanism — `ngtcp2_conn_update_pkt_tx_time` is never called here, so `conn_pacing_pkt_tx_allowed`
+is always true and that branch is unreachable. The loop asks the bucket itself and returns when the
+answer is no, which is correct about DATA and wrong about acknowledgements: it never asks ngtcp2
+whether one is due.
+
+WHAT IT COST, measured through the impairing relay on 2026-09-20, same transfer both clients:
+datagrams under 300 bytes were 15.6 % of what the reference sent (7 507) against 4.8 % of ours
+(1 868). The 5 639 missing small packets are the same order as the 3 451 times the loop stopped on
+the pace in that run (tx_stop_paced, src/quic/conn.h). They are also the whole of the back-to-back
+density gap that three separate changes to the FEED never moved — read `commonest runs` on that
+stand: the reference's runs of two and three datagrams are an ACK beside full packets, not a short
+burst of data.
+
+WHAT THIS PATCH ADDS: nothing but reach. conn_write_ack_pkt is already written, already handles the
+1RTT space with the right ack delay and exponent, and already returns zero when no acknowledgement
+is due. It is static. This exposes it for the one caller that needs it, with the two conditions its
+own assert and its callers rely on checked here rather than assumed: the connection is past the
+handshake with 1RTT keys, and no packet is half-built (NGTCP2_CONN_FLAG_PPE_PENDING).
+
+The bucket is charged for what goes out, because the reference charges it: hysteria's BBR calls
+`b.pacer.SentPacket(sentTime, bytes)` as the first statement of OnPacketSent, before it looks at
+whether the packet was ack-eliciting (core/internal/congestion/bbr/bbr_sender.go:444-451), and
+quic-go calls OnPacketSent for every packet it sends, ack-eliciting or not
+(internal/ackhandler/sent_packet_handler.go:325).
+
+Applies on top of 0009.
+--- a/lib/ngtcp2_conn.c
++++ b/lib/ngtcp2_conn.c
+@@ -3006,6 +3006,33 @@
+   return spktlen;
+ }
+ 
++/*
++ * ngtcp2_conn_write_ack_pkt_1rtt writes a packet containing nothing but an ACK frame, for a
++ * caller that paces outside this library and therefore never reaches the branch in
++ * ngtcp2_conn_writev_stream that would have written one. See patches/ngtcp2/0010 for why that
++ * caller exists and what the reference does at the same moment.
++ *
++ * Returns 0 - not an error - when there is no acknowledgement to send, when the connection is
++ * not past the handshake, or when a packet is half-built.
++ */
++ngtcp2_ssize ngtcp2_conn_write_ack_pkt_1rtt(ngtcp2_conn *conn,
++                                            ngtcp2_pkt_info *pi, uint8_t *dest,
++                                            size_t destlen, ngtcp2_tstamp ts) {
++  if (conn->state != NGTCP2_CS_POST_HANDSHAKE) {
++    return 0;
++  }
++
++  if (conn->pktns.crypto.tx.ckm == NULL) {
++    return 0;
++  }
++
++  if (conn->flags & NGTCP2_CONN_FLAG_PPE_PENDING) {
++    return 0;
++  }
++
++  return conn_write_ack_pkt(conn, pi, dest, destlen, NGTCP2_PKT_1RTT, ts);
++}
++
+ static void conn_discard_pktns(ngtcp2_conn *conn, ngtcp2_pktns **ppktns,
+                                ngtcp2_tstamp ts) {
+   ngtcp2_pktns *pktns = *ppktns;

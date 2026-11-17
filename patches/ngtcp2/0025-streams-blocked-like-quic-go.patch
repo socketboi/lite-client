@@ -1,0 +1,80 @@
+STREAMS_BLOCKED when the bidirectional stream limit is reached, as quic-go sends it.
+
+quic-go's OpenStream, finding the peer's limit reached, queues a STREAMS_BLOCKED carrying that limit
+before it returns StreamLimitReachedError, and only once per limit: a MAX_STREAMS that raises it
+re-arms the frame (vendor/quic-go/streams_map_outgoing.go:65-79, :144-160, :189-197). hysteria opens
+every proxied TCP connection with that call (vendor/hysteria/core/client/client.go:185-190), so a
+client that runs into a node's MAX_STREAMS tells it so on the wire. ngtcp2 never writes the frame at
+all; it only parses the peer's.
+
+ngtcp2_conn_lc_streams_blocked_bidi queues it on the same terms, and src/quic/conn.c,
+lc_qconn_tcp_open, calls it where it refuses a stream for want of one. A lost frame is resent as
+ngtcp2 resends any control frame, which is what quic-go's retransmission queue does with it
+(vendor/quic-go/retransmission_queue.go:52-61).
+
+diff --git a/lib/includes/ngtcp2/ngtcp2.h b/lib/includes/ngtcp2/ngtcp2.h
+--- a/lib/includes/ngtcp2/ngtcp2.h
++++ b/lib/includes/ngtcp2/ngtcp2.h
+@@ -5639,6 +5639,18 @@
+ /**
+  * @function
+  *
++ * `ngtcp2_conn_lc_streams_blocked_bidi` queues a STREAMS_BLOCKED
++ * (0x16) carrying the current bidirectional stream limit, once per
++ * limit, which is what quic-go's OpenStream does when it finds the
++ * limit reached (vendor/quic-go/streams_map_outgoing.go:65-79,
++ * :144-160) and a raised limit re-arms (:197).  It returns 0 when a
++ * frame was queued or none was due, or NGTCP2_ERR_NOMEM.
++ */
++NGTCP2_EXTERN int ngtcp2_conn_lc_streams_blocked_bidi(ngtcp2_conn *conn);
++
++/**
++ * @function
++ *
+  * `ngtcp2_conn_extend_max_offset` extends max data offset by
+  * |datalen|.  This function only extends connection-level flow
+  * control window.
+diff --git a/lib/ngtcp2_conn.c b/lib/ngtcp2_conn.c
+--- a/lib/ngtcp2_conn.c
++++ b/lib/ngtcp2_conn.c
+@@ -16218,3 +16218,27 @@
+            (NGTCP2_STRM_FLAG_SHUT_RD | NGTCP2_STRM_FLAG_STOP_SENDING)) &&
+          conn_should_send_max_stream_data(conn, strm);
+ }
++
++int ngtcp2_conn_lc_streams_blocked_bidi(ngtcp2_conn *conn) {
++  ngtcp2_frame_chain *nfrc;
++  int rv;
++
++  if (ngtcp2_conn_get_streams_bidi_left2(conn) != 0 ||
++      conn->local.bidi.lc_blocked_sent == conn->local.bidi.max_streams + 1) {
++    return 0;
++  }
++
++  rv = ngtcp2_frame_chain_objalloc_new(&nfrc, &conn->frc_objalloc);
++  if (rv != 0) {
++    return rv;
++  }
++
++  nfrc->fr.streams_blocked.type = NGTCP2_FRAME_STREAMS_BLOCKED_BIDI;
++  nfrc->fr.streams_blocked.max_streams = conn->local.bidi.max_streams;
++  nfrc->next = conn->pktns.tx.frq;
++  conn->pktns.tx.frq = nfrc;
++
++  conn->local.bidi.lc_blocked_sent = conn->local.bidi.max_streams + 1;
++
++  return 0;
++}
+diff --git a/lib/ngtcp2_conn.h b/lib/ngtcp2_conn.h
+--- a/lib/ngtcp2_conn.h
++++ b/lib/ngtcp2_conn.h
+@@ -566,6 +566,9 @@
+       /* next_stream_id is the bidirectional stream ID which the local
+          endpoint opens next. */
+       int64_t next_stream_id;
++      /* lc_blocked_sent is one more than the max_streams a
++         STREAMS_BLOCKED was queued for, 0 while none was. */
++      uint64_t lc_blocked_sent;
+     } bidi;
+ 
+     struct {

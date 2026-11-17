@@ -1,0 +1,158 @@
+PING in ACK-only packets as quic-go adds it (hysteria client).
+
+quic-go counts the application-data packets it sends that carry only an ACK; once
+MaxNonAckElicitingAcks (19) have gone in a row, the next ACK-only packet also carries a PING and
+the count starts again, and any packet with other frames resets it (vendor/quic-go/
+packet_packer.go:682-708, internal/protocol/params.go:69-71). Initial and Handshake packets never
+get that PING.
+
+Upstream ngtcp2 times it instead: a PING once smoothed_rtt has passed since the first of a run of
+non-ack-eliciting packets, in the Initial and Handshake spaces as well as 1-RTT, and never in the
+ACK-only packets written through ngtcp2_conn_write_single_frame_pkt.
+
+This patch replaces pktns->tx.non_ack_pkt_start_ts with a packet count, drops the rule for the
+long-header spaces, and applies the count to ACK-only 1-RTT packets on both write paths.
+Applies on top of 0001.
+
+--- a/lib/ngtcp2_conn.c
++++ b/lib/ngtcp2_conn.c
+@@ -798,7 +798,7 @@
+   ngtcp2_gaptr_init(&pktns->rx.pngap, mem);
+ 
+   pktns->tx.last_pkt_num = initial_pkt_num - 1;
+-  pktns->tx.non_ack_pkt_start_ts = UINT64_MAX;
++  pktns->tx.num_non_ack_eliciting_acks = 0;
+   pktns->rx.max_ack_eliciting_pkt_num = -1;
+   pktns->id = pktns_id;
+ 
+@@ -2761,27 +2761,10 @@
+       }
+     }
+ 
+-    if (!pkt_empty) {
+-      if (!(rtb_entry_flags & NGTCP2_RTB_ENTRY_FLAG_ACK_ELICITING)) {
+-        if (ngtcp2_tstamp_elapsed(pktns->tx.non_ack_pkt_start_ts,
+-                                  conn->cstat.smoothed_rtt, ts)) {
+-          lfr.ping.type = NGTCP2_FRAME_PING;
+-
+-          rv = conn_ppe_write_frame_hd_log(conn, &ppe, &hd_logged, &hd, &lfr);
+-          if (rv != 0) {
+-            assert(rv == NGTCP2_ERR_NOBUF);
+-          } else {
+-            rtb_entry_flags |= NGTCP2_RTB_ENTRY_FLAG_ACK_ELICITING;
+-            pktns->tx.non_ack_pkt_start_ts = UINT64_MAX;
+-            pkt_empty = 0;
+-          }
+-        } else if (pktns->tx.non_ack_pkt_start_ts == UINT64_MAX) {
+-          pktns->tx.non_ack_pkt_start_ts = ts;
+-        }
+-      } else {
+-        pktns->tx.non_ack_pkt_start_ts = UINT64_MAX;
+-      }
+-    }
++    /* No PING for a run of ACK-only Initial or Handshake packets:
++       quic-go adds one only to application data packets
++       (vendor/quic-go/packet_packer.go:682-708; the long-header
++       packers at :543-659 have no such rule). */
+   }
+ 
+   if (pkt_empty && !require_padding) {
+@@ -4505,8 +4488,13 @@
+   }
+ 
+   if (!(rtb_entry_flags & NGTCP2_RTB_ENTRY_FLAG_ACK_ELICITING)) {
+-    if (ngtcp2_tstamp_elapsed(pktns->tx.non_ack_pkt_start_ts,
+-                              cstat->smoothed_rtt, ts) ||
++    /* Every twentieth ACK-only packet in a row carries a PING, counted
++       in packets rather than timed: quic-go adds it once
++       numNonAckElicitingAcks has reached MaxNonAckElicitingAcks and
++       otherwise counts the packet (vendor/quic-go/packet_packer.go:
++       616-634). */
++    if ((!pkt_empty && pktns->tx.num_non_ack_eliciting_acks >=
++                         NGTCP2_MAX_NON_ACK_ELICITING_ACKS) ||
+         keep_alive_expired || conn->pktns.rtb.probe_pkt_left) {
+       lfr.ping.type = NGTCP2_FRAME_PING;
+ 
+@@ -4522,13 +4510,13 @@
+         } else {
+           rtb_entry_flags |= NGTCP2_RTB_ENTRY_FLAG_PTO_ELICITING;
+         }
+-        pktns->tx.non_ack_pkt_start_ts = UINT64_MAX;
++        pktns->tx.num_non_ack_eliciting_acks = 0;
+         if (keep_alive_expired) {
+           conn->flags |= NGTCP2_CONN_FLAG_KEEP_ALIVE_PING_SENT;
+         }
+       }
+-    } else if (pktns->tx.non_ack_pkt_start_ts == UINT64_MAX) {
+-      pktns->tx.non_ack_pkt_start_ts = ts;
++    } else if (!pkt_empty) {
++      ++pktns->tx.num_non_ack_eliciting_acks;
+     }
+   } else {
+     if (keep_alive_expired) {
+@@ -4539,7 +4527,7 @@
+         conn->flags |= NGTCP2_CONN_FLAG_KEEP_ALIVE_PING_SENT;
+       }
+     }
+-    pktns->tx.non_ack_pkt_start_ts = UINT64_MAX;
++    pktns->tx.num_non_ack_eliciting_acks = 0;
+   }
+ 
+   /* TODO Push STREAM frame back to ngtcp2_strm if there is an error
+@@ -4722,6 +4710,26 @@
+     return 0;
+   }
+ 
++  /* An ACK-only 1-RTT packet written here counts towards the same run
++     as one written by conn_write_pkt, and the twentieth carries a
++     PING (vendor/quic-go/packet_packer.go:690-708: quic-go packs its
++     ACK-only packets through that one function). */
++  if (type == NGTCP2_PKT_1RTT && (fr->hd.type == NGTCP2_FRAME_ACK ||
++                                  fr->hd.type == NGTCP2_FRAME_ACK_ECN)) {
++    if (pktns->tx.num_non_ack_eliciting_acks >=
++        NGTCP2_MAX_NON_ACK_ELICITING_ACKS) {
++      lfr.ping.type = NGTCP2_FRAME_PING;
++
++      if (conn_ppe_write_frame(conn, &ppe, &hd, &lfr) == 0) {
++        rtb_entry_flags |= NGTCP2_RTB_ENTRY_FLAG_ACK_ELICITING |
++                           NGTCP2_RTB_ENTRY_FLAG_PTO_ELICITING;
++        pktns->tx.num_non_ack_eliciting_acks = 0;
++      }
++    } else {
++      ++pktns->tx.num_non_ack_eliciting_acks;
++    }
++  }
++
+   lfr.padding.type = NGTCP2_FRAME_PADDING;
+   if (flags & NGTCP2_WRITE_PKT_FLAG_REQUIRE_PADDING_FULL) {
+     lfr.padding.len = ngtcp2_ppe_dgram_padding_size(&ppe, destlen);
+--- a/lib/ngtcp2_conn.h
++++ b/lib/ngtcp2_conn.h
+@@ -199,6 +199,11 @@
+    vendor/quic-go/connection.go:701-705 and :879-885). */
+ #define NGTCP2_CONN_FLAG_KEEP_ALIVE_PING_SENT 0x80000U
+ 
++/* NGTCP2_MAX_NON_ACK_ELICITING_ACKS is quic-go's
++   MaxNonAckElicitingAcks (vendor/quic-go/internal/protocol/params.go:
++   75-77). */
++#define NGTCP2_MAX_NON_ACK_ELICITING_ACKS 19
++
+ typedef struct ngtcp2_pktns {
+   struct {
+     /* last_pkt_num is the packet number which the local endpoint sent
+@@ -212,9 +217,12 @@
+       int64_t exponent;
+     } skip_pkt;
+     ngtcp2_frame_chain *frq;
+-    /* non_ack_pkt_start_ts is the timestamp since the local endpoint
+-       starts sending continuous non ACK-eliciting packets. */
+-    ngtcp2_tstamp non_ack_pkt_start_ts;
++    /* num_non_ack_eliciting_acks counts the ACK-only 1-RTT packets
++       sent in a row.  The next one past
++       NGTCP2_MAX_NON_ACK_ELICITING_ACKS carries a PING, as quic-go's
++       numNonAckElicitingAcks does (vendor/quic-go/packet_packer.go:
++       616-634, protocol.MaxNonAckElicitingAcks = 19). */
++    size_t num_non_ack_eliciting_acks;
+ 
+     struct {
+       /* ect0 is the number of QUIC packets, not UDP datagram, which

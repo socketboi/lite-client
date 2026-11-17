@@ -1,0 +1,5 @@
+# Every text file is LF in the repository and in every checkout, whatever core.autocrlf says: the
+# scripts run in a Linux container through a bind mount, the ngtcp2 patches apply with -F0, and
+# check-notices compares generated text byte for byte.
+* text=auto eol=lf
+*.fpt binary

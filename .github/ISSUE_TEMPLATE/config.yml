@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Questions and setup help
+    url: https://github.com/socketboi/lite-client/discussions
+    about: How to configure the client, which package to pick, whether a router is supported. Ask in Discussions.
+  - name: Security issue, or a way to identify users of this client
+    url: https://github.com/socketboi/lite-client/security/advisories/new
+    about: Report privately. See SECURITY.md for what counts.

@@ -1,0 +1,842 @@
+The ClientHello laid out as quic-go lays it out (hysteria client).
+
+quic-go cuts the ClientHello in one place and one place only: the second half of SNI
+(vendor/quic-go/crypto_stream.go:193-195). It writes everything else in order, skipping over that
+piece (:255-282), and hands the piece out once writeOffset has reached the end of the ClientHello
+(:221-253) — so it goes out last, in the final Initial packet of the flight, and a DPI that
+reassembles CRYPTO frames in arrival order sees a truncated name. The packet is filled with CRYPTO
+frames while it has room (vendor/quic-go/packet_packer.go:648-657), and its frames are then
+shuffled uniformly (rand.Shuffle, :1067-1071).
+
+Upstream ngtcp2 crumbles instead: conn_crumble_initial_crypto cuts the ClientHello at random points
+into up to eleven pieces, appends PING and PADDING frames between them, and permutates them with
+ngtcp2_pkt_permutate_vec — which draws j from [0, i), a Sattolo shuffle, so no piece ever stays
+where it was. The SNI it treats two ways: when everything fits in one packet it splits the vector at
+the middle of the name, and when it does not, ngtcp2_pkt_remove_vec_partial removes a random piece
+of 1..30 bytes starting at that middle and conn_cut_crypto_frame pushes it back into the send queue
+— where its low offset makes it go out FIRST in the next packet, not last. A dozen frames where
+quic-go writes three, cut in places quic-go does not cut, and the piece held back arrives early
+rather than late.
+
+This patch replaces the crumbling with quic-go's layout: conn_scramble_initial_crypto ends a CRYPTO
+frame where the second half of SNI begins and resumes where it ends, takes that piece out of the
+send queue and holds it in conn->initial_crypto_cut until the queue runs dry, then writes it, and
+shuffles the frames of the packet uniformly. The pieces of upstream's scheme that nothing uses any
+more (ngtcp2_pkt_split_vec_rand, ngtcp2_pkt_split_vec_at, ngtcp2_pkt_append_ping_and_padding,
+ngtcp2_pkt_permutate_vec, ngtcp2_pkt_remove_vec_partial) go with it.
+
+Two things quic-go does that this patch deliberately leaves out: the second cut it makes in the ECH
+extension (crypto_stream.go:196-201), which this client would never reach because its ClientHello
+carries no ECH extension, and PADDING written before the frames instead of after them
+(packet_packer.go:1064-1066), which is the layout of the packet rather than of the CRYPTO stream and
+belongs with the padding and packet number work.
+
+Applies on top of 0004.
+
+--- a/lib/ngtcp2_conn.c
++++ b/lib/ngtcp2_conn.c
+@@ -1648,7 +1648,7 @@
+   (*pconn)->state = NGTCP2_CS_CLIENT_INITIAL;
+   (*pconn)->local.bidi.next_stream_id = 0;
+   (*pconn)->local.uni.next_stream_id = 2;
+-  (*pconn)->flags |= NGTCP2_CONN_FLAG_CRUMBLE_INITIAL_CRYPTO;
++  (*pconn)->flags |= NGTCP2_CONN_FLAG_SCRAMBLE_INITIAL_CRYPTO;
+ 
+   rv = ngtcp2_conn_commit_local_transport_params(*pconn);
+   if (rv != 0) {
+@@ -1742,6 +1742,11 @@
+     return;
+   }
+ 
++  if (conn->initial_crypto_cut) {
++    ngtcp2_frame_chain_objalloc_del(conn->initial_crypto_cut,
++                                    &conn->frc_objalloc, conn->mem);
++  }
++
+   ngtcp2_qlog_end(&conn->qlog);
+ 
+   if (conn->early.ckm) {
+@@ -2294,206 +2299,224 @@
+ }
+ 
+ /*
+- * conn_cut_crypto_frame splits frc->fr.stream by removing
+- * |removed_data| from frc->fr.stream.data[0].  frc->fr.stream.data[0]
+- * must contain |removed_data|, and frc->fr.stream.datacnt >= 1.  New
+- * ngtcp2_frame_chain object that contains |removed_data| is created,
+- * and pushed to |crypto_strm| via ngtcp2_strm_streamfrq_push.  If
+- * there are data following the removed part of data, new
+- * ngtcp2_frame_chain object is created for it, and frc->next points
+- * to the object.
+- *
+- * This function returns 0 if it succeeds, or one of the following
+- * negative error codes:
+- *
+- * NGTCP2_ERR_NOMEM
+- *     Out of memory
++ * conn_crypto_framelen returns the number of bytes that a CRYPTO
++ * frame carrying |datalen| bytes at |offset| occupies.
+  */
+-static int conn_cut_crypto_frame(ngtcp2_conn *conn, ngtcp2_frame_chain *frc,
+-                                 ngtcp2_strm *crypto_strm,
+-                                 const ngtcp2_vec *removed_data) {
+-  ngtcp2_vec *data = frc->fr.stream.data;
+-  size_t datacnt = frc->fr.stream.datacnt;
+-  size_t ndatacnt;
+-  ngtcp2_frame_chain *right_frc = NULL, *removed_frc;
+-  size_t offset;
+-  int rv;
+-
+-  assert(datacnt);
+-  assert(data[0].base < removed_data->base);
+-  assert(ngtcp2_vec_end(removed_data) <= ngtcp2_vec_end(&data[0]));
++static size_t conn_crypto_framelen(uint64_t offset, uint64_t datalen) {
++  return 1 /* type */ + ngtcp2_put_uvarintlen(offset) +
++         ngtcp2_put_uvarintlen(datalen) + (size_t)datalen;
++}
+ 
+-  offset = (size_t)(removed_data->base - data->base);
++/*
++ * conn_find_initial_crypto_cut looks for SNI in the ClientHello at the
++ * head of |crypto_strm| and records the CRYPTO offsets of its second
++ * half in conn->initial_crypto_cut_start and
++ * conn->initial_crypto_cut_end.  Both are left equal if there is no
++ * ClientHello with SNI to be found, which is also what they are left
++ * as once the piece has been taken out of the queue.
++ */
++static void conn_find_initial_crypto_cut(ngtcp2_conn *conn,
++                                         ngtcp2_strm *crypto_strm) {
++  ngtcp2_frame_chain *frc = ngtcp2_strm_streamfrq_top(crypto_strm);
++  ngtcp2_vec server_name;
++  uint64_t offset;
+ 
+-  rv = ngtcp2_frame_chain_stream_datacnt_objalloc_new(
+-    &removed_frc, 1, &conn->frc_objalloc, conn->mem);
+-  if (rv != 0) {
+-    return rv;
++  if (frc == NULL || frc->fr.stream.datacnt == 0 ||
++      frc->fr.stream.data[0].len == 0 ||
++      !ngtcp2_pkt_find_server_name(&server_name, frc->fr.stream.data) ||
++      server_name.len < 2 ||
++      ngtcp2_vec_end(&server_name) > ngtcp2_vec_end(&frc->fr.stream.data[0])) {
++    return;
+   }
+ 
+-  /* ngtcp2_frame_chain for the removed data */
+-  removed_frc->fr.stream.type = NGTCP2_FRAME_CRYPTO;
+-  removed_frc->fr.stream.flags = 0;
+-  removed_frc->fr.stream.fin = 0;
+-  removed_frc->fr.stream.stream_id = 0;
+-  removed_frc->fr.stream.offset = frc->fr.stream.offset + offset;
+-  removed_frc->fr.stream.datacnt = 1;
+-  removed_frc->fr.stream.data[0] = (ngtcp2_vec){
+-    .base = data->base + offset,
+-    .len = removed_data->len,
+-  };
++  offset = frc->fr.stream.offset +
++           (uint64_t)(server_name.base - frc->fr.stream.data[0].base);
+ 
+-  rv = ngtcp2_strm_streamfrq_push(crypto_strm, removed_frc);
+-  if (rv != 0) {
+-    ngtcp2_frame_chain_objalloc_del(removed_frc, &conn->frc_objalloc,
+-                                    conn->mem);
+-    return rv;
+-  }
++  conn->initial_crypto_cut_start = offset + server_name.len / 2;
++  conn->initial_crypto_cut_end = offset + server_name.len;
++}
+ 
+-  if (data[0].len == offset + removed_data->len) {
+-    ndatacnt = datacnt - 1;
+-  } else {
+-    ndatacnt = datacnt;
+-  }
++/*
++ * conn_shuffle_frames permutes |frames| uniformly.  quic-go shuffles
++ * the frames of a packet before writing them, with a uniform
++ * Fisher-Yates shuffle (rand.Shuffle,
++ * vendor/quic-go/packet_packer.go:1067-1071).
++ */
++static void conn_shuffle_frames(ngtcp2_conn *conn, ngtcp2_frame_chain **frames,
++                                size_t framecnt) {
++  size_t i, j;
++  ngtcp2_frame_chain *t;
+ 
+-  if (ndatacnt) {
+-    /* ngtcp2_frame_chain after the removed data */
+-    rv = ngtcp2_frame_chain_stream_datacnt_objalloc_new(
+-      &right_frc, ndatacnt, &conn->frc_objalloc, conn->mem);
+-    if (rv != 0) {
+-      return rv;
+-    }
++  for (i = framecnt; i > 1; --i) {
++    j = ngtcp2_pcg32_rand_n(&conn->pcg, (uint32_t)i);
+ 
+-    right_frc->fr.stream.type = NGTCP2_FRAME_CRYPTO;
+-    right_frc->fr.stream.flags = 0;
+-    right_frc->fr.stream.fin = 0;
+-    right_frc->fr.stream.stream_id = 0;
+-    right_frc->fr.stream.offset =
+-      removed_frc->fr.stream.offset + removed_frc->fr.stream.data->len;
+-    right_frc->fr.stream.datacnt = 0;
+-    ngtcp2_vec_split(right_frc->fr.stream.data, &right_frc->fr.stream.datacnt,
+-                     data, &datacnt, offset + removed_data->len, ndatacnt);
+-
+-    assert(ndatacnt == right_frc->fr.stream.datacnt);
+-    assert(1 == datacnt);
+-  }
+-
+-  frc->fr.stream.datacnt = 1;
+-  frc->fr.stream.data[0].len = offset;
+-  frc->next = right_frc;
++    if (j == i - 1) {
++      continue;
++    }
+ 
+-  return 0;
++    t = frames[i - 1];
++    frames[i - 1] = frames[j];
++    frames[j] = t;
++  }
+ }
+ 
+ /*
+- * conn_crumble_initial_crypto splits CRYPTO frame (*pfrc)->fr.stream
+- * into pieces and adds PADDING and PING frames, and reorder those
+- * frames.  Those frames are encoded in the buffer pointed by |data|
+- * and |offsets|.  |data| is the pointer to the array of ngtcp2_vec of
+- * at least NGTCP2_MAX_STREAM_DATACNT.  |offsets| contains the CRYPTO
+- * offset of the corresponding ngtcp2_vec in |data|, and it also
+- * should have the capacity at least NGTCP2_MAX_STREAM_DATACNT
+- * uint64_t.  |left| is the number of bytes available for the current
+- * packet.  |crypto_offset| is the next smallest CRYPTO offset.
+- * |crypto_strm| is the CRYPTO stream.
++ * conn_scramble_initial_crypto fills one Initial packet with CRYPTO
++ * frames the way the quic-go client does.  |frames| receives the
++ * ngtcp2_frame_chain objects to write, in the order they are to be
++ * written, and it must have the capacity of at least
++ * NGTCP2_MAX_INITIAL_CRYPTO_FRAMES objects.  The very same objects are
++ * linked into a single list whose head is assigned to |*pfrc|, so that
++ * the caller hands them to the loss recovery as it does with the
++ * frames it pops itself.  |left| is the number of bytes available for
++ * the current packet, and |crypto_strm| is the CRYPTO stream.
++ *
++ * The second half of SNI is taken out of the queue and held in
++ * conn->initial_crypto_cut until everything else has been written, so
++ * that it goes out in the last Initial packet of the flight and a Deep
++ * Packet Inspection that reassembles CRYPTO frames in arrival order
++ * sees a truncated name.  quic-go cuts that very piece
++ * (vendor/quic-go/crypto_stream.go:193-195), ends a frame where the
++ * piece begins and resumes where it ends (:255-282), and hands the
++ * piece out once writeOffset has reached the end of the ClientHello
++ * (:221-253).  The frames of the packet are then shuffled, as quic-go
++ * shuffles the frames of every packet it writes.
+  *
+- * This function returns the number of objects written to |data| and
+- * |offsets|, or one of the following negative error codes:
++ * This function returns the number of objects written to |frames|, or
++ * one of the following negative error codes:
+  *
+  * NGTCP2_ERR_NOMEM
+  *     Out of memory
+  */
+ static ngtcp2_ssize
+-conn_crumble_initial_crypto(ngtcp2_conn *conn, ngtcp2_frame_chain **pfrc,
+-                            ngtcp2_vec *data, uint64_t *offsets,
+-                            ngtcp2_strm *crypto_strm, size_t left,
+-                            uint64_t crypto_offset) {
+-  ngtcp2_vec server_name;
+-  ngtcp2_vec removed_data;
+-  size_t max_add_frames = 10;
+-  size_t single_crypto_overhead =
+-    1 + ngtcp2_put_uvarintlen(crypto_offset + left - 1) +
+-    ngtcp2_put_uvarintlen(left);
+-  size_t total_crypto_overhead = single_crypto_overhead * max_add_frames;
+-  size_t datacnt;
+-  size_t i;
++conn_scramble_initial_crypto(ngtcp2_conn *conn, ngtcp2_frame_chain **pfrc,
++                             ngtcp2_frame_chain **frames,
++                             ngtcp2_strm *crypto_strm, size_t left) {
++  ngtcp2_frame_chain *head = NULL, **pnext = &head, *frc;
++  uint64_t crypto_offset, datalen;
++  size_t framecnt = 0, n;
+   int rv;
+ 
+-  if (left <= total_crypto_overhead) {
+-    return 0;
+-  }
++  *pfrc = NULL;
+ 
+-  left -= total_crypto_overhead;
++  for (; framecnt < NGTCP2_MAX_INITIAL_CRYPTO_FRAMES;) {
++    /* ngtcp2_strm_streamfrq_unacked_offset asserts a non-empty queue,
++       so emptiness is asked first. */
++    crypto_offset = ngtcp2_strm_streamfrq_empty(crypto_strm)
++                      ? (uint64_t)-1
++                      : ngtcp2_strm_streamfrq_unacked_offset(crypto_strm);
+ 
+-  left = ngtcp2_pkt_crypto_max_datalen(crypto_offset, left, left);
+-  if (left == (size_t)-1) {
+-    return 0;
+-  }
++    if (crypto_offset == (uint64_t)-1) {
++      if (conn->initial_crypto_cut == NULL) {
++        break;
++      }
+ 
+-  rv = ngtcp2_strm_streamfrq_pop(crypto_strm, pfrc, left);
+-  if (rv != 0) {
+-    assert(ngtcp2_err_is_fatal(rv));
+-    return rv;
+-  }
++      /* Everything else has been written, so the piece held back goes
++         out now, and therefore last. */
++      rv = ngtcp2_strm_streamfrq_push(crypto_strm, conn->initial_crypto_cut);
++      if (rv != 0) {
++        assert(ngtcp2_err_is_fatal(rv));
+ 
+-  if (*pfrc == NULL) {
+-    return 0;
+-  }
++        ngtcp2_frame_chain_objalloc_del(conn->initial_crypto_cut,
++                                        &conn->frc_objalloc, conn->mem);
++        conn->initial_crypto_cut = NULL;
+ 
+-  assert(crypto_offset == (*pfrc)->fr.stream.offset);
++        goto fail;
++      }
+ 
+-  ngtcp2_vec_copy(data, (*pfrc)->fr.stream.data, (*pfrc)->fr.stream.datacnt);
+-  datacnt = (*pfrc)->fr.stream.datacnt;
++      conn->initial_crypto_cut = NULL;
+ 
+-  offsets[0] = (*pfrc)->fr.stream.offset;
++      continue;
++    }
+ 
+-  for (i = 1; i < datacnt; ++i) {
+-    offsets[i] = offsets[i - 1] + data[i - 1].len;
+-  }
++    if (!(conn->flags & NGTCP2_CONN_FLAG_INITIAL_CRYPTO_CUT)) {
++      /* The ClientHello is looked at once, and the piece is cut out of
++         it once: quic-go stops scrambling as soon as the whole
++         ClientHello has been handed out. */
++      conn->flags |= NGTCP2_CONN_FLAG_INITIAL_CRYPTO_CUT;
++
++      conn_find_initial_crypto_cut(conn, crypto_strm);
++    }
++
++    if (conn->initial_crypto_cut_start != conn->initial_crypto_cut_end &&
++        crypto_offset == conn->initial_crypto_cut_start) {
++      /* The writing has reached the piece: take it out of the queue
++         whole, at no cost to this packet, and keep it.  Nothing can
++         split the queue inside that range — every frame before it ends
++         at its start and every frame after it begins at its end, and a
++         reclaimed frame is a range that was sent — so one pop takes all
++         of it.  Were it ever to come back short, the remainder simply
++         stays in the queue and is written like any other data. */
++      rv = ngtcp2_strm_streamfrq_pop(crypto_strm, &frc,
++                                     (size_t)(conn->initial_crypto_cut_end -
++                                              conn->initial_crypto_cut_start));
++      if (rv != 0) {
++        assert(ngtcp2_err_is_fatal(rv));
+ 
+-  if (datacnt < NGTCP2_MAX_STREAM_DATACNT &&
+-      ngtcp2_pkt_find_server_name(&server_name, data) && server_name.len > 1) {
+-    if (ngtcp2_strm_streamfrq_empty(crypto_strm) ||
+-        ngtcp2_strm_streamfrq_unacked_offset(crypto_strm) == (uint64_t)-1) {
+-      datacnt = ngtcp2_pkt_split_vec_at(
+-        data, datacnt, offsets,
+-        (size_t)(server_name.base - data[0].base) + server_name.len / 2);
+-    } else {
+-      /* If we have another data to send (most likely in the another
+-         packet), remove the part of SNI from this packet. */
+-      datacnt = ngtcp2_pkt_remove_vec_partial(
+-        &removed_data, data, datacnt, offsets, &conn->pcg, &server_name);
++        goto fail;
++      }
+ 
+-      rv = conn_cut_crypto_frame(conn, *pfrc, crypto_strm, &removed_data);
+-      if (rv != 0) {
+-        ngtcp2_frame_chain_objalloc_del(*pfrc, &conn->frc_objalloc, conn->mem);
+-        return rv;
++      if (frc == NULL) {
++        break;
+       }
+ 
+-      /* Add the length of removed data to total_crypto_overhead so
+-         that we can use them for inter CRYPTO frames padding. */
+-      total_crypto_overhead += removed_data.len;
++      conn->initial_crypto_cut = frc;
++      conn->initial_crypto_cut_start = 0;
++      conn->initial_crypto_cut_end = 0;
++
++      continue;
+     }
+-  }
+ 
+-  if (datacnt < max_add_frames + 1) {
+-    max_add_frames -= datacnt - 1;
++    n = ngtcp2_pkt_crypto_max_datalen(crypto_offset, left, left);
++    if (n == (size_t)-1) {
++      break;
++    }
+ 
+-    datacnt = ngtcp2_pkt_split_vec_rand(data, datacnt, offsets, &conn->pcg,
+-                                        max_add_frames);
++    if (conn->initial_crypto_cut_start != conn->initial_crypto_cut_end &&
++        crypto_offset < conn->initial_crypto_cut_start &&
++        conn->initial_crypto_cut_start - crypto_offset < n) {
++      /* End this frame where the piece begins, as quic-go ends its own
++         at the next cut. */
++      n = (size_t)(conn->initial_crypto_cut_start - crypto_offset);
++    }
++
++    rv = ngtcp2_strm_streamfrq_pop(crypto_strm, &frc, n);
++    if (rv != 0) {
++      assert(ngtcp2_err_is_fatal(rv));
++
++      goto fail;
++    }
++
++    if (frc == NULL) {
++      break;
++    }
++
++    datalen = ngtcp2_vec_len(frc->fr.stream.data, frc->fr.stream.datacnt);
++
++    assert(conn_crypto_framelen(frc->fr.stream.offset, datalen) <= left);
++
++    left -= conn_crypto_framelen(frc->fr.stream.offset, datalen);
++
++    frames[framecnt++] = frc;
++
++    *pnext = frc;
++    pnext = &frc->next;
+   }
+ 
+-  for (i = 1; i < datacnt; ++i) {
+-    total_crypto_overhead -= 1 + ngtcp2_put_uvarintlen(offsets[i]) +
+-                             ngtcp2_put_uvarintlen(data[i].len);
++  if (framecnt == 0) {
++    return 0;
+   }
+ 
+-  datacnt = ngtcp2_pkt_append_ping_and_padding(data, datacnt, &conn->pcg,
+-                                               total_crypto_overhead);
++  conn_shuffle_frames(conn, frames, framecnt);
++
++  *pfrc = head;
++
++  return (ngtcp2_ssize)framecnt;
+ 
+-  ngtcp2_pkt_permutate_vec(data, datacnt, offsets, &conn->pcg);
++fail:
++  ngtcp2_frame_chain_list_objalloc_del(head, &conn->frc_objalloc, conn->mem);
+ 
+-  return (ngtcp2_ssize)datacnt;
++  return rv;
+ }
+ 
+ static size_t conn_dgram_padding(const ngtcp2_conn *conn, ngtcp2_ppe *ppe) {
+@@ -2628,7 +2651,11 @@
+   build_pkt:
+     for (; !ngtcp2_strm_streamfrq_empty(&pktns->crypto.strm);) {
+       crypto_offset = ngtcp2_strm_streamfrq_unacked_offset(&pktns->crypto.strm);
+-      if (crypto_offset == (uint64_t)-1) {
++      if (crypto_offset == (uint64_t)-1 &&
++          (type != NGTCP2_PKT_INITIAL || conn->initial_crypto_cut == NULL)) {
++        /* The piece of the ClientHello held back has not been written
++           yet, and conn_scramble_initial_crypto is the only place that
++           can hand it out, so do not stop short of it here. */
+         ngtcp2_strm_streamfrq_clear(&pktns->crypto.strm);
+         break;
+       }
+@@ -2639,52 +2666,34 @@
+       }
+ 
+       if (type == NGTCP2_PKT_INITIAL &&
+-          (conn->flags & NGTCP2_CONN_FLAG_CRUMBLE_INITIAL_CRYPTO)) {
+-        ngtcp2_vec data[NGTCP2_MAX_STREAM_DATACNT];
+-        uint64_t offsets[NGTCP2_MAX_STREAM_DATACNT];
+-        ngtcp2_ssize datacnt;
++          (conn->flags & NGTCP2_CONN_FLAG_SCRAMBLE_INITIAL_CRYPTO)) {
++        ngtcp2_frame_chain *frames[NGTCP2_MAX_INITIAL_CRYPTO_FRAMES];
++        ngtcp2_ssize framecnt;
+         size_t i;
+ 
+-        datacnt = conn_crumble_initial_crypto(
+-          conn, &nfrc, data, offsets, &pktns->crypto.strm, left, crypto_offset);
+-        if (datacnt < 0) {
+-          assert(ngtcp2_err_is_fatal((int)datacnt));
++        framecnt = conn_scramble_initial_crypto(conn, &nfrc, frames,
++                                                &pktns->crypto.strm, left);
++        if (framecnt < 0) {
++          assert(ngtcp2_err_is_fatal((int)framecnt));
+           ngtcp2_frame_chain_list_objalloc_del(frq, &conn->frc_objalloc,
+                                                conn->mem);
+ 
+-          return datacnt;
++          return framecnt;
+         }
+ 
+-        if (datacnt == 0) {
++        if (framecnt == 0) {
+           break;
+         }
+ 
+-        for (i = 0; i < (size_t)datacnt; ++i) {
+-          if (data[i].base == NULL) {
+-            if (data[i].len == 0) {
+-              lfr.ping.type = NGTCP2_FRAME_PING;
+-            } else {
+-              lfr.padding = (ngtcp2_padding){
+-                .type = NGTCP2_FRAME_PADDING,
+-                .len = data[i].len,
+-              };
+-            }
+-          } else {
+-            lfr.stream = (ngtcp2_stream){
+-              .type = NGTCP2_FRAME_CRYPTO,
+-              .offset = offsets[i],
+-              .datacnt = 1,
+-              .data = &data[i],
+-            };
+-          }
+-
+-          rv = conn_ppe_write_frame_hd_log(conn, &ppe, &hd_logged, &hd, &lfr);
++        for (i = 0; i < (size_t)framecnt; ++i) {
++          rv = conn_ppe_write_frame_hd_log(conn, &ppe, &hd_logged, &hd,
++                                           &frames[i]->fr);
+           if (rv != 0) {
+             ngtcp2_unreachable();
+           }
+         }
+ 
+-        conn->frame_counts.crypto += (size_t)datacnt;
++        conn->frame_counts.crypto += (size_t)framecnt;
+       } else {
+         left = ngtcp2_pkt_crypto_max_datalen(crypto_offset, left, left);
+         if (left == (size_t)-1) {
+@@ -2965,6 +2974,16 @@
+ 
+   conn_discard_pktns(conn, &conn->in_pktns, ts);
+ 
++  if (conn->initial_crypto_cut) {
++    /* Nothing writes the piece held back once the Initial packet number
++       space is gone.  A server cannot derive handshake keys without the
++       whole ClientHello, so in practice there is nothing to free here;
++       the object simply must not outlive the space it belongs to. */
++    ngtcp2_frame_chain_objalloc_del(conn->initial_crypto_cut,
++                                    &conn->frc_objalloc, conn->mem);
++    conn->initial_crypto_cut = NULL;
++  }
++
+   conn_vneg_crypto_free(conn);
+ 
+   memset(&conn->vneg.rx, 0, sizeof(conn->vneg.rx));
+--- a/lib/ngtcp2_conn.h
++++ b/lib/ngtcp2_conn.h
+@@ -189,15 +189,33 @@
+    ngtcp2_conn_writev_stream is called inside the callback invoked by
+    ngtcp2_conn_write_aggregate_pkt. */
+ #define NGTCP2_CONN_FLAG_AGGREGATE_PKTS 0x20000U
+-/* NGTCP2_CONN_FLAG_CRUMBLE_INITIAL_CRYPTO, if set, crumbles an
+-   Initial CRYPTO frame into pieces as a countermeasure against Deep
+-   Packet Inspection. */
+-#define NGTCP2_CONN_FLAG_CRUMBLE_INITIAL_CRYPTO 0x40000U
++/* NGTCP2_CONN_FLAG_SCRAMBLE_INITIAL_CRYPTO, if set, splits the
++   ClientHello so that the second half of SNI is written after
++   everything else, as a countermeasure against Deep Packet
++   Inspection.  See conn_scramble_initial_crypto. */
++#define NGTCP2_CONN_FLAG_SCRAMBLE_INITIAL_CRYPTO 0x40000U
+ /* NGTCP2_CONN_FLAG_KEEP_ALIVE_PING_SENT is set when a keep-alive PING
+    has been written and no packet has been received since.  quic-go
+    sends one keep-alive PING per silence (keepAlivePingSent,
+    vendor/quic-go/connection.go:701-705 and :879-885). */
+ #define NGTCP2_CONN_FLAG_KEEP_ALIVE_PING_SENT 0x80000U
++/* NGTCP2_CONN_FLAG_INITIAL_CRYPTO_CUT is set once the ClientHello has
++   been looked at for the piece to cut out of it.  It is looked at once
++   and cut once: quic-go stops scrambling as soon as the whole
++   ClientHello has been handed out (vendor/quic-go/crypto_stream.go:
++   213-216), and its retransmissions come from the retransmission
++   queue, which the scrambling never touches
++   (vendor/quic-go/packet_packer.go:611-625). */
++#define NGTCP2_CONN_FLAG_INITIAL_CRYPTO_CUT 0x100000U
++
++/* NGTCP2_MAX_INITIAL_CRYPTO_FRAMES is the number of CRYPTO frames
++   that conn_scramble_initial_crypto writes into one Initial packet at
++   most.  The ClientHello takes two of them, and its retransmission
++   one per piece that was lost; quic-go keeps writing frames while the
++   packet has room (vendor/quic-go/packet_packer.go:648-657), and this
++   client stops filling the packet earlier if it ever gets that
++   fragmented. */
++#define NGTCP2_MAX_INITIAL_CRYPTO_FRAMES 16
+ 
+ /* NGTCP2_MAX_NON_ACK_ELICITING_ACKS is quic-go's
+    MaxNonAckElicitingAcks (vendor/quic-go/internal/protocol/params.go:
+@@ -675,6 +693,21 @@
+   /* handshake_confirmed_ts is the time instant when handshake is
+      confirmed.  For server, it is confirmed when completed. */
+   ngtcp2_tstamp handshake_confirmed_ts;
++  /* initial_crypto_cut holds the piece cut out of the ClientHello
++     (the second half of SNI) until every other byte of Initial CRYPTO
++     data has been written.  NULL when nothing is held.  quic-go keeps
++     that piece in initialCryptoStream.cuts and hands it out only once
++     writeOffset has reached the end of the ClientHello
++     (vendor/quic-go/crypto_stream.go:221-253). */
++  ngtcp2_frame_chain *initial_crypto_cut;
++  /* initial_crypto_cut_start and initial_crypto_cut_end are the CRYPTO
++     offsets of that piece while it is still in the send queue: a frame
++     ends where it starts and the next one begins where it ends, as
++     quic-go stops at its cuts (vendor/quic-go/crypto_stream.go:
++     221-248).  Both are zero once the piece has been taken out of the
++     queue, and they stay zero if the ClientHello has no SNI to cut. */
++  uint64_t initial_crypto_cut_start;
++  uint64_t initial_crypto_cut_end;
+   ngtcp2_pcg32 pcg;
+   ngtcp2_frame_counts frame_counts;
+   void *user_data;
+--- a/lib/ngtcp2_pkt.c
++++ b/lib/ngtcp2_pkt.c
+@@ -35,7 +35,6 @@
+ #include "ngtcp2_vec.h"
+ #include "ngtcp2_buf.h"
+ #include "ngtcp2_unreachable.h"
+-#include "ngtcp2_pcg.h"
+ 
+ int ngtcp2_pkt_chain_new(ngtcp2_pkt_chain **ppc, const ngtcp2_path *path,
+                          const ngtcp2_pkt_info *pi, const uint8_t *pkt,
+@@ -2589,46 +2588,6 @@
+   return (c & NGTCP2_SHORT_RESERVED_BIT_MASK) == 0 ? 0 : NGTCP2_ERR_PROTO;
+ }
+ 
+-size_t ngtcp2_pkt_split_vec_rand(ngtcp2_vec *data, size_t datacnt,
+-                                 uint64_t *offsets, ngtcp2_pcg32 *pcg,
+-                                 size_t max_add) {
+-  ngtcp2_vec *v;
+-  size_t idx;
+-  size_t len;
+-
+-  for (; max_add; --max_add) {
+-    idx = ngtcp2_pcg32_rand_n(pcg, (uint32_t)datacnt);
+-    assert(idx < datacnt);
+-
+-    v = &data[idx];
+-
+-    if (v->len <= 1) {
+-      continue;
+-    }
+-
+-    len = v->len / 2;
+-
+-    ngtcp2_vec_split_at(&data[datacnt], v, len);
+-
+-    offsets[datacnt] = offsets[idx] + len;
+-
+-    ++datacnt;
+-  }
+-
+-  return datacnt;
+-}
+-
+-size_t ngtcp2_pkt_split_vec_at(ngtcp2_vec *data, size_t datacnt,
+-                               uint64_t *offsets, size_t at) {
+-  assert(at < data[0].len);
+-
+-  ngtcp2_vec_split_at(&data[datacnt], &data[0], at);
+-
+-  offsets[datacnt] = offsets[0] + at;
+-
+-  return datacnt + 1;
+-}
+-
+ static int pkt_tls_skip8(ngtcp2_buf *buf) {
+   size_t len;
+ 
+@@ -2794,92 +2753,6 @@
+   }
+ }
+ 
+-size_t ngtcp2_pkt_append_ping_and_padding(ngtcp2_vec *data, size_t datacnt,
+-                                          ngtcp2_pcg32 *pcg, size_t n) {
+-  uint32_t k;
+-
+-  for (; n && datacnt < NGTCP2_MAX_STREAM_DATACNT;) {
+-    k = ngtcp2_pcg32_rand_n(pcg, (uint32_t)n + 1);
+-    if (k == 0) {
+-      /* PING */
+-      data[datacnt] = (ngtcp2_vec){
+-        .base = NULL,
+-        .len = 0,
+-      };
+-
+-      ++k;
+-    } else {
+-      /* PADDING of k length */
+-      data[datacnt] = (ngtcp2_vec){
+-        .base = NULL,
+-        .len = k,
+-      };
+-    }
+-
+-    ++datacnt;
+-    n -= k;
+-  }
+-
+-  return datacnt;
+-}
+-
+-void ngtcp2_pkt_permutate_vec(ngtcp2_vec *data, size_t datacnt,
+-                              uint64_t *offsets, ngtcp2_pcg32 *pcg) {
+-  size_t i, j;
+-  ngtcp2_vec v;
+-  uint64_t o;
+-
+-  if (datacnt < 2) {
+-    return;
+-  }
+-
+-  for (i = datacnt - 1; i > 0; --i) {
+-    j = ngtcp2_pcg32_rand_n(pcg, (uint32_t)i);
+-
+-    if (i == j) {
+-      continue;
+-    }
+-
+-    v = data[i];
+-    data[i] = data[j];
+-    data[j] = v;
+-
+-    o = offsets[i];
+-    offsets[i] = offsets[j];
+-    offsets[j] = o;
+-  }
+-}
+-
+-size_t ngtcp2_pkt_remove_vec_partial(ngtcp2_vec *removed_data, ngtcp2_vec *data,
+-                                     size_t datacnt, uint64_t *offsets,
+-                                     ngtcp2_pcg32 *pcg,
+-                                     const ngtcp2_vec *part) {
+-  ngtcp2_vec *v = &data[0];
+-  size_t len;
+-
+-  assert(datacnt);
+-  assert(v->base < part->base);
+-  assert(ngtcp2_vec_end(part) <= ngtcp2_vec_end(v));
+-
+-  len = (size_t)(part->base - v->base) + part->len / 2;
+-
+-  ngtcp2_vec_split_at(removed_data, v, len);
+-
+-  if (removed_data->len == 1) {
+-    return datacnt;
+-  }
+-
+-  len = 1 + ngtcp2_pcg32_rand_n(
+-              pcg, (uint32_t)ngtcp2_min(30, removed_data->len - 1));
+-  assert(len < removed_data->len);
+-
+-  ngtcp2_vec_split_at(&data[datacnt], removed_data, len);
+-
+-  offsets[datacnt] = offsets[0] + v->len + removed_data->len;
+-
+-  return datacnt + 1;
+-}
+-
+ int ngtcp2_stateless_reset_token_eq(const ngtcp2_stateless_reset_token *a,
+                                     const ngtcp2_stateless_reset_token *b) {
+   return memcmp(a->data, b->data, sizeof(a->data)) == 0;
+--- a/lib/ngtcp2_pkt.h
++++ b/lib/ngtcp2_pkt.h
+@@ -144,8 +144,6 @@
+    a ngtcp2_stream can include. */
+ #define NGTCP2_MAX_STREAM_DATACNT 256
+ 
+-typedef struct ngtcp2_pcg32 ngtcp2_pcg32;
+-
+ typedef struct ngtcp2_pkt_retry {
+   ngtcp2_cid odcid;
+   uint8_t *token;
+@@ -1247,34 +1245,6 @@
+ uint8_t ngtcp2_pkt_get_type_long(uint32_t version, uint8_t c);
+ 
+ /*
+- * ngtcp2_pkt_split_vec_rand appends ngtcp2_vec at most |max_add|
+- * times to the array pointed by |data| of length |datacnt| by
+- * splitting the existing ngtcp2_vec into two.  Which ngtcp2_vec to
+- * split is chosen randomly.  |offsets| contains the offset of each
+- * ngtcp2_vec pointed by |data|.  |offsets| is also updated.  The
+- * arrays must have the capacity at least |datacnt| + |max_add|.
+- * |pcg| is a random number generator.
+- *
+- * This function returns |datacnt| plus the number of ngtcp2_vec that
+- * are appended.
+- */
+-size_t ngtcp2_pkt_split_vec_rand(ngtcp2_vec *data, size_t datacnt,
+-                                 uint64_t *offsets, ngtcp2_pcg32 *pcg,
+-                                 size_t max_add);
+-
+-/*
+- * ngtcp2_pkt_split_vec_at splits data[0] at offset |at|, and the
+- * right side of ngtcp2_vec is assigned to data[datacnt].  Similarly,
+- * offsets[0] + |at| is assigned to offsets[datacnt].  |data| must
+- * point to the array of ngtcp2_vec of length |datacnt|, and |datacnt|
+- * must be greater than 0.  |at| must be strictly less than data->len.
+- *
+- * This function returns |datacnt| + 1.
+- */
+-size_t ngtcp2_pkt_split_vec_at(ngtcp2_vec *data, size_t datacnt,
+-                               uint64_t *offsets, size_t at);
+-
+-/*
+  * ngtcp2_pkt_find_server_name searches TLS Server Name Indication
+  * extension in |v|.  If it is found, assign the portion of server
+  * name to the object pointed by |server_name|, and returns nonzero.
+@@ -1284,46 +1254,6 @@
+ int ngtcp2_pkt_find_server_name(ngtcp2_vec *server_name, const ngtcp2_vec *v);
+ 
+ /*
+- * ngtcp2_pkt_append_ping_and_padding appends PING and PADDING frames
+- * to the array pointed by |data| of length |datacnt|.  The capacity
+- * of array must be at least NGTCP2_MAX_STREAM_DATACNT.  |n| is the
+- * number of bytes available for serialized PING and PADDING frames.
+- * |pcg| is a random number generator.  Which frames to add is
+- * determined randomly.
+- *
+- * The special encoding of PING and PADDING frames into ngtcp2_vec:
+- *
+- * - .base is NULL.
+- * - If .len is 0, it represents PING.  Otherwise, PADDING of .len
+- *   length.
+- *
+- * This function returns |datacnt| plus the number of frames added.
+- */
+-size_t ngtcp2_pkt_append_ping_and_padding(ngtcp2_vec *data, size_t datacnt,
+-                                          ngtcp2_pcg32 *pcg, size_t n);
+-
+-/*
+- * ngtcp2_pkt_permutate_vec permutates |data| and |offsets|, both have
+- * the |datacnt| elements.  |pcg| is a random number generator.
+- */
+-void ngtcp2_pkt_permutate_vec(ngtcp2_vec *data, size_t datacnt,
+-                              uint64_t *offsets, ngtcp2_pcg32 *pcg);
+-
+-/*
+- * ngtcp2_pkt_remove_vec_partial removes the portion of data that
+- * contains part of |part| from data[0].  This function does not
+- * remove whole range of |part|.  The length of removed data is chosen
+- * randomly.  The removed portion of data is assigned to the object
+- * pointed by |removed_data|.  If there is data located after the
+- * removed data, it will be assigned to data[datacnt].
+- * offsets[datacnt] is also updated, and the function returns
+- * |datacnt| + 1.  Otherwise, this function returns |datacnt|.
+- */
+-size_t ngtcp2_pkt_remove_vec_partial(ngtcp2_vec *removed_data, ngtcp2_vec *data,
+-                                     size_t datacnt, uint64_t *offsets,
+-                                     ngtcp2_pcg32 *pcg, const ngtcp2_vec *part);
+-
+-/*
+  * ngtcp2_stateless_reset_token_eq returns nonzero if |a| and |b|
+  * share the same token.
+  */

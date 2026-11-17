@@ -1,0 +1,54 @@
+The CRYPTO data a client accepts, bounded where quic-go bounds it (hysteria client).
+
+quic-go refuses CRYPTO data that would reach past sixteen kilobytes on any of its crypto streams —
+"MaxCryptoStreamOffset is the maximum offset allowed on any of the crypto streams. This limits the
+size of the ClientHello and Certificates that can be received"
+(vendor/quic-go/internal/protocol/params.go:86-88) — and closes the connection with
+CRYPTO_BUFFER_EXCEEDED the moment a frame's end crosses it (HandleCryptoFrame,
+vendor/quic-go/crypto_stream.go:34-41). The same number at every encryption level: the Initial,
+Handshake and 1-RTT crypto streams are all built on that one baseCryptoStream.
+
+Upstream ngtcp2 allows 64 KiB at Initial and Handshake and 256 KiB at 1-RTT. So a node that sends a
+Handshake flight between 16 and 64 KiB — a long certificate chain, say — is refused by every hysteria
+client and answered by this one, which then went on to read it under the per-message ceilings of
+crypto/tls (src/quic/qtls.h). Those ceilings are the reference's too, but on QUIC the reference never
+reaches them: sixteen kilobytes of CRYPTO data end the connection first.
+
+This patch gives all three levels quic-go's number. ngtcp2 already answers a crossing with
+NGTCP2_ERR_CRYPTO_BUFFER_EXCEEDED, which becomes transport error 0xd on the wire — quic-go's
+CryptoBufferExceeded (vendor/quic-go/internal/qerr/error_codes.go:26). The comparison is the same
+on both sides: the end of the frame against the bound, strictly greater refused.
+
+Applies on top of 0011.
+
+--- a/lib/ngtcp2_conn.c
++++ b/lib/ngtcp2_conn.c
+@@ -58,15 +58,19 @@
+    are not processed. */
+ #define NGTCP2_MAX_ACK_PER_PKT 1
+ 
+-/* NGTCP2_MAX_INITIAL_CRYPTO_OFFSET is the maximum offset of CRYPTO
+-   data at Initial encryption level. */
+-#define NGTCP2_MAX_INITIAL_CRYPTO_OFFSET (64 * 1024)
+-/* NGTCP2_MAX_HANDSHAKE_CRYPTO_OFFSET is the maximum offset of CRYPTO
+-   data at Handshake encryption level. */
+-#define NGTCP2_MAX_HANDSHAKE_CRYPTO_OFFSET (64 * 1024)
+-/* NGTCP2_MAX_1RTT_CRYPTO_OFFSET is the maximum offset of CRYPTO data
+-   at 1RTT encryption level. */
+-#define NGTCP2_MAX_1RTT_CRYPTO_OFFSET (256 * 1024)
++/* The maximum offset of CRYPTO data at every encryption level, and the
++   same number at each: quic-go's MaxCryptoStreamOffset,
++   16 * (1 << 10) (vendor/quic-go/internal/protocol/params.go:86-88),
++   which HandleCryptoFrame applies to the end of every CRYPTO frame on
++   the Initial, Handshake and 1-RTT crypto streams alike
++   (vendor/quic-go/crypto_stream.go:34-41; the Initial stream embeds the
++   same baseCryptoStream, vendor/quic-go/crypto_stream.go:136-137).
++   Upstream allows 64 KiB at Initial and Handshake and 256 KiB at
++   1RTT, so a flight every hysteria client refuses with
++   CRYPTO_BUFFER_EXCEEDED was read here. */
++#define NGTCP2_MAX_INITIAL_CRYPTO_OFFSET (16 * 1024)
++#define NGTCP2_MAX_HANDSHAKE_CRYPTO_OFFSET (16 * 1024)
++#define NGTCP2_MAX_1RTT_CRYPTO_OFFSET (16 * 1024)
+ 
+ ngtcp2_objalloc_def(strm, ngtcp2_strm, oplent)
+ 
