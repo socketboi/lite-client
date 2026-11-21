@@ -5,6 +5,17 @@ executes Xray JSON and JSONC with the upstream configuration loader and
 protocol implementations. Configurations are for a trusted administrator.
 The JSON controls the listeners, outbound connections, routes, DNS and logs.
 
+## Inbound protocols
+
+Xray Core provides Tunnel, HTTP, Shadowsocks, SOCKS, Trojan, VLESS, VMess,
+WireGuard, Hysteria, MASQUE and TUN. The package runs the upstream build and
+uses its configuration format for each protocol.
+
+The conformance suite checks configuration loading for all 11 inbounds. Its
+traffic test opens two HTTP listeners and verifies their routes through the
+`freedom` and `blackhole` outbounds. OpenWrt 25.12 on AArch64 was checked
+with an SDK-built APK and QEMU.
+
 ## Check and run on Linux
 
 With a verified copy of the pinned Xray executable:
@@ -58,8 +69,6 @@ An upstream preflight checks configuration, while startup also needs
 available listening ports and any devices or kernel features used by the
 profile. TUN, for example, needs a working `/dev/net/tun` on OpenWrt.
 
-Tunnel, HTTP, Shadowsocks, SOCKS, Trojan, VLESS, VMess, WireGuard, Hysteria,
-MASQUE and TUN are the upstream inbound protocols in this pinned release.
 The service does not install traffic interception rules. Any route or
 interface changes requested by the JSON are performed by Xray itself.
 Check available flash before installing the executable and any data packages.

@@ -7,11 +7,11 @@ A small **C client for OpenWrt routers**: VLESS / REALITY / XTLS-Vision, with an
 optional Hysteria 2 plane. Intended for devices where larger proxy engines do
 not fit comfortably, including the Xiaomi Mi Router 4A Gigabit.
 
-You supply your own compatible server and credentials. This project supplies the
-client, an OpenWrt service and package recipes. Traffic selection belongs to the
-firewall; there is no server implementation or sing-box JSON configuration engine.
+You supply your own compatible server and credentials. The native client
+includes an OpenWrt service with firewall integration. A separate package runs
+complete Xray configurations with the upstream Xray Core.
 
-## Protocols and scope
+## Native client
 
 | Area | Support |
 | --- | --- |
@@ -22,16 +22,19 @@ firewall; there is no server implementation or sing-box JSON configuration engin
 | Integration | OpenWrt procd, UCI and nftables TPROXY; credentials read from owner-only files |
 | Configuration | UCI and command-line tools; one outbound per running instance |
 
-The optional [Xray Core mode](docs/XRAY-JSON.md) runs complete Xray JSON profiles
-with the pinned upstream engine, including multiple inbounds, outbounds and
-routing. Its OpenWrt package is built separately for AArch64.
-
 The implementation targets the observable behavior of its pinned references.
 Known differences and qualification limits are recorded in
 [DIVERGENCES.md](DIVERGENCES.md),
 [REALITY compatibility](docs/XRAY-COMPATIBILITY.md) and
 [Hysteria compatibility](docs/HYSTERIA-COMPATIBILITY.md). These checks are not
 an independent security audit or a guarantee against traffic identification.
+
+## Xray JSON on AArch64
+
+The optional `lite-client-xray` package runs Xray Core 26.11.9 with the original
+JSON or JSONC profile. Xray handles its inbounds, outbounds, DNS and routing.
+The service has its own configuration directory and requires about 31.5 MiB
+before filesystem compression. See [Xray JSON setup and protocols](docs/XRAY-JSON.md).
 
 ## Read this before installing
 
@@ -136,7 +139,8 @@ own prerequisites and documented commands.
 | Document | Start here for |
 | --- | --- |
 | [INSTALL.md](docs/INSTALL.md) | Install, inspect, upgrade and remove the package |
-| [CONFIG.md](docs/CONFIG.md) | UCI options, secrets, server settings and firewall integration |
+| [CONFIG.md](docs/CONFIG.md) | Native client UCI, secrets and firewall integration |
+| [XRAY-JSON.md](docs/XRAY-JSON.md) | Full Xray profiles and the AArch64 package |
 | [BUILD.md](docs/BUILD.md) | Dependencies, toolchains, package recipes and pinned revisions |
 | [DESIGN.md](docs/DESIGN.md) | Architecture and known limitations |
 | [TESTING.md](docs/TESTING.md) | Correctness gates and qualified performance observations |
@@ -147,7 +151,8 @@ own prerequisites and documented commands.
 Questions belong in [Discussions](https://github.com/socketboi/lite-client/discussions).
 Reproducible bugs belong in [Issues](https://github.com/socketboi/lite-client/issues).
 Remove credentials, server addresses and personal data before posting logs.
-Optional financial support is described in [SUPPORT.md](docs/SUPPORT.md).
+
+[Support the project](docs/SUPPORT.md) for donation availability and ways to help with testing.
 
 ## License and upstream work
 

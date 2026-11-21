@@ -1,54 +1,42 @@
 # Supporting lite-client
 
-Bug reports and questions go to the issue tracker. This page is about money.
+Donations help pay for test routers, VPS instances for compatibility tests, and
+maintainer time.
 
-lite-client is written and tested by one person. Donations pay for:
+## Donate directly
 
-- Test routers. A release goes out only after it has run on real hardware. Right now that is a
-  Xiaomi Mi Router 4A Gigabit (MT7621, mipsel_24kc) and a Xiaomi AX3000T (MT7981, aarch64).
-  Other small routers people ask about get bought when there is money for them.
-- Test servers. A couple of small VPS in different countries that run the reference servers,
-  Xray-core and apernet/hysteria, which every change is checked against.
-- Time spent on this instead of paid work.
+**Donations are not open yet.** Wait for the signed address list on this page
+before sending funds.
 
-Donations are gifts. They don't buy support, priority on issues, or a say in what gets merged.
+The first planned option is **USDT on TRON (TRC-20)**. Donations will go directly
+to a project wallet. Each published entry will identify the asset, network and
+receiving address. Use that exact network in your wallet or exchange. TRON
+transfers are public.
 
-## Crypto
+TON and Monero will be listed when their verified receiving addresses are
+available. Donations are voluntary gifts.
 
-Addresses for USDT on TRON (TRC-20), TON and Monero are not published yet. They will appear here
-and in `docs/donate.txt`, signed as described below, and nowhere else first.
+## Verify a published address
 
-When sending USDT, pick the TRON network in your wallet or exchange. TRON and TON are public
-ledgers: anyone can see what an address has received and from where. If you don't want your
-donation to be visible, use Monero.
-
-There is no card or PayPal option. Those platforms need a legal name and a bank account, and this
-project is published under a pseudonym.
-
-## Checking the addresses
-
-Forks of network tools sometimes swap the donation addresses for their own. The addresses will be
-in `docs/donate.txt`, signed with an SSH key that belongs to the `socketboi` GitHub account. To
-check the signature:
+When donations open, the [official repository](https://github.com/socketboi/lite-client)
+will publish `docs/donate.txt`, its signature, and the project's dedicated public
+signer. From an official checkout, verify the list with OpenSSH:
 
 ```sh
-curl -sL https://github.com/socketboi.keys \
-  | sed 's/^/socketboi namespaces="file" /' > allowed_signers
-ssh-keygen -Y verify -f allowed_signers -I socketboi -n file \
+ssh-keygen -Y verify -f docs/donation-signers -I socketboi -n lite-client-donations \
   -s docs/donate.txt.sig < docs/donate.txt
 ```
 
-It should print `Good "file" signature for socketboi`. Addresses posted anywhere else, in chats,
-issues or forks, are not mine unless they are in this file and the signature checks out. If they ever
-change, the change will be in a commit to `donate.txt` and in the release notes.
+Copy the address from the verified file. Address changes will be published in
+the repository and announced in the release notes.
 
 ## Paid work
 
-If your company runs lite-client and wants a specific feature or a port to a particular router, open
-an issue. Payment for that is in crypto as well.
+If your company runs lite-client and wants a specific feature or a port to a
+particular router, open an issue. Payment for that is in crypto as well.
 
-## Not money
+## Help with testing
 
-Test reports help about as much. If you run lite-client on a router that isn't listed above, an
-issue with the model, OpenWrt version, package version and a throughput number is useful even when
-everything works.
+Reports from additional router models are welcome. Open an
+[issue](https://github.com/socketboi/lite-client/issues) with the router model,
+OpenWrt version, LiteClient version and a throughput result.
