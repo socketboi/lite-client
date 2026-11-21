@@ -19,7 +19,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - run: sh package-xray/check-runtime.sh
 
   # The whole gate, exactly as a contributor runs it. Nothing is left out for CI: check-device and
@@ -43,7 +43,7 @@ jobs:
     # mipsel and aarch64. Expected well under an hour; the limit only stops a hung run.
     timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           # LC_VERSION is `git describe --tags`, and check-builds reads it back from a binary.
           fetch-depth: 0
@@ -55,7 +55,7 @@ jobs:
 
       - name: Keep the logs of a failed run
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: gate-logs-${{ github.run_id }}
           path: |
@@ -73,7 +73,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -108,7 +108,7 @@ jobs:
             sh tools/public/notices.sh --device > "$out/THIRD_PARTY_NOTICES.md"
             ls -l "$out"/*'
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: lite-client-${{ github.sha }}
           path: build/routers
@@ -117,7 +117,7 @@ jobs:
 
       - name: Keep the logs of a failed run
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cross-logs-${{ github.run_id }}
           path: |
@@ -135,7 +135,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
           ref: ${{ github.event.pull_request.head.sha }}
