@@ -1,0 +1,88 @@
+#!/bin/sh
+# Launch the full, pinned Xray distribution with explicit local JSON inputs.
+set -eu
+umask 077
+XRAY_VERSION=26.11.9
+XRAY_COMMIT=676eaf6
+core=/usr/libexec/lite-client-xray/xray
+newline='
+'
+
+usage() {
+	cat <<'EOF'
+Usage: lc-xray [--core /path/to/xray] check|run [--confdir DIRECTORY] [FILE ...]
+  check   Validate local Xray JSON/JSONC without opening listeners.
+  run     Run the pinned Xray Core in the foreground.
+Files are loaded in argument order, followed by the directory's files in name order.
+EOF
+}
+fail() {
+	printf 'lc-xray: %s\n' "$1" >&2
+	exit 2
+}
+config_paths() {
+	for file in "$1"/.* "$1"/*; do
+		[ -e "$file" ] || [ -L "$file" ] || continue
+		case "${file##*/}" in ?*.json|?*.jsonc) ;; *) continue ;; esac
+		[ -f "$file" ] && [ -r "$file" ] || fail 'Unreadable JSON file in the configuration directory.'
+		case "$file" in *"$newline"*) fail 'A configuration path contains a line break.' ;; esac
+		printf '%s\n' "$file"
+	done
+}
+
+if [ "${1:-}" = --core ]; then
+	[ "$#" -ge 2 ] || fail '--core requires a path.'
+	[ -n "$2" ] || fail '--core requires a path.'
+	core=$2
+	shift 2
+fi
+case "${1:-}" in
+	-h|--help|help) usage; exit 0 ;;
+	check|run) action=$1; shift ;;
+	*) usage >&2; exit 2 ;;
+esac
+
+if [ "${1:-}" = --confdir ]; then
+	[ "$#" -ge 2 ] || fail '--confdir requires a directory.'
+	[ -n "$2" ] || fail '--confdir requires a directory.'
+	case "$2" in /*) directory=$2 ;; *) directory=$PWD/$2 ;; esac
+	[ -d "$directory" ] && [ -r "$directory" ] && [ -x "$directory" ] ||
+		fail 'The configuration directory is unavailable.'
+	paths=$(config_paths "$directory") || exit "$?"
+	[ -n "$paths" ] || fail 'The configuration directory has no JSON or JSONC files.'
+	paths=$(printf '%s\n' "$paths" | LC_ALL=C sort)
+	shift 2
+	while [ -n "$paths" ]; do
+		set -- "$@" "${paths%%"$newline"*}"
+		case "$paths" in *"$newline"*) paths=${paths#*"$newline"} ;; *) paths= ;; esac
+	done
+fi
+[ "$#" -gt 0 ] || fail 'Choose at least one local Xray JSON file.'
+
+count=$#
+while [ "$count" -gt 0 ]; do
+	case "$1" in
+		''|--*|*://*|stdin:) fail 'Expected a local configuration file.' ;;
+		/*) file=$1 ;;
+		*) file=$PWD/$1 ;;
+	esac
+	[ -f "$file" ] && [ -r "$file" ] || fail 'A configuration file is missing or unreadable.'
+	shift
+	set -- "$@" -config "$file"
+	count=$((count - 1))
+done
+
+case "$core" in /*) ;; *) core=$PWD/$core ;; esac
+[ -f "$core" ] && [ -x "$core" ] ||
+	fail "Xray Core $XRAY_VERSION is missing. Install lite-client-xray or pass --core."
+version=$("$core" version) || fail 'The Xray Core binary could not run on this system.'
+case "${version%%"$newline"*}" in
+	"Xray $XRAY_VERSION "*" $XRAY_COMMIT ("*) ;;
+	*) fail "Expected official Xray Core $XRAY_VERSION ($XRAY_COMMIT)." ;;
+esac
+
+if [ "$action" = check ]; then
+	set -- -test "$@"
+fi
+# Files are explicit. Ignore Xray's implicit configuration-directory environment.
+exec env -u XRAY_LOCATION_CONFDIR -u xray.location.confdir "$core" run -format json "$@" </dev/null

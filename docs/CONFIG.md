@@ -1,5 +1,8 @@
 # Configuring lite-client
 
+For a complete Xray JSON or JSONC profile, use the separate
+[Xray Core mode](XRAY-JSON.md). The settings below configure the native client.
+
 The configuration is one UCI section, `lite-client.main`, in `/etc/config/lite-client`. The service
 script `/etc/init.d/lite-client` reads it, checks every value, and only then starts `lc-tunnel` and
 installs the firewall rules. A value it cannot use stops the start with a line in syslog; nothing is

@@ -22,6 +22,10 @@ firewall; there is no server implementation or sing-box JSON configuration engin
 | Integration | OpenWrt procd, UCI and nftables TPROXY; credentials read from owner-only files |
 | Configuration | UCI and command-line tools; one outbound per running instance |
 
+The optional [Xray Core mode](docs/XRAY-JSON.md) runs complete Xray JSON profiles
+with the pinned upstream engine, including multiple inbounds, outbounds and
+routing. Its OpenWrt package is built separately for AArch64.
+
 The implementation targets the observable behavior of its pinned references.
 Known differences and qualification limits are recorded in
 [DIVERGENCES.md](DIVERGENCES.md),
